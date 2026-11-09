@@ -80,6 +80,22 @@ DLLs the game loads itself are lifted in the same run (`--module
 game.dll --symbols dir [--manifest file]`, repeated) and listed in
 `GameConfig::lifted_dlls`.
 
+## Metal pipeline prewarming (experimental)
+
+`RECOMP_PREWARM_PIPELINES=1` compiles previously observed Metal pipeline
+recipes before gameplay, using the shaders' cached MSL. It is disabled by
+default. An initial run still needs to populate the caches; new states and
+entries that cannot be prewarmed use the existing background/lazy path.
+
+Prewarming trades startup time and earlier pipeline allocation for fewer
+compilation stalls during drawing. On an Apple TV 4K (A15), 339 and later
+341 cached recipes were prewarmed, with no draw-time pipeline compilation
+messages in the warmed test scenes. This does not remove GPU load, asset
+streaming stalls, or presentation timing variation. A later test reached
+tvOS's per-process memory limit, so memory use and startup responsiveness
+need further validation before enabling it by default. Mac and iPad
+behavior has not been verified.
+
 ## Requirements
 
 Linux x86-64, or macOS on Apple Silicon. Clang and LLVM (the static

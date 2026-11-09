@@ -513,6 +513,8 @@ class MetalDevice final : public Device {
       internal_lib_ = lib;
       LoadRecipes();
       LoadMslCache();
+      if (const char* e = std::getenv("RECOMP_PREWARM_PIPELINES"); e && *e == '1')
+        WarmPipelineCache();
       MTLDepthStencilDescriptor* dd = [MTLDepthStencilDescriptor new];
       dd.depthCompareFunction = MTLCompareFunctionAlways;
       dd.depthWriteEnabled = YES;
@@ -3504,6 +3506,50 @@ void main() {
     return h;
   }
 
+  // Compile previously observed pipeline states before gameplay instead of
+  // racing their background compilation on the first draw. Recipes use shader
+  // hashes, so they remain valid when this run assigns different shader IDs.
+  void WarmPipelineCache() {
+    const uint64_t start = NowNs();
+    std::unordered_map<uint64_t, id<MTLFunction>> functions;
+    auto function = [&](uint64_t hash) -> id<MTLFunction> {
+      auto found = functions.find(hash);
+      if (found != functions.end()) return found->second;
+      auto source = msl_cache_.find(hash);
+      if (source == msl_cache_.end()) return nil;
+      NSError* error = nil;
+      id<MTLLibrary> library = [dev_ newLibraryWithSource:@(source->second.c_str())
+                                               options:MslOptions(true) error:&error];
+      id<MTLFunction> fn = [library newFunctionWithName:@"main0"];
+      functions.emplace(hash, fn);
+      return fn;
+    };
+    for (const Recipe& recipe : recipes_) {
+      @autoreleasepool {
+        id<MTLFunction> vs = function(recipe.vs);
+        id<MTLFunction> ps = function(recipe.ps);
+        if (!vs || !ps) continue;
+        if (recipe.key.lean & kLeanPs) {
+          auto source = msl_cache_.find(recipe.ps);
+          if (source == msl_cache_.end()) continue;
+          ps = Lean(recipe.ps, @(source->second.c_str()));
+          if (!ps) continue;
+        }
+        NSError* error = nil;
+        MTLRenderPipelineDescriptor* descriptor = Describe(recipe.key, vs, ps);
+        id<MTLRenderPipelineState> pipeline =
+            [dev_ newRenderPipelineStateWithDescriptor:descriptor error:&error];
+        if (pipeline) warmed_pipelines_.emplace(Fnv64(&recipe, sizeof recipe), pipeline);
+      }
+      // SDL's UIKit entry runs on the main thread. Keep startup responsive
+      // while Metal compiles; no game frame has been submitted yet.
+      if ([NSThread isMainThread])
+        CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0, true);
+    }
+    std::fprintf(stderr, "gfx: prewarmed %zu/%zu cached pipelines before gameplay in %.2f s\n",
+                 warmed_pipelines_.size(), recipes_.size(), double(NowNs() - start) / 1e9);
+  }
+
   static std::string RecipePath() {
     NSString* dir = [NSSearchPathForDirectoriesInDomains(NSCachesDirectory, NSUserDomainMask, YES).firstObject
         stringByAppendingPathComponent:@"x86recomp"];
@@ -3636,6 +3682,14 @@ void main() {
       PipeKey k = r.key;
       k.vs = vs->second;
       k.ps = ps->second;
+      auto warm = warmed_pipelines_.find(Fnv64(&r, sizeof r));
+      if (warm != warmed_pipelines_.end()) {
+        if (prebuild_started_.insert(k).second) {
+          std::lock_guard<std::mutex> l(prebuilt_mu_);
+          prebuilt_[k] = warm->second;
+        }
+        continue;
+      }
       NSString* src = nil;  // the pixel shader's MSL, for its lean variant
       if (k.lean & kLeanPs) {
         auto m = msl_cache_.find(r.ps);
@@ -4418,6 +4472,7 @@ void main() {
   std::vector<Recipe> recipes_;
   std::unordered_multimap<uint64_t, size_t> recipe_by_shader_;
   std::unordered_set<PipeKey, BytesHash<PipeKey>> prebuild_started_;
+  std::unordered_map<uint64_t, id<MTLRenderPipelineState>> warmed_pipelines_;
   std::mutex prebuilt_mu_;
   std::unordered_map<PipeKey, id<MTLRenderPipelineState>, BytesHash<PipeKey>> prebuilt_;
   size_t prebuilt_used_ = 0;  // encoding thread
