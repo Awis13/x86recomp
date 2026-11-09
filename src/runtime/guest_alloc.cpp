@@ -1,5 +1,6 @@
 #include "runtime/guest_alloc.h"
 
+#include <algorithm>
 #include <cstring>
 
 namespace recomp {
@@ -129,6 +130,26 @@ bool GuestAllocator::Release(uint64_t base, bool zero) {
   return true;
 }
 
+GuestAllocator::Stats GuestAllocator::GetStats() const {
+  std::lock_guard<std::recursive_mutex> l(mu_);
+  Stats s;
+  uint64_t at = lo_;
+  auto gap = [&](uint64_t end) {
+    if (end <= at) return;
+    s.free += end - at;
+    s.largest_free = std::max(s.largest_free, end - at);
+  };
+  for (const auto& [base, size] : regions_) {
+    if (base >= hi_) break;
+    if (base + size <= lo_) continue;
+    gap(base);
+    s.reserved += std::min(base + size, hi_) - std::max(base, lo_);
+    at = std::max(at, base + size);
+  }
+  gap(hi_);
+  return s;
+}
+
 // ---- GuestHeap -------------------------------------------------------------
 
 namespace {
@@ -201,6 +222,7 @@ uint64_t GuestHeap::Alloc(uint64_t size, bool zero) {
   else
     size = have;
   used_[addr] = {size, req};
+  used_bytes_ += size;
   if (zero) std::memset(vm_.mem().ptr(addr), 0, size);
   return addr;
 }
@@ -211,6 +233,7 @@ bool GuestHeap::Free(uint64_t p) {
   if (it == used_.end()) return false;
   uint64_t addr = p, size = it->second.size;
   used_.erase(it);
+  used_bytes_ -= size;
   // Coalesce with the following free block, unless it starts a segment.
   auto nx = free_.find(addr + size);
   if (nx != free_.end() && !IsSegmentStart(nx->first)) {
@@ -257,6 +280,7 @@ uint64_t GuestHeap::ReAlloc(uint64_t p, uint64_t size, bool zero,
         InsertFree(p + want, total - want);
         total = want;
       }
+      used_bytes_ += total - old_size;
       it->second = {total, size};
       if (zero)
         std::memset(vm_.mem().ptr(p + old_req), 0, total - old_req);
@@ -269,6 +293,15 @@ uint64_t GuestHeap::ReAlloc(uint64_t p, uint64_t size, bool zero,
   std::memcpy(vm_.mem().ptr(n), vm_.mem().ptr(p), std::min(old_req, size));
   Free(p);
   return n;
+}
+
+GuestHeap::Stats GuestHeap::GetStats() const {
+  std::lock_guard<std::mutex> l(mu_);
+  Stats s;
+  for (const auto& seg : segments_) s.segments += seg.second;
+  s.used = used_bytes_;
+  if (!free_by_size_.empty()) s.largest_free = free_by_size_.rbegin()->first;
+  return s;
 }
 
 uint64_t GuestHeap::Size(uint64_t p) const {

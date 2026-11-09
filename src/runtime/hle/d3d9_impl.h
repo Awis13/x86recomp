@@ -297,6 +297,11 @@ struct Device final : com::Tagged<com::TagOf("d3d9.Device")> {
 // reads in place (gfx::Device::MapSharedMemory), when it can: set up for
 // `d` once d.gfx exists.
 void SetUpSharedBuffers(Device& d);
+// <ID>_MEM_REPORT=s: every s seconds, two log lines saying what the guest's
+// address space holds: the whole of it and the process heap, then this
+// front end's texture levels by pool, buffers and the shared heap. Called
+// once a frame.
+void MemoryReport();
 // A draw of `d` reads buffer `b`.
 inline void NoteBufferUse(Device& d, Buffer* b) {
   if (b->shared) b->last_use = d.gfx->FrameSerial();

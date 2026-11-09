@@ -9,9 +9,11 @@
 // texture. The device holds a reference to everything bound to it.
 
 #include <algorithm>
+#include <atomic>
 #include <cstdlib>
 #include <memory>
 #include <mutex>
+#include <string>
 #include <type_traits>
 #include <vector>
 #include <cstdio>
@@ -22,6 +24,7 @@
 #include "runtime/hle/hle.h"
 #include "runtime/hle/kernel32_state.h"
 #include "runtime/log.h"
+#include "runtime/platform.h"
 
 namespace recomp::d3d9 {
 
@@ -89,7 +92,70 @@ void Retire(SharedHeap& s, const gfx::Device* dev, gaddr mem, uint64_t serial) {
     s.retired.push_back({mem, serial, dev});
 }
 
+// Guest memory the resources hold, for MemoryReport: bytes and blocks of
+// texture levels by pool (D3DPOOL) and of vertex and index buffers, each
+// in the shared heap ([1]) or the process heap ([0]).
+struct MemCounts {
+  std::atomic<int64_t> level_bytes[4][2] = {}, levels[4] = {};
+  std::atomic<int64_t> buffer_bytes[2] = {}, buffers{0};
+  std::atomic<int64_t> surface_bytes{0};
+};
+MemCounts g_mem;
+
+void CountLevel(uint32_t pool, bool shared, int64_t bytes) {
+  g_mem.level_bytes[pool & 3][shared] += bytes;
+  g_mem.levels[pool & 3] += bytes < 0 ? -1 : 1;
+}
+
+void CountBuffer(bool shared, int64_t bytes) {
+  g_mem.buffer_bytes[shared] += bytes;
+  g_mem.buffers += bytes < 0 ? -1 : 1;
+}
+
 }  // namespace
+
+void MemoryReport() {
+  static const double every_s = [] {
+    const char* e = Env("MEM_REPORT");
+    return e ? std::atof(e) : 0.0;
+  }();
+  if (every_s <= 0) return;
+  static uint64_t next = 0;
+  const uint64_t now = platform::MonotonicNs();
+  if (now < next) return;
+  next = now + uint64_t(every_s * 1e9);
+  auto mb = [](int64_t b) { return double(b) / (1 << 20); };
+  uint64_t heap_size = 0, heap_used = 0, heap_largest = 0;
+  size_t retired = 0;
+  {
+    SharedHeap& s = Shared();
+    std::lock_guard<std::mutex> lock(s.mu);
+    if (s.heap) {
+      const GuestHeap::Stats st = s.heap->GetStats();
+      heap_size = s.size, heap_used = st.used, heap_largest = st.largest_free;
+      retired = s.retired.size();
+    }
+  }
+  static const char* const kPool[4] = {"DEFAULT", "MANAGED", "SYSTEMMEM", "SCRATCH"};
+  std::string levels;
+  int64_t level_total = 0;
+  for (int p = 0; p < 4; p++) {
+    const int64_t sh = g_mem.level_bytes[p][1], pr = g_mem.level_bytes[p][0];
+    level_total += sh + pr;
+    if (!g_mem.levels[p]) continue;
+    char b[128];
+    std::snprintf(b, sizeof b, " %s %.1f + %.1f (%lld levels)", kPool[p], mb(sh), mb(pr),
+                  (long long)g_mem.levels[p].load());
+    levels += b;
+  }
+  WarnF("mem: %s\n", GuestMemoryText().c_str());
+  WarnF("mem: d3d9 in the guest, MB: texture levels %.1f (shared heap + process heap:%s); "
+        "vertex and index buffers %.1f + %.1f (%lld); offscreen surfaces %.1f; shared heap %.1f of "
+        "%.0f used (largest free block %.1f, %zu blocks waiting for the GPU)\n",
+        mb(level_total), levels.empty() ? " none" : levels.c_str(), mb(g_mem.buffer_bytes[1]),
+        mb(g_mem.buffer_bytes[0]), (long long)g_mem.buffers.load(), mb(g_mem.surface_bytes),
+        mb(int64_t(heap_used)), mb(int64_t(heap_size)), mb(int64_t(heap_largest)), retired);
+}
 
 
 namespace {
@@ -204,6 +270,7 @@ uint32_t LevelMem(Texture& t, Texture::Level& l) {
     l.shared = l.mem != 0;
   }
   if (!l.mem) l.mem = HeapAllocProcess(l.size, true);
+  if (l.mem) CountLevel(t.pool, l.shared, l.size);
   return l.mem;
 }
 
@@ -345,7 +412,10 @@ Surface::~Surface() {
   Device* d = com::As<Device>(device);
   if (d && depth) d->gfx->DestroyDepth(depth);
   if (d && tex) d->gfx->DestroyTexture(tex);
-  if (mem) HeapFreeProcess(mem);
+  if (mem) {
+    g_mem.surface_bytes -= int64_t(HeapSizeProcess(mem));
+    HeapFreeProcess(mem);
+  }
 }
 
 Shader::~Shader() {
@@ -357,6 +427,7 @@ Texture::~Texture() {
   Device* d = com::As<Device>(device);
   if (d && tex) d->gfx->DestroyTexture(tex);
   for (Level& l : lv) {
+    if (l.mem) CountLevel(pool, l.shared, -int64_t(l.size));
     if (l.mem && l.shared) {
       SharedHeap& s = Shared();
       std::lock_guard<std::mutex> lock(s.mu);
@@ -393,6 +464,7 @@ void SetUpSharedBuffers(Device& d) {
 
 Buffer::~Buffer() {
   if (!mem) return;
+  CountBuffer(shared, -int64_t(length));
   if (!shared) {
     HeapFreeProcess(mem);
     return;
@@ -515,6 +587,7 @@ uint32_t NewSurface(Device& d, uint32_t device, Surface::Kind kind, uint32_t w,
     case Surface::Kind::Offscreen:
       s->pitch = gfx::RowPitch(f, w);
       s->mem = HeapAllocProcess(s->pitch * gfx::RowCount(f, h), true);
+      if (s->mem) g_mem.surface_bytes += int64_t(s->pitch) * gfx::RowCount(f, h);
       break;
     default:
       break;
@@ -606,6 +679,7 @@ uint32_t CreateBuffer(Ctx& c, bool index) {
     b->shared = b->mem != 0;
   }
   if (!b->mem) b->mem = HeapAllocProcess(length, true);
+  if (b->mem) CountBuffer(b->shared, length);
   Wr32(out, com::Publish(b, BufferVtable(index)));
   return D3D_OK;
 }

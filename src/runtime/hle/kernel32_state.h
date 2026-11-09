@@ -51,6 +51,11 @@ void WriteSystemTime(uint32_t st, const std::tm& t, int ms);
 
 gaddr HeapAllocProcess(uint64_t size, bool zero);
 
+// The guest's address space in one line, in MB: reserved, free and the
+// largest free gap; the process heap (its segments, live blocks, largest
+// free block); the segments of the heaps the guest created.
+std::string GuestMemoryText();
+
 // <ID>_WAIT_LOG=ms: a guest wait (an HLE call's lifetime) longer than that
 // is logged with the thread, what it waited on and the guest caller (the
 // return address on the stack at entry).

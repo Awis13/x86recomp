@@ -8,11 +8,13 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <ctime>
 #include <map>
 #include <memory>
 #include <mutex>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -54,6 +56,26 @@ gaddr HeapAllocProcess(uint64_t size, bool zero) {
 }
 
 void HeapFreeProcess(gaddr p) { g_process_heap->Free(p); }
+
+std::string GuestMemoryText() {
+  const GuestAllocator::Stats vm = g_proc->vm.GetStats();
+  const GuestHeap::Stats ph = g_process_heap->GetStats();
+  uint64_t others = 0;
+  {
+    std::lock_guard<std::mutex> l(g_heaps_mu);
+    for (const auto& [handle, heap] : g_heaps)
+      if (heap.get() != g_process_heap) others += heap->GetStats().segments;
+  }
+  char b[256];
+  std::snprintf(b, sizeof b,
+                "address space: %llu MB reserved, %llu free (largest gap %llu); process heap %llu "
+                "(%llu in blocks, largest free block %llu); other heaps %llu",
+                (unsigned long long)(vm.reserved >> 20), (unsigned long long)(vm.free >> 20),
+                (unsigned long long)(vm.largest_free >> 20), (unsigned long long)(ph.segments >> 20),
+                (unsigned long long)(ph.used >> 20), (unsigned long long)(ph.largest_free >> 20),
+                (unsigned long long)(others >> 20));
+  return b;
+}
 
 gaddr HeapReAllocProcess(gaddr p, uint64_t size) {
   return g_process_heap->ReAlloc(p, size, false, false);
@@ -730,7 +752,17 @@ HLE("kernel32.dll", HeapDestroy, 1) {
 HLE64("kernel32.dll", HeapAlloc, 3) {
   GuestHeap* h = FindHeap(Arg(c, 0));
   if (!h) FatalF("HeapAlloc on unknown heap %08llX", (unsigned long long)Arg(c, 0));
-  return h->Alloc(Arg(c, 2), Arg(c, 1) & kHeapZeroMemory);
+  const gaddr p = h->Alloc(Arg(c, 2), Arg(c, 1) & kHeapZeroMemory);
+  if (!p) {
+    // The guest is out of address space (or the heap has a fixed size):
+    // what it looks like, a few times, for the log of a game that then
+    // gives up.
+    static std::atomic<int> left{8};
+    if (left.load() > 0 && left.fetch_sub(1) > 0)
+      WarnF("HeapAlloc of %llu bytes failed (heap %08llX): %s\n", (unsigned long long)Arg(c, 2),
+            (unsigned long long)Arg(c, 0), GuestMemoryText().c_str());
+  }
+  return p;
 }
 
 HLE64("kernel32.dll", HeapFree, 3) {
