@@ -98,6 +98,16 @@ On macOS with Homebrew
 cmake --preset debug -DRECOMP_LLVM_ROOT=/opt/homebrew/opt/llvm@22
 ```
 
+## Landscape-only mobile display modes
+
+A landscape-only port can set `<ID>_DISPLAY_LANDSCAPE=1` before the runtime
+initializes SDL video (`<ID>` is the game's environment prefix, for example
+`GTAIV`). This normalizes a portrait native display mode to landscape for
+screen metrics and adapter-mode enumeration, including graphics-setting
+resets. It also adds half, two-thirds, and five-sixths native-aspect modes,
+rounded down to even pixels, alongside the full native and existing modes.
+Without the variable the existing display-mode behavior is retained.
+
 ## Licence
 
 MIT (see [LICENSE](LICENSE)). Dependencies keep their own licences:
