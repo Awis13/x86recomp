@@ -23,6 +23,7 @@
 #include "runtime/hle/d3d9_impl.h"
 #include "runtime/hle/hle.h"
 #include "runtime/hle/kernel32_state.h"
+#include "runtime/hle/shared_heap.h"
 #include "runtime/log.h"
 #include "runtime/platform.h"
 
@@ -30,66 +31,42 @@ namespace recomp::d3d9 {
 
 // ---- vertex and index buffers the GPU reads in place
 //
-// One heap of guest memory for the process (<ID>_GPU_HEAP_MB, default
-// 512; 0 turns it off), committed whole and mapped into each graphics
-// device that can read memory in place. The GPU reads a buffer while the
-// game may already be filling it for a later frame, so a Lock that would
-// write memory a frame not yet finished may still read (no NOOVERWRITE)
-// gives the buffer a new block, as D3D9 drivers rename DISCARDed buffers
-// (the old contents copied over without DISCARD); old blocks, and those of
-// buffers released, are freed once the GPU has finished their last frame.
+// One heap of guest memory for the process (<ID>_GPU_HEAP_MB; default
+// SharedHeap::kDefault32, kDefault64 for a 64-bit guest; 0 turns it off),
+// committed whole and mapped into each graphics device that can read
+// memory in place. The GPU reads a buffer while the game may already be
+// filling it for a later frame, so a Lock that would write memory a frame
+// not yet finished may still read (no NOOVERWRITE) gives the buffer a new
+// block, as D3D9 drivers rename DISCARDed buffers (the old contents copied
+// over without DISCARD); old blocks, and those of buffers released, are
+// freed once the GPU has finished their last frame (shared_heap.h). When
+// the heap is full, new buffers and texture levels go to the process heap,
+// and the device copies what it draws from them.
 
 namespace {
-
-struct SharedHeap {
-  std::mutex mu;
-  std::unique_ptr<GuestHeap> heap;
-  uint64_t size = 0;
-  struct Retired {
-    gaddr mem;
-    uint64_t serial;
-    const gfx::Device* dev;
-  };
-  std::vector<Retired> retired;
-};
 
 SharedHeap& Shared() {
   static SharedHeap s;
   return s;
 }
 
-// Frees retired blocks `dev` has finished with (all of other devices':
-// a device finishes its GPU work when it is destroyed). Under mu.
-void Reclaim(SharedHeap& s, const gfx::Device* dev) {
-  const uint64_t done = dev ? dev->CompletedSerial() : 0;
-  std::erase_if(s.retired, [&](const SharedHeap::Retired& r) {
-    if (r.dev == dev && r.serial > done) return false;
-    s.heap->Free(r.mem);
-    return true;
-  });
-}
-
-// A block of the shared heap, or 0 if it is full.
-gaddr SharedAlloc(SharedHeap& s, const gfx::Device* dev, uint32_t size, bool zero) {
-  gaddr p = s.heap->Alloc(size, zero);
-  if (!p && !s.retired.empty()) {
-    Reclaim(s, dev);
-    p = s.heap->Alloc(size, zero);
-  }
-  if (!p) {
-    static bool warned = false;
-    if (!warned) WarnF("d3d9: the shared buffer heap (%llu MB) is full\n",
-                       (unsigned long long)(s.size >> 20));
-    warned = true;
+// A block of the shared heap `dev` will read, or 0 if it is full.
+gaddr SharedAlloc(const gfx::Device* dev, uint32_t size, bool zero) {
+  SharedHeap& s = Shared();
+  const gaddr p = s.Alloc(dev, dev ? dev->CompletedSerial() : 0, size, zero);
+  if (!p && s) {
+    static std::atomic<bool> warned{false};
+    if (!warned.exchange(true))
+      WarnF("d3d9: the shared buffer heap (%llu MB) is full\n",
+            (unsigned long long)(s.size() >> 20));
   }
   return p;
 }
 
-void Retire(SharedHeap& s, const gfx::Device* dev, gaddr mem, uint64_t serial) {
-  if (!dev || serial <= dev->CompletedSerial())
-    s.heap->Free(mem);
-  else
-    s.retired.push_back({mem, serial, dev});
+// Gives back a block `dev` (null: no device any more) read last in its
+// frame `serial`.
+void Retire(const gfx::Device* dev, gaddr mem, uint64_t serial) {
+  Shared().Retire(dev, dev ? dev->CompletedSerial() : 0, mem, serial);
 }
 
 // Guest memory the resources hold, for MemoryReport: bytes and blocks of
@@ -125,17 +102,7 @@ void MemoryReport() {
   if (now < next) return;
   next = now + uint64_t(every_s * 1e9);
   auto mb = [](int64_t b) { return double(b) / (1 << 20); };
-  uint64_t heap_size = 0, heap_used = 0, heap_largest = 0;
-  size_t retired = 0;
-  {
-    SharedHeap& s = Shared();
-    std::lock_guard<std::mutex> lock(s.mu);
-    if (s.heap) {
-      const GuestHeap::Stats st = s.heap->GetStats();
-      heap_size = s.size, heap_used = st.used, heap_largest = st.largest_free;
-      retired = s.retired.size();
-    }
-  }
+  const SharedHeap::Stats sh = Shared().GetStats();
   static const char* const kPool[4] = {"DEFAULT", "MANAGED", "SYSTEMMEM", "SCRATCH"};
   std::string levels;
   int64_t level_total = 0;
@@ -151,10 +118,13 @@ void MemoryReport() {
   WarnF("mem: %s\n", GuestMemoryText().c_str());
   WarnF("mem: d3d9 in the guest, MB: texture levels %.1f (shared heap + process heap:%s); "
         "vertex and index buffers %.1f + %.1f (%lld); offscreen surfaces %.1f; shared heap %.1f of "
-        "%.0f used (largest free block %.1f, %zu blocks waiting for the GPU)\n",
+        "%.0f used (%.1f at most so far; largest free block %.1f; %.1f in %llu blocks waiting for the "
+        "GPU)\n",
         mb(level_total), levels.empty() ? " none" : levels.c_str(), mb(g_mem.buffer_bytes[1]),
         mb(g_mem.buffer_bytes[0]), (long long)g_mem.buffers.load(), mb(g_mem.surface_bytes),
-        mb(int64_t(heap_used)), mb(int64_t(heap_size)), mb(int64_t(heap_largest)), retired);
+        mb(int64_t(sh.used)), mb(int64_t(Shared().size())), mb(int64_t(sh.peak)),
+        mb(int64_t(sh.largest_free)),
+        mb(int64_t(sh.waiting_bytes)), (unsigned long long)sh.waiting);
 }
 
 
@@ -264,9 +234,7 @@ uint32_t LevelMem(Texture& t, Texture::Level& l) {
     return !e || *e != '0';
   }();
   if (on && t.tex && d && d->shared_buffers) {
-    SharedHeap& s = Shared();
-    std::lock_guard<std::mutex> lock(s.mu);
-    l.mem = uint32_t(SharedAlloc(s, d->gfx.get(), l.size, true));
+    l.mem = uint32_t(SharedAlloc(d->gfx.get(), l.size, true));
     l.shared = l.mem != 0;
   }
   if (!l.mem) l.mem = HeapAllocProcess(l.size, true);
@@ -280,11 +248,9 @@ uint32_t LevelMem(Texture& t, Texture::Level& l) {
 void RenameLevelIfInUse(Texture& t, Texture::Level& l) {
   Device* d = com::As<Device>(t.device);
   if (!l.shared || !d || !d->gfx || l.gpu_use <= d->gfx->CompletedSerial()) return;
-  SharedHeap& s = Shared();
-  std::lock_guard<std::mutex> lock(s.mu);
-  if (gaddr n = SharedAlloc(s, d->gfx.get(), l.size, false)) {
+  if (gaddr n = SharedAlloc(d->gfx.get(), l.size, false)) {
     std::memcpy(GPtr(n), GPtr(l.mem), l.size);
-    Retire(s, d->gfx.get(), l.mem, l.gpu_use);
+    Retire(d->gfx.get(), l.mem, l.gpu_use);
     l.mem = uint32_t(n);
     l.gpu_use = 0;
   }
@@ -429,9 +395,7 @@ Texture::~Texture() {
   for (Level& l : lv) {
     if (l.mem) CountLevel(pool, l.shared, -int64_t(l.size));
     if (l.mem && l.shared) {
-      SharedHeap& s = Shared();
-      std::lock_guard<std::mutex> lock(s.mu);
-      Retire(s, d && d->gfx ? d->gfx.get() : nullptr, l.mem, l.gpu_use);
+      Retire(d && d->gfx ? d->gfx.get() : nullptr, l.mem, l.gpu_use);
     } else if (l.mem) {
       HeapFreeProcess(l.mem);
     }
@@ -442,24 +406,21 @@ Texture::~Texture() {
 void SetUpSharedBuffers(Device& d) {
   if (!d.gfx->SharesMemory()) return;
   SharedHeap& s = Shared();
-  std::lock_guard<std::mutex> l(s.mu);
-  if (!s.heap) {
+  if (!s) {
     const char* e = Env("GPU_HEAP_MB");
-    const uint64_t mb = e ? std::strtoull(e, nullptr, 10) : 512;
+    const uint64_t mb = e ? std::strtoull(e, nullptr, 10)
+                          : (g_proc->x64 ? SharedHeap::kDefault64 : SharedHeap::kDefault32) >> 20;
     if (!mb) return;
-    s.heap = std::make_unique<GuestHeap>(g_proc->vm, mb << 20, mb << 20);
-    if (!s.heap->handle()) {
+    if (!s.Init(g_proc->vm, mb << 20)) {
       WarnF("d3d9: no room for a %llu MB shared buffer heap\n", (unsigned long long)mb);
-      s.heap.reset();
       return;
     }
-    s.size = mb << 20;
   }
-  Reclaim(s, nullptr);
-  d.shared_buffers = d.gfx->MapSharedMemory(GPtr(s.heap->handle()), s.size);
+  s.Reclaim(nullptr, 0);  // an earlier device's blocks
+  d.shared_buffers = d.gfx->MapSharedMemory(GPtr(s.base()), s.size());
   if (d.shared_buffers)
     std::fprintf(stderr, "d3d9: vertex and index buffers in %llu MB the GPU reads in place\n",
-                 (unsigned long long)(s.size >> 20));
+                 (unsigned long long)(s.size() >> 20));
 }
 
 Buffer::~Buffer() {
@@ -469,10 +430,8 @@ Buffer::~Buffer() {
     HeapFreeProcess(mem);
     return;
   }
-  SharedHeap& s = Shared();
   Device* d = com::As<Device>(device);
-  std::lock_guard<std::mutex> l(s.mu);
-  Retire(s, d && d->gfx ? d->gfx.get() : nullptr, mem, last_use);
+  Retire(d && d->gfx ? d->gfx.get() : nullptr, mem, last_use);
 }
 
 uint32_t NewTexture(Device& d, uint32_t device, bool cube, uint32_t w, uint32_t h,
@@ -673,9 +632,7 @@ uint32_t CreateBuffer(Ctx& c, bool index) {
   b->pool = Arg(c, 4);
   Device* d = com::As<Device>(b->device);
   if (d && d->shared_buffers) {
-    SharedHeap& s = Shared();
-    std::lock_guard<std::mutex> l(s.mu);
-    b->mem = uint32_t(SharedAlloc(s, d->gfx.get(), length, true));
+    b->mem = uint32_t(SharedAlloc(d->gfx.get(), length, true));
     b->shared = b->mem != 0;
   }
   if (!b->mem) b->mem = HeapAllocProcess(length, true);
@@ -1217,11 +1174,9 @@ uint32_t BufferLock(Ctx& c) {
   Device* d = com::As<Device>(b->device);
   if (b->shared && d && d->gfx && !(flags & (D3DLOCK_READONLY | D3DLOCK_NOOVERWRITE)) &&
       b->last_use > d->gfx->CompletedSerial()) {
-    SharedHeap& s = Shared();
-    std::lock_guard<std::mutex> l(s.mu);
-    if (gaddr n = SharedAlloc(s, d->gfx.get(), b->length, false)) {
+    if (gaddr n = SharedAlloc(d->gfx.get(), b->length, false)) {
       if (!(flags & D3DLOCK_DISCARD)) std::memcpy(GPtr(n), GPtr(b->mem), b->length);
-      Retire(s, d->gfx.get(), b->mem, b->last_use);
+      Retire(d->gfx.get(), b->mem, b->last_use);
       b->mem = uint32_t(n);
       b->last_use = 0;
     }

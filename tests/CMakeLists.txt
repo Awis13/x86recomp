@@ -131,6 +131,18 @@ if(TARGET recomp_wmvcore)
   add_test(NAME wmvcore COMMAND wmvcore_test ${CMAKE_CURRENT_SOURCE_DIR}/wmvcore)
 endif()
 
+# shared_heap_test: the heap a graphics device reads in place (retired
+# blocks freed as its frames finish, runtime/hle/shared_heap.h) and the
+# address-space and heap statistics behind <ID>_MEM_REPORT; portable.
+add_executable(shared_heap_test shared_heap_test.cpp
+               ${PROJECT_SOURCE_DIR}/src/runtime/hle/shared_heap.cpp
+               ${PROJECT_SOURCE_DIR}/src/runtime/guest_memory.cpp
+               ${PROJECT_SOURCE_DIR}/src/runtime/guest_alloc.cpp)
+target_include_directories(shared_heap_test PRIVATE ${PROJECT_SOURCE_DIR}/src)
+target_compile_features(shared_heap_test PRIVATE cxx_std_20)
+target_link_libraries(shared_heap_test PRIVATE Threads::Threads)
+add_test(NAME shared_heap COMMAND shared_heap_test)
+
 # lift_semantics_test checks the integer/flag helpers in lifted.h against
 # the host CPU the same way.
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64)$")

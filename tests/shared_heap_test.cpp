@@ -1,0 +1,238 @@
+// shared_heap_test: the heap a graphics device reads in place
+// (runtime/hle/shared_heap.h) over real guest memory, and the statistics
+// <ID>_MEM_REPORT prints (GuestAllocator::GetStats, GuestHeap::GetStats).
+// Checks that:
+//   - the address space's reserved and free bytes and its largest gap
+//     follow reservations and releases, and a heap's segments, bytes in
+//     blocks and largest free block follow Alloc, Free and ReAlloc;
+//   - the shared heap takes its whole size from the address space once, and
+//     nothing more whatever is allocated; a size with no gap for it fails;
+//   - a block retired in a frame the device has finished, or with no
+//     device, is free at once; one of a later frame stays (its bytes
+//     untouched) until the device finishes that frame, and is then freed by
+//     the next Alloc, without the heap being full;
+//   - a game that renames a buffer every frame (Alloc, Retire the old one)
+//     keeps the heap at what it holds plus the frames in flight, for any
+//     number of frames (collected only when full, the heap would fill);
+//   - a full heap gives 0 while the frames are in flight and a block again
+//     once they are over;
+//   - a new device's first Reclaim frees the blocks of the one before.
+// Scenarios come from raw mt19937 output, which the standard fixes.
+
+#include <algorithm>
+#include <cstdio>
+#include <cstring>
+#include <random>
+#include <vector>
+
+#include "runtime/guest_alloc.h"
+#include "runtime/guest_memory.h"
+#include "runtime/hle/shared_heap.h"
+
+using namespace recomp;
+
+namespace {
+
+GuestMemory g_mem;
+int g_failures = 0;
+
+#define CHECK(cond)                                                         \
+  do {                                                                      \
+    if (!(cond)) {                                                          \
+      std::fprintf(stderr, "%s:%d: CHECK failed: %s\n", __FILE__, __LINE__, \
+                   #cond);                                                  \
+      g_failures++;                                                         \
+    }                                                                       \
+  } while (0)
+
+constexpr uint64_t kMb = 1 << 20;
+constexpr uint64_t kLo = 0x10000, kHi = 0x80000000u;
+
+void TestStats() {
+  GuestAllocator vm;
+  vm.Init(&g_mem, kLo, kHi);
+  GuestAllocator::Stats s = vm.GetStats();
+  CHECK(s.reserved == 0 && s.free == kHi - kLo && s.largest_free == kHi - kLo);
+
+  // An image in the middle splits the space in two gaps.
+  vm.MarkReserved(0x40000000, 64 * kMb);
+  s = vm.GetStats();
+  CHECK(s.reserved == 64 * kMb && s.free == kHi - kLo - 64 * kMb);
+  CHECK(s.largest_free == 0x40000000 - kLo);
+
+  const uint64_t a = vm.Reserve(0, 256 * kMb), b = vm.Reserve(0, 16 * kMb);
+  CHECK(a && b);
+  s = vm.GetStats();
+  CHECK(s.reserved == (64 + 256 + 16) * kMb);
+  CHECK(s.reserved + s.free == kHi - kLo);
+  CHECK(s.largest_free == kHi - 0x40000000 - 64 * kMb);  // above the image now
+  CHECK(vm.Release(a));
+  s = vm.GetStats();
+  CHECK(s.reserved == (64 + 16) * kMb && s.reserved + s.free == kHi - kLo);
+  // The freed 256 MB is a gap of its own, below b.
+  CHECK(vm.Reserve(0, 256 * kMb) == a);
+
+  // A heap: 16 MB segments, bytes in blocks, the largest free block.
+  {
+    GuestHeap h(vm, kMb, 0);
+    GuestHeap::Stats hs = h.GetStats();
+    CHECK(hs.segments == 16 * kMb && hs.used == 0 && hs.largest_free == 16 * kMb);
+    const uint64_t p = h.Alloc(1000, false), q = h.Alloc(4 * kMb, false);
+    hs = h.GetStats();
+    CHECK(hs.used == 1008 + 4 * kMb);  // blocks are rounded to 16 bytes
+    CHECK(hs.largest_free == 16 * kMb - hs.used);
+    CHECK(h.ReAlloc(p, 3000, false, false));
+    hs = h.GetStats();
+    CHECK(hs.used >= 3008 + 4 * kMb && hs.used < 8000 + 4 * kMb);
+    CHECK(h.Free(q));
+    CHECK(h.GetStats().used == hs.used - 4 * kMb);
+    CHECK(h.Alloc(20 * kMb, false));  // a second segment
+    hs = h.GetStats();
+    CHECK(hs.segments == 36 * kMb);
+    CHECK(vm.GetStats().reserved == (64 + 16 + 256 + 36) * kMb);
+  }
+  CHECK(vm.GetStats().reserved == (64 + 16 + 256) * kMb);  // the heap gave its segments back
+}
+
+void Fill(uint64_t p, uint8_t v, size_t n) { std::memset(g_mem.ptr(p), v, n); }
+bool AllEqual(uint64_t p, uint8_t v, size_t n) {
+  const uint8_t* q = g_mem.ptr(p);
+  for (size_t i = 0; i < n; i++)
+    if (q[i] != v) return false;
+  return true;
+}
+
+void TestRetire() {
+  GuestAllocator vm;
+  vm.Init(&g_mem, kLo, kHi);
+  {
+    SharedHeap none;
+    CHECK(!none && none.Alloc(nullptr, 0, 16, false) == 0);
+    CHECK(!none.Init(vm, 3072 * kMb));  // more than the guest has
+    CHECK(!none && vm.GetStats().reserved == 0);
+    // Never under a heap segment, and size() is what was reserved.
+    CHECK(none.Init(vm, kMb) && none.size() == 16 * kMb);
+    CHECK(vm.GetStats().reserved == 16 * kMb);
+  }
+  CHECK(vm.GetStats().reserved == 0);
+  SharedHeap h;
+  CHECK(h.Init(vm, 32 * kMb));
+  CHECK(h && h.size() == 32 * kMb && h.base() >= kLo);
+  CHECK(vm.GetStats().reserved == 32 * kMb);
+  int dev_a = 0, dev_b = 0;  // two devices, by address
+
+  // Finished frames, or no device: free at once.
+  uint64_t p = h.Alloc(&dev_a, 0, kMb, true);
+  CHECK(p >= h.base() && p + kMb <= h.base() + h.size());
+  CHECK(AllEqual(p, 0, kMb));
+  h.Retire(&dev_a, 5, p, 5);
+  CHECK(h.GetStats().used == 0 && h.GetStats().waiting == 0);
+  p = h.Alloc(&dev_a, 5, kMb, false);
+  h.Retire(nullptr, 0, p, 99);
+  CHECK(h.GetStats().used == 0);
+
+  // A frame in flight: the block stays, with its bytes.
+  p = h.Alloc(&dev_a, 5, kMb, false);
+  Fill(p, 0x5A, kMb);
+  h.Retire(&dev_a, 5, p, 7);
+  SharedHeap::Stats s = h.GetStats();
+  CHECK(s.used == kMb && s.peak == kMb && s.waiting == 1 && s.waiting_bytes == kMb);
+  // Allocations while frame 7 is not over do not get it...
+  uint64_t q = h.Alloc(&dev_a, 6, kMb, false);
+  CHECK(q && q != p && AllEqual(p, 0x5A, kMb));
+  CHECK(h.GetStats().waiting == 1);
+  // ... the first one after it is does (the heap is far from full).
+  uint64_t r = h.Alloc(&dev_a, 7, 64, false);
+  s = h.GetStats();
+  CHECK(r && s.waiting == 0 && s.waiting_bytes == 0 && s.used == kMb + 64);
+  h.Retire(&dev_a, 7, q, 0);
+  h.Retire(&dev_a, 7, r, 0);
+  CHECK(h.GetStats().used == 0);
+
+  // Full: 0 while the frames are in flight, a block when they are over.
+  std::vector<uint64_t> blocks;
+  for (int i = 0; i < 8; i++) blocks.push_back(h.Alloc(&dev_a, 7, 4 * kMb, false));
+  for (uint64_t b : blocks) CHECK(b);
+  CHECK(h.Alloc(&dev_a, 7, kMb, false) == 0);
+  CHECK(h.GetStats().largest_free == 0);
+  for (uint64_t b : blocks) h.Retire(&dev_a, 7, b, 9);
+  CHECK(h.GetStats().waiting == 8);
+  CHECK(h.Alloc(&dev_a, 8, kMb, false) == 0);
+  p = h.Alloc(&dev_a, 9, kMb, false);
+  CHECK(p && h.GetStats().waiting == 0 && h.GetStats().used == kMb);
+  CHECK(h.GetStats().peak == 32 * kMb);  // it was full
+
+  // Another device: the first one's blocks are over, whatever their frame.
+  h.Retire(&dev_a, 9, p, 1000);
+  CHECK(h.GetStats().waiting == 1);
+  h.Reclaim(&dev_b, 0);
+  CHECK(h.GetStats().waiting == 0 && h.GetStats().used == 0);
+  CHECK(vm.GetStats().reserved == 32 * kMb);  // never more than its size
+}
+
+// A game renaming buffers: each frame it locks some of its buffers with
+// DISCARD (a new block, the old one retired with the current frame), and
+// the device finishes frames `lag` behind.
+void TestRenames(uint32_t seed) {
+  std::mt19937 rng(seed);
+  GuestAllocator vm;
+  vm.Init(&g_mem, kLo, kHi);
+  SharedHeap h;
+  CHECK(h.Init(vm, 16 * kMb));
+  int dev = 0;
+  struct Buf {
+    uint64_t mem;
+    uint32_t size;
+    uint8_t value;
+  };
+  std::vector<Buf> bufs;
+  uint64_t held = 0;
+  for (int i = 0; i < 40; i++) {
+    Buf b{0, 4096u << (rng() % 5), uint8_t(rng())};  // 4 to 64 KiB
+    b.mem = h.Alloc(&dev, 0, b.size, false);
+    CHECK(b.mem);
+    Fill(b.mem, b.value, b.size);
+    held += b.size;
+    bufs.push_back(b);
+  }
+  const uint64_t lag = 3;
+  uint64_t peak = 0, peak_frame_bytes = 0;
+  for (uint64_t frame = 1; frame <= 3000; frame++) {
+    const uint64_t done = frame > lag ? frame - lag : 0;
+    uint64_t frame_bytes = 0;
+    for (uint32_t n = 4 + rng() % 8; n; n--) {
+      Buf& b = bufs[rng() % bufs.size()];
+      CHECK(AllEqual(b.mem, b.value, b.size));  // nobody else got its block
+      const uint64_t fresh = h.Alloc(&dev, done, b.size, false);
+      CHECK(fresh);
+      if (!fresh) return;
+      h.Retire(&dev, done, b.mem, frame);
+      b.mem = fresh;
+      b.value = uint8_t(rng());
+      Fill(b.mem, b.value, b.size);
+      frame_bytes += b.size;
+    }
+    peak_frame_bytes = std::max(peak_frame_bytes, frame_bytes);
+    peak = std::max(peak, h.GetStats().used);
+  }
+  // What the game holds, and the blocks of the frames not finished (the
+  // current one and `lag` before it, and one more collected a call late).
+  CHECK(peak <= held + (lag + 2) * peak_frame_bytes + 40 * 16);
+  CHECK(peak < 16 * kMb / 2);
+  for (const Buf& b : bufs) CHECK(AllEqual(b.mem, b.value, b.size));
+}
+
+}  // namespace
+
+int main() {
+  if (!g_mem.Reserve()) return 1;
+  TestStats();
+  TestRetire();
+  for (uint32_t seed = 1; seed <= 4; seed++) TestRenames(seed);
+  if (g_failures) {
+    std::fprintf(stderr, "shared_heap_test: %d failures\n", g_failures);
+    return 1;
+  }
+  std::printf("shared_heap_test: ok\n");
+  return 0;
+}
