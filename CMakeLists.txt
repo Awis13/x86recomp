@@ -141,6 +141,7 @@ add_library(recomp_runtime SHARED
   src/runtime/hle/advapi32.cpp
   src/runtime/hle/user32_input.cpp
   src/runtime/hle/user32_window.cpp
+  src/runtime/hle/display_modes.cpp
   src/runtime/hle/gdi32.cpp
   src/runtime/hle/shell_net.cpp
   src/runtime/hle/ws2_32.cpp

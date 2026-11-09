@@ -101,6 +101,15 @@ target_include_directories(win32_text_test PRIVATE ${PROJECT_SOURCE_DIR}/src)
 target_compile_features(win32_text_test PRIVATE cxx_std_20)
 add_test(NAME win32_text COMMAND win32_text_test)
 
+# display_modes_test: the display mode list (hle/display_modes.h) for
+# landscape and portrait desktops with a port's extra sizes, and the
+# parser of <ID>_DISPLAY_EXTRA_MODES; portable.
+add_executable(display_modes_test display_modes_test.cpp
+               ${PROJECT_SOURCE_DIR}/src/runtime/hle/display_modes.cpp)
+target_include_directories(display_modes_test PRIVATE ${PROJECT_SOURCE_DIR}/src)
+target_compile_features(display_modes_test PRIVATE cxx_std_20)
+add_test(NAME display_modes COMMAND display_modes_test)
+
 # lazy_mem_test: lazily read-back images (DirectDraw Lock of GPU
 # surfaces) through real page faults; portable.
 add_executable(lazy_mem_test lazy_mem_test.cpp

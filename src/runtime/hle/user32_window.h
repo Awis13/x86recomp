@@ -8,6 +8,8 @@
 #include <string>
 #include <vector>
 
+#include "runtime/hle/display_modes.h"
+
 namespace recomp {
 
 // <ID>_BACKGROUND=1 (used for automated test runs): never move or hide the
@@ -70,10 +72,8 @@ void ClientAreaSize(uint32_t hwnd, int* w, int* h);
 // The display mode sizes games can switch to, smallest first: the classic
 // 4:3 and 5:4 ones, common wide ones and the desktop's own size, up to the
 // desktop's size (EnumDisplaySettings, ChangeDisplaySettings, DirectDraw's
-// EnumDisplayModes).
-struct ModeSize {
-  int w, h;
-};
+// EnumDisplayModes), and the sizes the port adds with
+// <ID>_DISPLAY_EXTRA_MODES (hle/display_modes.h).
 std::vector<ModeSize> DisplayModeSizes();
 
 }  // namespace recomp

@@ -32,6 +32,7 @@
 #include <vector>
 
 #include "runtime/display.h"
+#include "runtime/hle/display_modes.h"
 #include "runtime/hle/hle.h"
 #include "runtime/hle/input_state.h"
 #include "runtime/hle/kernel32_state.h"
@@ -675,6 +676,16 @@ bool TakeMessage(uint32_t hwnd, uint32_t lo, uint32_t hi, bool remove, Msg* out)
 }
 
 
+// <ID>_DISPLAY_LANDSCAPE=1: the desktop the game sees is never taller than
+// wide (EnsureSdlVideo).
+bool LandscapeDisplay() {
+  static const bool landscape = [] {
+    const char* e = Env("DISPLAY_LANDSCAPE");
+    return e && *e && *e != '0';
+  }();
+  return landscape;
+}
+
 GameConfig::Fullscreen FullscreenPolicy() {
   using F = GameConfig::Fullscreen;
   static const F f = [] {
@@ -838,15 +849,12 @@ void EnsureSdlVideo() {
     g_desktop_density = d;
     g_display_w = g_desktop_w = int(std::lround(float(m->w) * d));
     g_display_h = g_desktop_h = int(std::lround(float(m->h) * d));
-    // Landscape-only mobile apps may have a portrait native display mode.
-    // Keep adapter modes and screen metrics in the app's orientation, so a
-    // graphics-setting reset does not replace a wide back buffer with a tall one.
-    if (const char* e = Env("DISPLAY_LANDSCAPE"); e && *e == '1') {
-      if (g_desktop_w < g_desktop_h) {
-        std::swap(g_desktop_w, g_desktop_h);
-        std::swap(g_display_w, g_display_h);
-      }
-      std::fprintf(stderr, "user32: landscape desktop %dx%d\n", g_desktop_w, g_desktop_h);
+    // A landscape-only app on a display whose native mode is portrait
+    // (phones): modes and screen metrics in the app's orientation, so a
+    // mode the game picks from the list is wide like its back buffer.
+    if (LandscapeDisplay() && g_desktop_w < g_desktop_h) {
+      std::swap(g_desktop_w, g_desktop_h);
+      std::swap(g_display_w, g_display_h);
     }
   }
 }
@@ -1270,32 +1278,17 @@ void ShowWindowNoActivate(uint32_t hwnd) {
 }
 
 std::vector<ModeSize> DisplayModeSizes() {
-  static const ModeSize kSizes[] = {
-      {640, 480},   {800, 600},   {1024, 768},  {1152, 864},  {1280, 960},
-      {1280, 1024}, {1600, 1200}, {1280, 720},  {1366, 768},  {1600, 900},
-      {1920, 1080}, {1920, 1200}, {2560, 1080}, {2560, 1440}, {3440, 1440},
-      {3840, 2160}};
+  // <ID>_DISPLAY_EXTRA_MODES=WxH,WxH,...: sizes the port adds to the list
+  // (the presets of its launcher, say), so that the game finds the mode it
+  // runs at among those it enumerates.
+  static const std::vector<ModeSize> extra = [] {
+    std::vector<ModeSize> v;
+    const char* e = Env("DISPLAY_EXTRA_MODES");
+    if (!ParseModeSizes(e, &v)) FatalF("DISPLAY_EXTRA_MODES=%s: expected WxH,WxH,...", e);
+    return v;
+  }();
   EnsureSdlVideo();
-  // Never smaller than a 1024x768 desktop, so the classic modes stay.
-  const int mw = std::max(g_desktop_w, 1024), mh = std::max(g_desktop_h, 768);
-  std::vector<ModeSize> v{{g_desktop_w, g_desktop_h}};
-  if (const char* e = Env("DISPLAY_LANDSCAPE"); e && *e == '1') {
-    // Include the same native-aspect quality levels as the mobile launcher,
-    // so reopening Graphics can keep the current resolution selected.
-    for (double scale : {0.5, 2.0 / 3.0, 5.0 / 6.0}) {
-      const int w = std::max(2, int(g_desktop_w * scale) / 2 * 2);
-      const int h = std::max(2, int(g_desktop_h * scale) / 2 * 2);
-      v.push_back({w, h});
-    }
-  }
-  for (const ModeSize& s : kSizes)
-    if (s.w <= mw && s.h <= mh) v.push_back(s);
-  std::sort(v.begin(), v.end(),
-            [](const ModeSize& a, const ModeSize& b) { return a.w != b.w ? a.w < b.w : a.h < b.h; });
-  v.erase(std::unique(v.begin(), v.end(),
-                      [](const ModeSize& a, const ModeSize& b) { return a.w == b.w && a.h == b.h; }),
-          v.end());
-  return v;
+  return BuildModeSizes(g_desktop_w, g_desktop_h, extra);
 }
 
 void ClientAreaSize(uint32_t hwnd, int* w, int* h) {

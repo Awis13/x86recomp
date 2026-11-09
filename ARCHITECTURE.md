@@ -800,7 +800,20 @@ game's back. What games see and what the host shows:
   EnumDisplayModes; one list, `DisplayModeSizes()`): the classic 4:3 and
   5:4 sizes, common wide ones (1280x720 to 3840x2160) and the desktop's
   own size, up to the desktop's size, in 16 and 32 bpp. A mode switch
-  makes that the screen the game sees (GetSystemMetrics, ...).
+  makes that the screen the game sees (GetSystemMetrics, ...). Two
+  switches for ports to phones and tablets, set before SDL video comes
+  up: <ID>_DISPLAY_LANDSCAPE=1 for an app that runs in landscape only,
+  where the display's native mode may be portrait (the desktop the game
+  sees, and so the modes and screen metrics, is then never taller than
+  wide; otherwise a game that falls back to the desktop's mode, when its
+  graphics settings are reset say, gets a tall back buffer), and
+  <ID>_DISPLAY_EXTRA_MODES=WxH,WxH,... for sizes the port adds to the
+  list, such as the resolutions its launcher offers that are not among
+  the common ones (a game shows only enumerated modes in its menu, and
+  may replace one it does not find). The runtime leaves out what is not
+  positive or is larger than the desktop, and sorts the rest in with
+  each size once (`BuildModeSizes`, hle/display_modes.h); a list that
+  is not of that form is a fatal error.
 - Host fullscreen: a visible top-level window that covers the whole
   screen the game sees (a popup at a switched mode, a borderless window
   at the desktop's size, DirectDraw exclusive mode) goes fullscreen on
