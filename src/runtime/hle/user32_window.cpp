@@ -838,6 +838,16 @@ void EnsureSdlVideo() {
     g_desktop_density = d;
     g_display_w = g_desktop_w = int(std::lround(float(m->w) * d));
     g_display_h = g_desktop_h = int(std::lround(float(m->h) * d));
+    // Landscape-only mobile apps may have a portrait native display mode.
+    // Keep adapter modes and screen metrics in the app's orientation, so a
+    // graphics-setting reset does not replace a wide back buffer with a tall one.
+    if (const char* e = Env("DISPLAY_LANDSCAPE"); e && *e == '1') {
+      if (g_desktop_w < g_desktop_h) {
+        std::swap(g_desktop_w, g_desktop_h);
+        std::swap(g_display_w, g_display_h);
+      }
+      std::fprintf(stderr, "user32: landscape desktop %dx%d\n", g_desktop_w, g_desktop_h);
+    }
   }
 }
 
@@ -1269,6 +1279,15 @@ std::vector<ModeSize> DisplayModeSizes() {
   // Never smaller than a 1024x768 desktop, so the classic modes stay.
   const int mw = std::max(g_desktop_w, 1024), mh = std::max(g_desktop_h, 768);
   std::vector<ModeSize> v{{g_desktop_w, g_desktop_h}};
+  if (const char* e = Env("DISPLAY_LANDSCAPE"); e && *e == '1') {
+    // Include the same native-aspect quality levels as the mobile launcher,
+    // so reopening Graphics can keep the current resolution selected.
+    for (double scale : {0.5, 2.0 / 3.0, 5.0 / 6.0}) {
+      const int w = std::max(2, int(g_desktop_w * scale) / 2 * 2);
+      const int h = std::max(2, int(g_desktop_h * scale) / 2 * 2);
+      v.push_back({w, h});
+    }
+  }
   for (const ModeSize& s : kSizes)
     if (s.w <= mw && s.h <= mh) v.push_back(s);
   std::sort(v.begin(), v.end(),
