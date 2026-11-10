@@ -751,19 +751,31 @@ HLE("kernel32.dll", HeapDestroy, 1) {
   return g_heaps.erase(Arg(c, 0)) ? 1 : 0;
 }
 
+namespace {
+
+// An allocation that failed for want of address space: the guest's
+// memory as GuestMemoryText says, the first eight times, for the log of a
+// game that then gives up.
+void ReportOutOfAddressSpace(const char* what, uint64_t size, uint64_t heap) {
+  static std::atomic<int> left{8};
+  if (left.load() <= 0 || left.fetch_sub(1) <= 0) return;
+  if (heap)
+    WarnF("%s of %llu bytes failed (heap %08llX): %s\n", what, (unsigned long long)size,
+          (unsigned long long)heap, GuestMemoryText().c_str());
+  else
+    WarnF("%s of %llu bytes failed: %s\n", what, (unsigned long long)size,
+          GuestMemoryText().c_str());
+}
+
+}  // namespace
+
 HLE64("kernel32.dll", HeapAlloc, 3) {
   GuestHeap* h = FindHeap(Arg(c, 0));
   if (!h) FatalF("HeapAlloc on unknown heap %08llX", (unsigned long long)Arg(c, 0));
   const gaddr p = h->Alloc(Arg(c, 2), Arg(c, 1) & kHeapZeroMemory);
-  if (!p) {
-    // The guest is out of address space (or the heap has a fixed size):
-    // what it looks like, a few times, for the log of a game that then
-    // gives up.
-    static std::atomic<int> left{8};
-    if (left.load() > 0 && left.fetch_sub(1) > 0)
-      WarnF("HeapAlloc of %llu bytes failed (heap %08llX): %s\n", (unsigned long long)Arg(c, 2),
-            (unsigned long long)Arg(c, 0), GuestMemoryText().c_str());
-  }
+  // A heap with a maximum size is full when it is, whatever the address
+  // space has left: that is the guest's business.
+  if (!p && h->growable()) ReportOutOfAddressSpace("HeapAlloc", Arg(c, 2), Arg(c, 0));
   return p;
 }
 
@@ -853,6 +865,8 @@ HLE64("kernel32.dll", VirtualAlloc, 4) {
   if (type & kMemReserve) {
     gaddr base = vm.Reserve(addr, size + (addr & 0xFFFF), type & kMemTopDown);
     if (!base) {
+      // Anywhere: out of address space (a given address may just be taken).
+      if (!addr) ReportOutOfAddressSpace("VirtualAlloc", size, 0);
       SetLastError(kErrorNotEnoughMemory);
       return 0;
     }

@@ -840,8 +840,9 @@ uploads read them without a copy on the CPU.
   by pool (in the shared heap and in the process heap), vertex and index
   buffers, offscreen surfaces, and the shared heap's use, the most it
   has held, its largest free block and the retired blocks waiting for
-  the GPU. A HeapAlloc that fails logs the first line too (its first
-  eight times).
+  the GPU. An allocation that fails for want of address space (a
+  HeapAlloc on a heap without a maximum size, a VirtualAlloc reservation
+  at no given address) logs the first line too, the first eight times.
 
 ### Display modes, fullscreen and presentation
 Display modes are virtual: the host's mode never changes behind the

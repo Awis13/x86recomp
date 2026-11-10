@@ -70,6 +70,9 @@ class GuestHeap {
   ~GuestHeap();
 
   uint64_t handle() const { return handle_; }
+  // Whether it takes more address space when full (no maximum size): if
+  // so, an allocation fails only for want of address space.
+  bool growable() const { return max_size_ == 0; }
 
   uint64_t Alloc(uint64_t size, bool zero);
   bool Free(uint64_t p);
