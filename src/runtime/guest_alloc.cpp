@@ -155,6 +155,15 @@ bool GuestHeap::Grow(uint64_t need) {
   uint64_t size = RoundUp(std::max(need, kDefaultSegment),
                           GuestAllocator::kGranularity);
   uint64_t base = vm_.Reserve(0, size);
+  // The default segment is a growth preference. A smaller VM gap can
+  // still satisfy this allocation when no full-sized segment fits.
+  if (!base && need < size) {
+    const uint64_t minimum = RoundUp(need, GuestAllocator::kGranularity);
+    if (minimum < size) {
+      size = minimum;
+      base = vm_.Reserve(0, size);
+    }
+  }
   if (!base) return false;
   // Committing is cheap: host pages are only materialised when touched.
   vm_.Commit(base, size, Prot::RW);

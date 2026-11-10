@@ -11,6 +11,7 @@ namespace {
 
 constexpr uint32_t kScnMemWrite = 0x80000000;
 constexpr uint16_t kFileDll = 0x2000;
+constexpr uint16_t kFileLargeAddressAware = 0x20;
 
 template <typename T>
 T Rd(const std::vector<uint8_t>& d, size_t off) {
@@ -61,6 +62,7 @@ bool PeImage::Load(const std::string& path, GuestMemory& mem,
     return false;
   }
   dll = (Rd<uint16_t>(d, pe + 22) & kFileDll) != 0;
+  large_address_aware = (Rd<uint16_t>(d, pe + 22) & kFileLargeAddressAware) != 0;
   entry = Rd<uint32_t>(d, oh + 16);
   // PE32+ widens ImageBase and the stack and heap sizes to 64 bits (and
   // drops BaseOfData), which moves the data directories by 16 bytes.

@@ -250,7 +250,9 @@ uint32_t LockLevel(Texture& t, uint32_t face, uint32_t level, uint32_t out, uint
   if (l.locked) return D3DERR_INVALIDCALL;
   if ((t.usage & (D3DUSAGE_RENDERTARGET | D3DUSAGE_DEPTHSTENCIL)) && t.pool == D3DPOOL_DEFAULT)
     return D3DERR_INVALIDCALL;  // GPU-only
-  LevelMem(t, l);
+  // Allocation can fail even though the GPU texture exists. A successful
+  // lock must publish writable storage; leave the level unlocked for retry.
+  if (!LevelMem(t, l)) return 0x8007000E;  // E_OUTOFMEMORY
   if (!(flags & (D3DLOCK_READONLY | D3DLOCK_NO_DIRTY_UPDATE))) RenameLevelIfInUse(t, l);
   gfx::Rect r{0, 0, int32_t(l.w), int32_t(l.h)};
   if (rect) r = *G<gfx::Rect>(rect);

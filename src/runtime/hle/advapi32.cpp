@@ -325,21 +325,34 @@ HLE_NAMED("oleaut32.dll", "#6", SysFreeString, 1) {
   return 0;
 }
 
-// VARIANT: vt (2 bytes) at +0, the value at +8. Only the empty and string
-// kinds are ever made here (the benchmark's system query that fails).
-constexpr uint16_t kVtEmpty = 0, kVtBstr = 8;
-
+// VARIANT lifecycle for scalar, BSTR and COM-interface values. These are
+// 32-bit guest layouts: vt at +0, pointer/value union at +8.
 HLE_NAMED("oleaut32.dll", "#8", VariantInit, 1) {
-  if (Arg(c, 0)) Wr16(Arg(c, 0), kVtEmpty);
+  // An uninitialized VARIANT may contain garbage: do not release its contents.
+  if (Arg(c, 0)) Wr16(Arg(c, 0), 0);  // VT_EMPTY
   return 0;
 }
 
 HLE_NAMED("oleaut32.dll", "#9", VariantClear, 1) {
+  constexpr uint16_t kByRef = 0x4000, kArray = 0x2000;
+  constexpr uint32_t kBadVarType = 0x80020008, kNotImpl = 0x80004001;
   const uint32_t v = Arg(c, 0);
   if (!v) return 0;
-  if (Rd16(v) == kVtBstr) com::FreeBstr(Rd32(v + 8));
-  Wr16(v, kVtEmpty);
-  return 0;  // S_OK
+  const uint16_t tag = Rd16(v), type = tag & ~(kByRef | kArray);
+  // VT_VARIANT is only valid by reference. SAFEARRAYs and records have no
+  // implementation here; fail without discarding their ownership information.
+  if (type == 15 || type > 23 || (type == 12 && !(tag & (kByRef | kArray))) ||
+      (type <= 1 && (tag & (kByRef | kArray))))
+    return kBadVarType;
+  if ((tag & kArray) && !(tag & kByRef)) return kNotImpl;
+  if (!(tag & kByRef)) {
+    if (type == 8) com::FreeBstr(Rd32(v + 8));  // VT_BSTR
+    else if ((type == 9 || type == 13) && Rd32(v + 8))
+      com::Release(Rd32(v + 8));  // VT_DISPATCH / VT_UNKNOWN
+  }
+  // BYREF values belong to the caller, including strings and interfaces.
+  Wr16(v, 0);
+  return 0;
 }
 
 // ---- wintrust / crypt32 --------------------------------------------------------

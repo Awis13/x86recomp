@@ -479,7 +479,14 @@ int RunProcess(const GameConfig& game, const std::string& exe_path,
     // Everything above 4 GiB, below the TEBs (runtime.h).
     p.vm.Init(&p.mem, kUserLo64, kTebLo64);
   } else {
-    p.vm.Init(&p.mem, 0x00010000, kThunkBase);
+    // PE32 LAA images get the WOW64 address range. Restricting them to
+    // 2 GiB can fail resource allocations while half the arena is unused.
+    p.vm.Init(&p.mem, 0x00010000,
+              p.img.large_address_aware ? 0xFFFF0000ull : kThunkBase);
+    if (p.img.large_address_aware)
+      // Keep the thunks, PEB and downward-growing TEBs out of all guest
+      // reservations, including explicit and MEM_TOP_DOWN allocations.
+      p.vm.MarkReserved(kThunkBase, 0x80000000ull - kThunkBase);
     p.vm.MarkReserved(hle::kModuleRegion, hle::kModuleRegionSize);
   }
   p.vm.MarkReserved(p.img.image_base, p.img.image_size);

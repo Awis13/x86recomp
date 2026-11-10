@@ -34,6 +34,7 @@ constexpr GUID kIID_IWbemClassObject = {0xDC12A681, 0x737F, 0x11CF, {0x88, 0x4D,
 
 constexpr uint32_t S_OK = 0, WBEM_S_FALSE = 1, E_NOINTERFACE = 0x80004002,
                    E_POINTER = 0x80004003, WBEM_E_NOT_FOUND = 0x80041002,
+                   WBEM_E_NOT_SUPPORTED = 0x8004100C,
                    WBEM_E_INVALID_NAMESPACE = 0x8004100E,
                    WBEM_E_INVALID_CLASS = 0x80041010;
 constexpr uint16_t VT_BSTR = 8;
@@ -175,16 +176,19 @@ HLE_NAMED("wbemprox.dll", "IWbemServices::CreateInstanceEnum", Svc_CreateInstanc
   return S_OK;
 }
 
-// (strQueryLanguage, strQuery, lFlags, pCtx, ppEnum): no class is served
-// to queries (the benchmark asks Win32_OperatingSystem and Win32_Processor
-// for its report and goes on without them).
+// (strQueryLanguage, strQuery, lFlags, pCtx, ppEnum). This provider only
+// implements CreateInstanceEnum for XInput discovery; it has no WQL engine or
+// hardware inventory. Report callers handle a failed query; distinguish an
+// unsupported operation from a supported query with no matches. Leave the
+// output null on failure.
 HLE_NAMED("wbemprox.dll", "IWbemServices::ExecQuery", Svc_ExecQuery, 6) {
   Self<Services>(c, "IWbemServices");
-  uint32_t out = Arg(c, 5);
+  const uint32_t out = Arg(c, 5);
   if (!out) return E_POINTER;
   Wr32(out, 0);
-  WarnF("wbem: ExecQuery(%s): not available\n", Arg(c, 2) ? win32::Narrow(GWStr(Arg(c, 2))).c_str() : "");
-  return WBEM_E_INVALID_CLASS;
+  const auto query = Arg(c, 2) ? GWStr(Arg(c, 2)) : u"";
+  WarnF("wbem: ExecQuery(%s): not supported\n", win32::Narrow(query).c_str());
+  return WBEM_E_NOT_SUPPORTED;
 }
 
 // ---- IEnumWbemClassObject -----------------------------------------------------

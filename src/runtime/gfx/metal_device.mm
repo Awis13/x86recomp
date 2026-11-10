@@ -66,6 +66,9 @@
 #include <vector>
 
 #include "runtime/gfx/device.h"
+#if TARGET_OS_OSX
+#include "runtime/gfx/metal_cache.h"
+#endif
 // kSmaaHlsl: SMAA.hlsl (smaa/, MIT), and its lookup textures.
 #include "runtime/gfx/smaa/AreaTex.h"
 #include "runtime/gfx/smaa/SearchTex.h"
@@ -73,6 +76,8 @@
 #include "runtime/gfx/metal_prelude.h"
 #include "runtime/gfx/reversed_z.h"
 #include "runtime/gfx/shader_compile.h"
+#include "runtime/gfx/metal_internal.h"
+#include "runtime/gfx/metal_smaa.h"
 #include "runtime/log.h"
 
 // RECOMP_DISPLAY_LINK=1 (macOS 14+): the display hands out each drawable
@@ -231,6 +236,9 @@ bool Empty(const Rect& r) { return r.right <= r.left || r.bottom <= r.top; }
 
 // A render pipeline: shaders, the pass's attachment formats, blending and
 // write masks (Metal enums).
+#if TARGET_OS_OSX
+using PipeKey = MetalPipeKey;
+#else
 struct PipeKey {
   uint32_t vs, ps;
   uint16_t color[4];  // MTLPixelFormat per colour target (0: none)
@@ -241,6 +249,7 @@ struct PipeKey {
   bool operator==(const PipeKey& o) const { return std::memcmp(this, &o, sizeof *this) == 0; }
 };
 static_assert(sizeof(PipeKey) == 32, "no padding");
+#endif
 // PipeKey::lean: a shader made without what the draw does not use.
 constexpr uint8_t kLeanPs = 1;  // the pixel shader without the alpha test
 
@@ -272,184 +281,40 @@ struct BytesHash {
 
 // The device's own shaders: clears and textured quads (StretchRect, the
 // window).
-constexpr const char* kInternalMsl = R"(
-#include <metal_stdlib>
-using namespace metal;
-struct ClearOut { float4 pos [[position]]; };
-// A triangle over the whole target at depth p.x (the scissor bounds it).
-vertex ClearOut clear_vs(uint vid [[vertex_id]], constant float4& p [[buffer(0)]]) {
-  float2 t = float2((vid << 1) & 2, vid & 2);
-  ClearOut o;
-  o.pos = float4(t * 2.0 - 1.0, p.x, 1.0);
-  return o;
-}
-fragment float4 clear_fs(constant float4& c [[buffer(0)]]) { return c; }
-struct QuadOut { float4 pos [[position]]; float2 uv; };
-// A strip of four: r[0] the rectangle in clip space (x0, y0, x1, y1),
-// r[1] the source in texture coordinates, r[2].x the source level.
-vertex QuadOut quad_vs(uint vid [[vertex_id]], constant float4* r [[buffer(0)]]) {
-  float2 t = float2(vid & 1, vid >> 1);
-  QuadOut o;
-  o.pos = float4(mix(r[0].xy, r[0].zw, t), 0.0, 1.0);
-  o.uv = mix(r[1].xy, r[1].zw, t);
-  return o;
-}
-fragment float4 quad_fs(QuadOut in [[stage_in]], texture2d<float> tex [[texture(0)]],
-                        sampler s [[sampler(0)]], constant float4* r [[buffer(0)]]) {
-  return tex.sample(s, in.uv, level(r[2].x));
-}
-// A triangle over the whole target; uv 0..1 from the top left.
-struct TriOut { float4 pos [[position]]; float2 uv; };
-vertex TriOut tri_vs(uint vid [[vertex_id]]) {
-  float2 t = float2((vid << 1) & 2, vid & 2);
-  TriOut o;
-  o.pos = float4(t * 2.0 - 1.0, 0.0, 1.0);
-  o.uv = float2(t.x, 1.0 - t.y);
-  return o;
-}
-// A depth buffer copied to one of another size (nearest).
-struct DepthOut { float d [[depth(any)]]; };
-fragment DepthOut depth_copy_fs(TriOut in [[stage_in]], depth2d<float> src [[texture(0)]],
-                                sampler s [[sampler(0)]]) {
-  DepthOut o;
-  o.d = src.sample(s, in.uv);
-  return o;
-}
-// Motion from the camera alone: each pixel's point (from its depth) where
-// the last frame's camera saw it, in texture coordinates (previous - now).
-// m: this frame's clip space (the depth as stored) to the last frame's.
-// The depth is copied in the same pass (MetalFX's depth input: the
-// scene's own may have stencil).
-struct MotionOut { float2 mv [[color(0)]]; float d [[depth(any)]]; };
-fragment MotionOut motion_fs(TriOut in [[stage_in]], depth2d<float> depth [[texture(0)]],
-                             constant float4x4& m [[buffer(0)]]) {
-  float d = depth.read(uint2(in.pos.xy));
-  float4 prev = m * float4(in.uv.x * 2.0 - 1.0, 1.0 - in.uv.y * 2.0, d, 1.0);
-  float2 p = prev.xy / prev.w;
-  MotionOut o;
-  o.mv = float2(p.x * 0.5 + 0.5, 0.5 - p.y * 0.5) - in.uv;
-  o.d = d;
-  return o;
-}
-
-// Temporal antialiasing (RECOMP_UPSCALER=taa), one pass at the back
-// buffer's size. The history is reprojected by the camera (motion from the
-// nearest depth around the pixel, so edges move with their foreground),
-// read through a Catmull-Rom filter (five bilinear taps, it stays sharp
-// when it moves), and clipped toward the mean of this frame's 3x3
-// neighbourhood in YCoCg (variance clipping: what moves on its own, cars,
-// people, rain, swaying trees, has no motion here and must not ghost).
-// The more the content moves, the more of this frame goes in. This
-// frame's colour is reconstructed at the pixel's centre from its 3x3
-// neighbourhood (each sample where the jitter put it, Blackman-Harris
-// weights as Karis's UE4 TAA), not taken where the jitter left it: that
-// offset, accumulated, is what blurs a plain TAA.
-struct TaaParams {
-  float4x4 m;      // this frame's clip space to the last frame's
-  float2 inv_size;
-  float2 jitter;   // the scene's shift this frame, pixels (x right, y down)
-  float w_min, w_max;  // this frame's weight, still and moving
-  float w_per_px;      // the weight's rise per pixel of motion
-  float gamma;         // the clip box's half size, in standard deviations
-  uint reset;
-  uint direct;     // write the result to `out` too (no sharpening after)
-  uint reversed;   // depth stored as 1 - d (m takes it so): the nearest is the largest
-};
-half3 rgb_to_ycocg(half3 c) {
-  return half3(0.25h * (c.r + 2.0h * c.g + c.b), 0.5h * (c.r - c.b), 0.25h * (2.0h * c.g - c.r - c.b));
-}
-half3 ycocg_to_rgb(half3 c) { return half3(c.x + c.y - c.z, c.x + c.z, c.x - c.y - c.z); }
-float3 taa_history(texture2d<half> h, sampler s, float2 uv, float2 size, float2 inv_size) {
-  const float2 t = floor(uv * size - 0.5) + 0.5, f = uv * size - t;
-  const float2 w0 = f * (-0.5 + f * (1.0 - 0.5 * f)), w1 = 1.0 + f * f * (-2.5 + 1.5 * f);
-  const float2 w2 = f * (0.5 + f * (2.0 - 1.5 * f)), w3 = f * f * (-0.5 + 0.5 * f);
-  const float2 w12 = w1 + w2;
-  const float2 p0 = (t - 1.0) * inv_size, p3 = (t + 2.0) * inv_size, p12 = (t + w2 / w12) * inv_size;
-  const float a = w12.x * w0.y, b = w0.x * w12.y, c = w12.x * w12.y, d = w3.x * w12.y, e = w12.x * w3.y;
-  const float3 r = float3(h.sample(s, float2(p12.x, p0.y)).rgb) * a + float3(h.sample(s, float2(p0.x, p12.y)).rgb) * b +
-                   float3(h.sample(s, p12).rgb) * c + float3(h.sample(s, float2(p3.x, p12.y)).rgb) * d +
-                   float3(h.sample(s, float2(p12.x, p3.y)).rgb) * e;
-  return max(r / (a + b + c + d + e), 0.0);
-}
-kernel void taa_cs(texture2d<half, access::read> color [[texture(0)]],
-                   depth2d<float, access::read> depth [[texture(1)]],
-                   texture2d<half> history [[texture(2)]],
-                   texture2d<half, access::write> history_out [[texture(3)]],
-                   texture2d<half, access::write> out [[texture(4)]],
-                   constant TaaParams& p [[buffer(0)]], uint2 gid [[thread_position_in_grid]]) {
-  const uint2 size = uint2(color.get_width(), color.get_height());
-  if (gid.x >= size.x || gid.y >= size.y) return;
-  const int2 last = int2(size) - 1;
-  half3 mean = 0.0h, sq = 0.0h;
-  float3 filtered = 0.0;
-  float wsum = 0.0;
-  for (int y = -1; y <= 1; y++)
-    for (int x = -1; x <= 1; x++) {
-      const half3 c = rgb_to_ycocg(color.read(uint2(clamp(int2(gid) + int2(x, y), 0, last))).rgb);
-      // The neighbour's sample lies at its centre less the jitter.
-      const float2 d = float2(x, y) - p.jitter;
-      const float w = exp(-2.29 * dot(d, d));
-      filtered += float3(c) * w;
-      wsum += w;
-      mean += c;
-      sq += c * c;
-    }
-  const half3 cur = half3(filtered / wsum);
-  half3 res = cur;
-  if (p.reset == 0) {
-    // The nearest of the pixel and its diagonal neighbours.
-    int2 q = int2(gid);
-    float d = depth.read(gid);
-    for (int k = 0; k < 4; k++) {
-      const int2 n = clamp(int2(gid) + int2(k & 1 ? 1 : -1, k & 2 ? 1 : -1), 0, last);
-      const float dn = depth.read(uint2(n));
-      if (p.reversed ? dn > d : dn < d) { d = dn; q = n; }
-    }
-    const float2 uq = (float2(q) + 0.5) * p.inv_size;
-    const float4 prev = p.m * float4(uq.x * 2.0 - 1.0, 1.0 - uq.y * 2.0, d, 1.0);
-    const float2 mv = float2(prev.x / prev.w * 0.5 + 0.5, 0.5 - prev.y / prev.w * 0.5) - uq;
-    const float2 uv = (float2(gid) + 0.5) * p.inv_size + mv;
-    if (prev.w > 0.0 && all(uv >= 0.0) && all(uv <= 1.0)) {
-      constexpr sampler s(filter::linear, address::clamp_to_edge);
-      mean /= 9.0h;
-      const half3 sigma = sqrt(max(sq / 9.0h - mean * mean, 0.0h)) * half(p.gamma) + 1.0e-3h;
-      half3 h = rgb_to_ycocg(half3(taa_history(history, s, uv, float2(size), p.inv_size)));
-      const half3 off = h - mean, ext = abs(off) / sigma;
-      h = mean + off / max(1.0h, max(ext.x, max(ext.y, ext.z)));
-      const float moved = length(mv * float2(size));
-      res = mix(h, cur, half(mix(p.w_min, p.w_max, saturate(moved * p.w_per_px))));
-    }
-  }
-  const half4 o = half4(max(ycocg_to_rgb(res), 0.0h), 1.0h);
-  history_out.write(o, gid);
-  if (p.direct != 0) out.write(o, gid);
-}
-
-// Sharpening after TAA, contrast-adaptive (after AMD's CAS): the cross of
-// neighbours pulled away from the centre, less where the local contrast
-// is already high (no halos on edges). sharpness 0..1.
-kernel void taa_sharpen_cs(texture2d<half, access::read> src [[texture(0)]],
-                           texture2d<half, access::write> out [[texture(1)]],
-                           constant float& sharpness [[buffer(0)]], uint2 gid [[thread_position_in_grid]]) {
-  const uint2 size = uint2(src.get_width(), src.get_height());
-  if (gid.x >= size.x || gid.y >= size.y) return;
-  const int2 last = int2(size) - 1, g = int2(gid);
-  const half3 e = src.read(gid).rgb;
-  const half3 b = src.read(uint2(clamp(g + int2(0, -1), 0, last))).rgb;
-  const half3 d = src.read(uint2(clamp(g + int2(-1, 0), 0, last))).rgb;
-  const half3 f = src.read(uint2(clamp(g + int2(1, 0), 0, last))).rgb;
-  const half3 h = src.read(uint2(clamp(g + int2(0, 1), 0, last))).rgb;
-  const half3 mn = min(e, min(min(b, d), min(f, h))), mx = max(e, max(max(b, d), max(f, h)));
-  const half3 amp = sqrt(saturate(min(mn, 2.0h - mx) / max(mx, 1.0e-4h)));
-  const half3 w = amp * half(-1.0f / mix(8.0f, 5.0f, sharpness));
-  out.write(half4(saturate((e + (b + d + f + h) * w) / (1.0h + 4.0h * w)), 1.0h), gid);
-}
-)";
+using recomp::gfx::kInternalMsl;
 
 constexpr uint32_t kClearVs = 0x80000001, kClearPs = 0x80000002;
 constexpr uint32_t kQuadVs = 0x80000003, kQuadPs = 0x80000004;
 
+id<MTLLibrary> CachedLibrary(id<MTLDevice> dev, NSString* source, MTLCompileOptions* options, NSError** error) {
+#if TARGET_OS_OSX
+  options = options ? [options copy] : [MTLCompileOptions new];
+  options.languageVersion = MTLLanguageVersion2_1;
+  return MetalCachedLibrary(dev, source, options, error);
+#else
+  return [dev newLibraryWithSource:source options:options error:error];
+#endif
+}
+id<MTLFunction> CachedFunction(id<MTLLibrary> lib, NSString* name) {
+#if TARGET_OS_OSX
+  return MetalCachedFunction(lib, name);
+#else
+  return [lib newFunctionWithName:name];
+#endif
+}
+id<MTLRenderPipelineState> CachedPipeline(id<MTLDevice> dev, MTLRenderPipelineDescriptor* pd, NSError** error) {
+#if TARGET_OS_OSX
+  return MetalCachedPipeline(dev, pd, error);
+#else
+  return [dev newRenderPipelineStateWithDescriptor:pd error:error];
+#endif
+}
+
 class MetalDevice final : public Device {
+  struct Shader;
+  struct ShaderWork;
+  static constexpr size_t kShaderLanes = 4;
+
  public:
   explicit MetalDevice(SDL_Window* w) : window_(w) {}
 
@@ -507,8 +372,13 @@ class MetalDevice final : public Device {
       // (a chunk a device makes is resident for its lifetime).
       MakeSpareChunks(kSlots);
 
+#if TARGET_OS_OSX
+      // Freeze selection before loading frames can record observations. Restore
+      // in parallel with the loading screen; the first depth-tested scene draw joins it.
+      preload_ = std::jthread(MetalPreloadTask(dev_));
+#endif
       NSError* err = nil;
-      id<MTLLibrary> lib = [dev_ newLibraryWithSource:@(kInternalMsl) options:nil error:&err];
+      id<MTLLibrary> lib = CachedLibrary(dev_, @(kInternalMsl), nil, &err);
       if (!lib) FatalF("gfx: the device's own shaders: %s", err.localizedDescription.UTF8String);
       internal_lib_ = lib;
       LoadRecipes();
@@ -566,7 +436,7 @@ class MetalDevice final : public Device {
       for (auto [sid, name] : {std::pair{kClearVs, "clear_vs"}, {kClearPs, "clear_fs"},
                                {kQuadVs, "quad_vs"}, {kQuadPs, "quad_fs"}}) {
         Shader s;
-        s.fn = [lib newFunctionWithName:@(name)];
+        s.fn = CachedFunction(lib, @(name));
         shaders_[sid] = s;
         enc_shaders_[sid] = s.fn;
       }
@@ -646,12 +516,15 @@ class MetalDevice final : public Device {
 
   ~MetalDevice() override {
     if (!dev_) return;
-    // Lean shader and pipeline prebuild blocks capture this device's state:
+    // Shader and pipeline preload blocks capture this device's state:
     // they are finished below, before its maps, mutexes and Metal objects
     // are destroyed. Those still queued see closing_ and do nothing, so only
     // the one running is waited for (quitting while loading, hundreds are
     // queued).
     closing_ = true;
+#if TARGET_OS_OSX
+    preload_.request_stop();
+#endif
     // Each step that takes long is told, to find what holds a quit up.
     uint64_t t = NowNs();
     auto step = [&t](const char* what) {
@@ -673,8 +546,16 @@ class MetalDevice final : public Device {
     step("the encoding thread");
     if (last_cb_) [last_cb_ waitUntilCompleted];
     step("the GPU");
+#if TARGET_OS_OSX
+    JoinPreload();
+    for (size_t lane = 0; lane < kShaderLanes; lane++) dispatch_sync(ShaderQueue(lane), ^{});
+    step("the shader prefetch");
+#endif
     dispatch_sync(AheadQueue(), ^{});
     step("the build ahead");
+#if TARGET_OS_OSX
+    MetalDrainPipelineWrites(true);
+#endif
     StopDisplayLink();
     if (view_) SDL_Metal_DestroyView(view_);
   }
@@ -1305,69 +1186,122 @@ class MetalDevice final : public Device {
 
   ShaderId CreateShader(const hlsl::Program& prog) override {
     std::lock_guard<std::recursive_mutex> l(mu_);
+    Shader sh;
+    sh.stage = prog.stage;
+    sh.inputs = prog.inputs.size();
+    sh.float_regs = prog.float_regs;
+    sh.position_matrix = prog.position_matrix;
+    sh.position_note = prog.position_note;
+    sh.float_reads = prog.float_reads;
+    sh.sampler_type.fill(hlsl::ParamType::Void);
+    for (const hlsl::Sampler& smp : prog.samplers) {
+      if (smp.reg >= 16) FatalF("gfx: shader sampler register %u", smp.reg);
+      sh.sampler_type[smp.reg] = smp.type;
+      sh.samplers = std::max(sh.samplers, smp.reg + 1);
+    }
+    const std::string glsl = "#version 450\n" + Prelude(prog.stage) + prog.glsl;
+    sh.hash = Fnv64(glsl.data(), glsl.size()) ^ uint64_t(prog.stage);
+    sh.varyings = hlsl::VaryingMask(prog);
+    sh.program = std::make_shared<const hlsl::Program>(prog);
+    const ShaderId sid = next_id_++;
+    shaders_[sid] = std::move(sh);
+    sid_by_hash_[shaders_.at(sid).hash] = sid;
+#if TARGET_OS_OSX
+    // Registering a game shader does not mean a frame will use it. Keep
+    // its translation until a draw needs it; only observed recipes justify
+    // loading it early for archive-only prebuilding on subsequent launches.
+    if (recipe_by_shader_.contains(shaders_.at(sid).hash)) CompileShader(sid);
+    else pending_shaders_.push_back(sid);
+#else
+    CompileShader(sid);
+#endif
+    if (perf_) pc_.shaders++;
+    return sid;
+  }
+
+  std::shared_ptr<ShaderWork> ShaderJob(Shader& sh) {
+    if (!sh.work) {
+      sh.work = std::make_shared<ShaderWork>();
+      sh.work->device = dev_;
+      sh.work->program = sh.program;
+      sh.work->hash = sh.hash;
+      sh.work->msl = CachedMsl(sh.hash);
+    }
+    return sh.work;
+  }
+
+  static void BuildShader(const std::shared_ptr<ShaderWork>& work) {
+    std::call_once(work->once, [&] {
+      @autoreleasepool {
+        const auto& prog = *work->program;
+        const bool vertex = prog.stage == hlsl::Stage::Vertex;
+        std::string glsl = "#version 450\n" + Prelude(prog.stage) + prog.glsl;
+        const uint64_t hash = work->hash;
+        // RECOMP_SHADER_DUMP=dir: each translated shader's GLSL, by hash.
+        if (const char* dir = std::getenv("RECOMP_SHADER_DUMP")) {
+          char path[1024];
+          std::snprintf(path, sizeof path, "%s/%016llx.%s.glsl", dir, (unsigned long long)hash, vertex ? "vs" : "ps");
+          if (FILE* f = std::fopen(path, "wx")) {
+            std::fwrite(glsl.data(), 1, glsl.size(), f);
+            std::fclose(f);
+          }
+        }
+        // GLSL to SPIR-V to MSL takes most of the time (Metal's own compile
+        // of the MSL is cached by the system): the MSL comes from earlier
+        // runs when it can.
+        std::string& msl = work->msl;
+#if TARGET_OS_OSX
+        if (msl.empty()) msl = MetalPreparedMsl(glsl);
+#endif
+        NSError* err = nil;
+        bool has_lean = MetalLeanMacros(&msl, vertex);
+        id<MTLLibrary> lib = msl.empty() ? nil
+                                         : CachedLibrary(work->device, @(msl.c_str()), has_lean ? MslOptions(true) : nil, &err);
+        if (!lib) {
+          std::vector<uint32_t> spirv;
+          std::string log;
+          if (!GlslToSpirv(glsl, vertex ? ShaderStage::Vertex : ShaderStage::Fragment, &spirv, &log)) {
+            std::fprintf(stderr, "%s\n", glsl.c_str());
+            work->error = "compiling a translated shader: " + log; return;
+          }
+          msl.clear();
+          if (!SpirvToMsl(spirv, &msl, &log)) { work->error = "SPIR-V to MSL: " + log; return; }
+          work->translated = true;
+          has_lean = MetalLeanMacros(&msl, vertex);
+          lib = CachedLibrary(work->device, @(msl.c_str()), has_lean ? MslOptions(true) : nil, &err);
+        }
+        if (!lib) {
+          std::fprintf(stderr, "%s\n", msl.c_str());
+          work->error = std::string("compiling MSL: ") + (err.localizedDescription.UTF8String ?: "unknown error"); return;
+        }
+        work->function = CachedFunction(lib, @"main0");
+        work->has_lean = has_lean;
+      }
+    });
+  }
+
+  void CompileShader(ShaderId sid) {
+    Shader& sh = shaders_.at(sid);
+    if (sh.fn) return;
     const uint64_t perf_t0 = perf_ ? NowNs() : 0;
+    const auto work = ShaderJob(sh);
+    // Claim a queued job immediately; only an already running job can hold up
+    // this draw. call_once also makes prefetch and demanded work share a result.
+    BuildShader(work);
+    if (!work->function) FatalF("gfx: shader: %s", work->error.c_str());
     @autoreleasepool {
-      Shader sh;
-      sh.stage = prog.stage;
-      sh.inputs = prog.inputs.size();
-      sh.float_regs = prog.float_regs;
-      sh.position_matrix = prog.position_matrix;
-      sh.position_note = prog.position_note;
-      sh.float_reads = prog.float_reads;
-      sh.sampler_type.fill(hlsl::ParamType::Void);
-      for (const hlsl::Sampler& smp : prog.samplers) {
-        if (smp.reg >= 16) FatalF("gfx: shader sampler register %u", smp.reg);
-        sh.sampler_type[smp.reg] = smp.type;
-        sh.samplers = std::max(sh.samplers, smp.reg + 1);
-      }
-      bool vertex = prog.stage == hlsl::Stage::Vertex;
-      std::string glsl = "#version 450\n" + Prelude(prog.stage) + prog.glsl;
-      const uint64_t hash = Fnv64(glsl.data(), glsl.size()) ^ uint64_t(prog.stage);
-      // RECOMP_SHADER_DUMP=dir: each translated shader's GLSL, by hash.
-      if (const char* dir = std::getenv("RECOMP_SHADER_DUMP")) {
-        char path[1024];
-        std::snprintf(path, sizeof path, "%s/%016llx.%s.glsl", dir, (unsigned long long)hash, vertex ? "vs" : "ps");
-        if (FILE* f = std::fopen(path, "wx")) {
-          std::fwrite(glsl.data(), 1, glsl.size(), f);
-          std::fclose(f);
-        }
-      }
-      // GLSL to SPIR-V to MSL takes most of the time (Metal's own compile
-      // of the MSL is cached by the system): the MSL comes from earlier
-      // runs when it can.
-      std::string msl = CachedMsl(hash);
-      NSError* err = nil;
-      bool has_lean = MetalLeanMacros(&msl, vertex);
-      id<MTLLibrary> lib = msl.empty() ? nil
-                                       : [dev_ newLibraryWithSource:@(msl.c_str())
-                                                            options:has_lean ? MslOptions(true) : nil
-                                                              error:&err];
-      if (!lib) {
-        std::vector<uint32_t> spirv;
-        std::string log;
-        if (!GlslToSpirv(glsl, vertex ? ShaderStage::Vertex : ShaderStage::Fragment, &spirv, &log)) {
-          std::fprintf(stderr, "%s\n", glsl.c_str());
-          FatalF("gfx: compiling a translated shader (source above): %s", log.c_str());
-        }
-        msl.clear();
-        if (!SpirvToMsl(spirv, &msl, &log)) FatalF("gfx: SPIR-V to MSL: %s", log.c_str());
+      const uint64_t hash = sh.hash;
+      const std::string& msl = work->msl;
+      if (work->translated) {
+        CacheMsl(hash, msl);
         if (perf_) pc_.msl_compiles++;
-        has_lean = MetalLeanMacros(&msl, vertex);
-        lib = [dev_ newLibraryWithSource:@(msl.c_str())
-                                 options:has_lean ? MslOptions(true) : nil
-                                   error:&err];
-        if (lib) CacheMsl(hash, msl);
       }
-      if (!lib) {
-        std::fprintf(stderr, "%s\n", msl.c_str());
-        FatalF("gfx: compiling MSL (above): %s", err.localizedDescription.UTF8String);
-      }
-      sh.fn = [lib newFunctionWithName:@"main0"];
-      sh.hash = hash;
-      sh.varyings = hlsl::VaryingMask(prog);
-      if (!vertex) sh.program = std::make_shared<const hlsl::Program>(prog);
-      sh.has_lean = has_lean;
-      if (has_lean) {
+#if TARGET_OS_OSX
+      msl_cache_[hash] = msl;
+#endif
+      sh.fn = work->function;
+      sh.has_lean = work->has_lean;
+      if (sh.has_lean && !FoundLean(hash)) {
         NSString* src = @(msl.c_str());
         std::atomic<bool>* closing = &closing_;
         dispatch_async(AheadQueue(), ^{
@@ -1375,9 +1309,6 @@ class MetalDevice final : public Device {
           Lean(hash, src);
         });
       }
-      ShaderId sid = next_id_++;
-      shaders_[sid] = sh;
-      sid_by_hash_[sh.hash] = sid;
       Keep(sh.fn);
       __unsafe_unretained id<MTLFunction> fn = sh.fn;
       Rec([this, sid, fn, hash] {
@@ -1385,30 +1316,81 @@ class MetalDevice final : public Device {
         enc_shader_hash_[sid] = hash;
       });
       PrebuildFor(sh.hash);
-      if (perf_t0) {
-        pc_.shaders++;
-        pc_.shader_ns += NowNs() - perf_t0;
-      }
-      return sid;
+      sh.work.reset();
+      if (sh.stage == hlsl::Stage::Vertex) sh.program.reset();
+      if (perf_t0) pc_.shader_ns += NowNs() - perf_t0;
     }
   }
+
+#if TARGET_OS_OSX
+  void JoinPreload() {
+    if (preload_.joinable()) {
+      const uint64_t started = NowNs();
+      preload_.join();
+      std::fprintf(stderr, "gfx: prepared scene barrier waited %.3f ms\n", (NowNs() - started) / 1e6);
+    }
+  }
+
+  static dispatch_queue_t ShaderQueue(size_t lane) {
+    static dispatch_queue_t queues[kShaderLanes] = {
+      dispatch_queue_create("recomp.gfx.shader.0", dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INITIATED, 0)),
+      dispatch_queue_create("recomp.gfx.shader.1", dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INITIATED, 0)),
+      dispatch_queue_create("recomp.gfx.shader.2", dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INITIATED, 0)),
+      dispatch_queue_create("recomp.gfx.shader.3", dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INITIATED, 0))};
+    return queues[lane];
+  }
+
+  void PrefetchShaders() {
+    std::atomic<bool>* closing = &closing_;
+    for (ShaderId sid : pending_shaders_) {
+      auto it = shaders_.find(sid);
+      if (it == shaders_.end() || it->second.fn) continue;
+      const auto work = ShaderJob(it->second);
+      dispatch_async(ShaderQueue(next_shader_lane_++ % kShaderLanes), ^{
+        if (closing->load() || work->cancelled.load()) return;
+        @autoreleasepool {
+          BuildShader(work);
+          if (work->has_lean && !closing->load() && !work->cancelled.load())
+            Lean(work->hash, @(work->msl.c_str()));
+        }
+      });
+    }
+    pending_shaders_.clear();
+  }
+#endif
 
   void DestroyShader(ShaderId sid) override {
     std::lock_guard<std::recursive_mutex> l(mu_);
     auto it = shaders_.find(sid);
     if (it == shaders_.end() || sid >= kClearVs) return;
+    if (it->second.work) it->second.work->cancelled = true;
     const auto variants = std::move(it->second.variants);
     for (const auto& [mask, vid] : variants) DestroyShader(vid);  // `it` stays valid
     Keep(it->second.fn);
     auto h = sid_by_hash_.find(it->second.hash);
-    if (h != sid_by_hash_.end() && h->second == sid) sid_by_hash_.erase(h);
+    if (h != sid_by_hash_.end() && h->second == sid) {
+#if TARGET_OS_OSX
+      auto alias = std::find_if(shaders_.begin(), shaders_.end(), [&](const auto& entry) {
+        return entry.first != sid && entry.second.hash == it->second.hash;
+      });
+      if (alias != shaders_.end()) h->second = alias->first;
+      else sid_by_hash_.erase(h);
+#else
+      sid_by_hash_.erase(h);
+#endif
+    }
     shaders_.erase(it);
     bound_.pipe_set = false;
+#if TARGET_OS_OSX
+    std::erase_if(requested_pipelines_, [sid](const auto& key) { return key.vs == sid || key.ps == sid; });
+#endif
+#if !TARGET_OS_OSX
     {
       std::lock_guard<std::mutex> pl(prebuilt_mu_);
       for (auto p = prebuilt_.begin(); p != prebuilt_.end();)
         p = p->first.vs == sid || p->first.ps == sid ? prebuilt_.erase(p) : std::next(p);
     }
+#endif
     Rec([this, sid] {
       last_pipe_ = nil;
       for (auto p = pipelines_.begin(); p != pipelines_.end();) {
@@ -1438,6 +1420,9 @@ class MetalDevice final : public Device {
 
   void RecordDraw(const ShaderDraw& d) {
     EnsureTarget();
+#if TARGET_OS_OSX
+    if (current_color_ && pass_.depth && rs_[7] && rs_[14]) JoinPreload();
+#endif
     auto vit = shaders_.find(d.vs), pit = shaders_.find(d.ps);
     if (vit == shaders_.end() || pit == shaders_.end()) return;
     const Shader& vs = vit->second;
@@ -1461,6 +1446,8 @@ class MetalDevice final : public Device {
     WarnUnsupportedShaderState();
     MTLScissorRect sc;
     if (!DrawScissor(&sc)) return;
+    CompileShader(d.vs);
+    CompileShader(ps_id);
     if (!BeginDraw()) return;
     if (pass_.scene && !pass_.low) frame_scene_ = true;
     // Jittered for the temporal upscaler: the scene's geometry (depth
@@ -1878,6 +1865,10 @@ class MetalDevice final : public Device {
   // After each draw: the composite's done once it has covered the whole
   // back buffer.
   void AfterDraw() {
+#if TARGET_OS_OSX
+    // Runs after the actual Metal draw command, including repeated state reuse.
+    if (cache_report_) Rec([this] { shader_draws_[last_draw_source_]++; });
+#endif
     if (pass_.low && viewport_.x == 0 && viewport_.y == 0 && int(viewport_.width) >= bb_w_ &&
         int(viewport_.height) >= bb_h_)
       Composite();
@@ -1888,13 +1879,10 @@ class MetalDevice final : public Device {
   id<MTLRenderPipelineState> DepthCopyPipe(MTLPixelFormat pf) {
     auto it = depth_copy_pipes_.find(pf);
     if (it != depth_copy_pipes_.end()) return it->second;
-    MTLRenderPipelineDescriptor* pd = [MTLRenderPipelineDescriptor new];
-    pd.vertexFunction = [internal_lib_ newFunctionWithName:@"tri_vs"];
-    pd.fragmentFunction = [internal_lib_ newFunctionWithName:@"depth_copy_fs"];
-    pd.depthAttachmentPixelFormat = pf;
-    if (pf == MTLPixelFormatDepth32Float_Stencil8) pd.stencilAttachmentPixelFormat = pf;
+    auto pd = MetalDepthCopyDescriptor(pf, CachedFunction(internal_lib_, @"tri_vs"),
+                                      CachedFunction(internal_lib_, @"depth_copy_fs"));
     NSError* err = nil;
-    id<MTLRenderPipelineState> ps = [dev_ newRenderPipelineStateWithDescriptor:pd error:&err];
+    id<MTLRenderPipelineState> ps = CachedPipeline(dev_, pd, &err);
     if (!ps) FatalF("gfx: depth copy pipeline: %s", err.localizedDescription.UTF8String);
     depth_copy_pipes_[pf] = ps;
     return ps;
@@ -1987,10 +1975,18 @@ class MetalDevice final : public Device {
     if (taa_pipe_ && taa_src_.width == w && taa_src_.height == h) return true;
     if (!taa_pipe_) {
       NSError* err = nil;
-      taa_pipe_ = [dev_ newComputePipelineStateWithFunction:[internal_lib_ newFunctionWithName:@"taa_cs"] error:&err];
+#if TARGET_OS_OSX
+      taa_pipe_ = MetalCachedComputePipeline(dev_, CachedFunction(internal_lib_, @"taa_cs"), &err);
+#else
+      taa_pipe_ = [dev_ newComputePipelineStateWithFunction:CachedFunction(internal_lib_, @"taa_cs") error:&err];
+#endif
       if (!taa_pipe_) FatalF("gfx: TAA pipeline: %s", err.localizedDescription.UTF8String);
-      taa_sharpen_pipe_ = [dev_ newComputePipelineStateWithFunction:[internal_lib_ newFunctionWithName:@"taa_sharpen_cs"]
+#if TARGET_OS_OSX
+      taa_sharpen_pipe_ = MetalCachedComputePipeline(dev_, CachedFunction(internal_lib_, @"taa_sharpen_cs"), &err);
+#else
+      taa_sharpen_pipe_ = [dev_ newComputePipelineStateWithFunction:CachedFunction(internal_lib_, @"taa_sharpen_cs")
                                                               error:&err];
+#endif
       if (!taa_sharpen_pipe_) FatalF("gfx: TAA sharpening pipeline: %s", err.localizedDescription.UTF8String);
     }
     for (int i = 0; i < 2; i++) {
@@ -2067,12 +2063,12 @@ class MetalDevice final : public Device {
                       MTLTextureUsageShaderRead | sc.outputTextureUsage);
       if (!motion_pipe_) {
         MTLRenderPipelineDescriptor* pd = [MTLRenderPipelineDescriptor new];
-        pd.vertexFunction = [internal_lib_ newFunctionWithName:@"tri_vs"];
-        pd.fragmentFunction = [internal_lib_ newFunctionWithName:@"motion_fs"];
+        pd.vertexFunction = CachedFunction(internal_lib_, @"tri_vs");
+        pd.fragmentFunction = CachedFunction(internal_lib_, @"motion_fs");
         pd.colorAttachments[0].pixelFormat = MTLPixelFormatRG16Float;
         pd.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
         NSError* err = nil;
-        motion_pipe_ = [dev_ newRenderPipelineStateWithDescriptor:pd error:&err];
+        motion_pipe_ = CachedPipeline(dev_, pd, &err);
         if (!motion_pipe_) FatalF("gfx: motion pipeline: %s", err.localizedDescription.UTF8String);
       }
       fx_reset_ = true;
@@ -2141,62 +2137,22 @@ class MetalDevice final : public Device {
   // textures), then neighbourhood blending; the HUD draws on after.
 
   id<MTLRenderPipelineState> SmaaPipeline(int pass, MTLPixelFormat target) {
-    static const int kSamplers[3] = {1, 3, 2};  // per pass
     id<MTLFunction> fn[2];
     for (int stage = 0; stage < 2; stage++) {
       const bool vertex = stage == 0;
-      std::string glsl = "#version 450\n#define SMAA_GLSL_4 1\n#define SMAA_PRESET_HIGH 1\n"
-                         "#define SMAA_RT_METRICS smaa_metrics\n#define PASS " +
-                         std::to_string(pass) + "\n";
-      glsl += vertex ? "#define SMAA_INCLUDE_PS 0\n" : "#define SMAA_INCLUDE_VS 0\n";
-      glsl += "layout(std140, set = 0, binding = 0) uniform SmaaMetrics { vec4 smaa_metrics; };\n";
-      for (int i = 0; !vertex && i < kSamplers[pass]; i++)
-        glsl += "layout(set = 0, binding = " + std::to_string(i) + ") uniform sampler2D t" +
-                std::to_string(i) + ";\n";
-      glsl += kSmaaHlsl;
-      glsl += vertex ? R"(
-layout(location = 0) out vec2 v_uv;
-layout(location = 1) out vec2 v_pix;
-layout(location = 2) out vec4 v_off[3];
-void main() {
-  // One triangle over the target; texture y runs down.
-  vec2 p = vec2(float((gl_VertexIndex << 1) & 2), float(gl_VertexIndex & 2));
-  gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);
-  v_uv = vec2(p.x, 1.0 - p.y);
-  v_pix = vec2(0.0);
-  v_off[0] = v_off[1] = v_off[2] = vec4(0.0);
-#if PASS == 0
-  SMAAEdgeDetectionVS(v_uv, v_off);
-#elif PASS == 1
-  SMAABlendingWeightCalculationVS(v_uv, v_pix, v_off);
-#else
-  SMAANeighborhoodBlendingVS(v_uv, v_off[0]);
-#endif
-}
-)" : R"(
-layout(location = 0) in vec2 v_uv;
-layout(location = 1) in vec2 v_pix;
-layout(location = 2) in vec4 v_off[3];
-layout(location = 0) out vec4 o_color;
-void main() {
-#if PASS == 0
-  o_color = vec4(SMAALumaEdgeDetectionPS(v_uv, v_off, t0), 0.0, 0.0);
-#elif PASS == 1
-  o_color = SMAABlendingWeightCalculationPS(v_uv, v_pix, v_off, t0, t1, t2, vec4(0.0));
-#else
-  o_color = SMAANeighborhoodBlendingPS(v_uv, v_off[0], t0, t1);
-#endif
-}
-)";
+      std::string glsl = MetalSmaaGlsl(pass, vertex);
       std::vector<uint32_t> spirv;
       std::string log, msl;
-      if (!GlslToSpirv(glsl, vertex ? ShaderStage::Vertex : ShaderStage::Fragment, &spirv, &log))
+#if TARGET_OS_OSX
+      msl = MetalPreparedMsl(glsl);
+#endif
+      if (msl.empty() && !GlslToSpirv(glsl, vertex ? ShaderStage::Vertex : ShaderStage::Fragment, &spirv, &log))
         FatalF("gfx: compiling SMAA pass %d: %s", pass, log.c_str());
-      if (!SpirvToMsl(spirv, &msl, &log)) FatalF("gfx: SMAA pass %d to MSL: %s", pass, log.c_str());
+      if (msl.empty() && !SpirvToMsl(spirv, &msl, &log)) FatalF("gfx: SMAA pass %d to MSL: %s", pass, log.c_str());
       NSError* err = nil;
-      id<MTLLibrary> lib = [dev_ newLibraryWithSource:@(msl.c_str()) options:nil error:&err];
+      id<MTLLibrary> lib = CachedLibrary(dev_, @(msl.c_str()), nil, &err);
       if (!lib) FatalF("gfx: SMAA pass %d MSL: %s", pass, err.localizedDescription.UTF8String);
-      fn[stage] = [lib newFunctionWithName:@"main0"];
+      fn[stage] = CachedFunction(lib, @"main0");
     }
     MTLRenderPipelineDescriptor* pd = [MTLRenderPipelineDescriptor new];
     pd.vertexFunction = fn[0];
@@ -2204,7 +2160,7 @@ void main() {
     pd.colorAttachments[0].pixelFormat = target;
     if (pass < 2) pd.stencilAttachmentPixelFormat = MTLPixelFormatStencil8;  // smaa_stencil_
     NSError* err = nil;
-    id<MTLRenderPipelineState> ps = [dev_ newRenderPipelineStateWithDescriptor:pd error:&err];
+    id<MTLRenderPipelineState> ps = CachedPipeline(dev_, pd, &err);
     if (!ps) FatalF("gfx: SMAA pass %d pipeline: %s", pass, err.localizedDescription.UTF8String);
     return ps;
   }
@@ -2519,6 +2475,16 @@ void main() {
     if (tex_at_.size() <= tid) tex_at_.resize(size_t(tid) + 1);
     tex_at_[tid] = &e;
   }
+  struct ShaderWork {
+    std::once_flag once;
+    id<MTLDevice> device = nil;
+    std::shared_ptr<const hlsl::Program> program;
+    uint64_t hash = 0;
+    std::string msl, error;
+    id<MTLFunction> function = nil;
+    bool has_lean = false, translated = false;
+    std::atomic<bool> cancelled{false};
+  };
   struct Shader {
     id<MTLFunction> fn = nil;
     hlsl::Stage stage = hlsl::Stage::Vertex;
@@ -2532,10 +2498,12 @@ void main() {
     std::bitset<256> float_reads;
     uint64_t hash = 0;  // of its translation: the same from run to run (0: the device's own)
     uint32_t varyings = 0;  // locations written (vertex) or read (pixel): hlsl::VaryingMask
-    // Pixel shaders: the translation, and its variants for vertex shaders
+    // Retain the translation until a draw needs its Metal function. Pixel
+    // shaders also keep variants for vertex shaders
     // that leave some of its inputs unwritten, by the inputs they do write
     // (PixelShaderFor).
     std::shared_ptr<const hlsl::Program> program;
+    std::shared_ptr<ShaderWork> work;
     std::unordered_map<uint32_t, ShaderId> variants;
     bool has_lean = false;  // also made lean (MslOptions(false)): kLeanPs
   };
@@ -3070,10 +3038,26 @@ void main() {
     draw_serial_.store(serial_ + 1, std::memory_order_release);
     Rec([this, serial, presented] { EncodeEndFrame(serial, presented); });
     Flush();
+#if TARGET_OS_OSX
+    // Once a loading-screen frame is submitted, use its I/O/animation time
+    // for shader compilation instead of delaying the first frame or the scene.
+    if (presented && !closing_) PrefetchShaders();
+#endif
   }
 
   // On the encoding thread: commits the frame's command buffers.
   void EncodeEndFrame(uint64_t serial, bool presented) {
+#if TARGET_OS_OSX
+    if (cache_report_) {
+      for (auto pair : {std::pair{"draws", &shader_draws_}, std::pair{"binds", &shader_binds_}}) {
+        const auto& counts = *pair.second;
+        if (counts[0] || counts[1] || counts[2])
+          std::fprintf(stderr, "gfx: shader-use %s runtime=%llu archive=%llu preloaded=%llu\n", pair.first,
+                       (unsigned long long)counts[0], (unsigned long long)counts[1], (unsigned long long)counts[2]);
+        pair.second->fill(0);
+      }
+    }
+#endif
     if (upload_blit_) [upload_blit_ endEncoding];
     upload_blit_ = nil;
     [upload_cb_ commit];
@@ -3411,8 +3395,8 @@ void main() {
   id<MTLRenderPipelineState> Pipeline(const PipeKey& k) {
     auto it = pipelines_.find(k);
     if (it != pipelines_.end()) return it->second;
+#if !TARGET_OS_OSX
     {
-      // Built ahead from an earlier run's recipe (PrebuildFor)?
       std::lock_guard<std::mutex> l(prebuilt_mu_);
       auto pb = prebuilt_.find(k);
       if (pb != prebuilt_.end()) {
@@ -3424,6 +3408,7 @@ void main() {
         return p;
       }
     }
+#endif
     id<MTLFunction> ps = enc_shaders_.at(k.ps);
     if (k.lean & kLeanPs) {
       id<MTLFunction> lean = FoundLean(enc_shader_hash_.at(k.ps));
@@ -3440,13 +3425,17 @@ void main() {
       MTLRenderPipelineDescriptor* pd = Describe(k, enc_shaders_.at(k.vs), ps);
       NSError* err = nil;
       const auto t0 = std::chrono::steady_clock::now();
-      id<MTLRenderPipelineState> p = [dev_ newRenderPipelineStateWithDescriptor:pd error:&err];
+#if TARGET_OS_OSX
+      id<MTLRenderPipelineState> p = MetalCachedPipeline(dev_, pd, &err, false, "encoder");
+#else
+      id<MTLRenderPipelineState> p = CachedPipeline(dev_, pd, &err);
+#endif
       if (!p) FatalF("gfx: render pipeline: %s", err.localizedDescription.UTF8String);
       // Compiling while drawing stalls the frame: the slow ones are named.
       const double ms =
           std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
       if (ms > 2)
-        std::fprintf(stderr, "gfx: pipeline %zu compiled in %.1f ms (%zu built ahead so far)\n",
+        std::fprintf(stderr, "gfx: pipeline %zu created in %.1f ms (%zu built ahead so far)\n",
                      pipelines_.size() + 1, ms, prebuilt_used_);
       if (perf_.load(std::memory_order_relaxed)) {
         const uint64_t ns = uint64_t(ms * 1e6);
@@ -3465,6 +3454,9 @@ void main() {
   // A pipeline's descriptor from its key and functions.
   static MTLRenderPipelineDescriptor* Describe(const PipeKey& k, id<MTLFunction> vs, id<MTLFunction> ps) {
     {
+#if TARGET_OS_OSX
+      return MetalDescribe(k, vs, ps);
+#else
       MTLRenderPipelineDescriptor* pd = [MTLRenderPipelineDescriptor new];
       pd.vertexFunction = vs;
       pd.fragmentFunction = ps;
@@ -3484,17 +3476,18 @@ void main() {
       pd.depthAttachmentPixelFormat = MTLPixelFormat(k.depth);
       pd.stencilAttachmentPixelFormat = MTLPixelFormat(k.stencil);
       return pd;
+#endif
     }
   }
 
-  // ---- pipelines built ahead: each pipeline compiled in a run is kept as
-  // a recipe (its shaders' hashes and the rest of its key) in the user's
-  // caches; in later runs, once both shaders of a recipe exist, it is
-  // compiled in the background and drawing finds it ready.
+  // ---- observed pipelines: restore archives as game-created shaders become
+  // available, including source-IR archives that offline-only preload skips.
+  // iOS also compiles missing recipe states asynchronously.
 
   struct Recipe {
     uint64_t vs, ps;  // Shader::hash
     PipeKey key;      // vs, ps 0
+    bool operator==(const Recipe& other) const { return std::memcmp(this, &other, sizeof *this) == 0; }
   };
   static_assert(sizeof(Recipe) == 48, "no padding");
 
@@ -3505,6 +3498,14 @@ void main() {
   }
 
   static std::string RecipePath() {
+#if TARGET_OS_OSX
+    std::string prepared = MetalPreparationDirectory();
+    if (!prepared.empty()) {
+      NSString* dir = @(prepared.c_str());
+      [NSFileManager.defaultManager createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
+      return prepared + "/runtime-pipelines-v1.bin";
+    }
+#endif
     NSString* dir = [NSSearchPathForDirectoriesInDomains(NSCachesDirectory, NSUserDomainMask, YES).firstObject
         stringByAppendingPathComponent:@"x86recomp"];
     [NSFileManager.defaultManager createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
@@ -3532,8 +3533,8 @@ void main() {
   id<MTLFunction> Lean(uint64_t hash, NSString* src) {
     if (id<MTLFunction> fn = FoundLean(hash)) return fn;
     NSError* err = nil;
-    id<MTLLibrary> lib = [dev_ newLibraryWithSource:src options:MslOptions(false) error:&err];
-    id<MTLFunction> fn = [lib newFunctionWithName:@"main0"];
+    id<MTLLibrary> lib = CachedLibrary(dev_, src, MslOptions(false), &err);
+    id<MTLFunction> fn = CachedFunction(lib, @"main0");
     if (!fn) return nil;
     std::lock_guard<std::mutex> l(lean_mu_);
     return lean_.emplace(hash, fn).first->second;
@@ -3586,18 +3587,19 @@ void main() {
 
   void LoadRecipes() {
     recipe_path_ = RecipePath();
+    auto add = [&](const Recipe& r) {
+      if (!recipe_known_.insert(Fnv64(&r, sizeof r)).second) return;
+      recipes_.push_back(r);
+      recipe_by_shader_.emplace(r.vs, recipes_.size() - 1);
+      if (r.ps != r.vs) recipe_by_shader_.emplace(r.ps, recipes_.size() - 1);
+    };
     if (FILE* f = std::fopen(recipe_path_.c_str(), "rb")) {
       Recipe r;
-      while (std::fread(&r, sizeof r, 1, f) == 1) {
-        if (!recipe_known_.insert(Fnv64(&r, sizeof r)).second) continue;
-        recipes_.push_back(r);
-        recipe_by_shader_.emplace(r.vs, recipes_.size() - 1);
-        if (r.ps != r.vs) recipe_by_shader_.emplace(r.ps, recipes_.size() - 1);
-      }
+      while (std::fread(&r, sizeof r, 1, f) == 1) add(r);
       std::fclose(f);
     }
     if (!recipes_.empty())
-      std::fprintf(stderr, "gfx: %zu pipeline recipes from earlier runs\n", recipes_.size());
+      std::fprintf(stderr, "gfx: %zu recorded pipeline recipes\n", recipes_.size());
     recipe_file_ = std::fopen(recipe_path_.c_str(), "ab");
   }
 
@@ -3633,6 +3635,7 @@ void main() {
       const Recipe& r = recipes_[it->second];
       auto vs = sid_by_hash_.find(r.vs), ps = sid_by_hash_.find(r.ps);
       if (vs == sid_by_hash_.end() || ps == sid_by_hash_.end()) continue;
+      if (!shaders_.at(vs->second).fn || !shaders_.at(ps->second).fn) continue;
       PipeKey k = r.key;
       k.vs = vs->second;
       k.ps = ps->second;
@@ -3645,8 +3648,10 @@ void main() {
       if (!prebuild_started_.insert(k).second) continue;
       MTLRenderPipelineDescriptor* pd = Describe(k, shaders_.at(k.vs).fn, shaders_.at(k.ps).fn);
       id<MTLDevice> dev = dev_;
+#if !TARGET_OS_OSX
       std::mutex* mu = &prebuilt_mu_;
       auto* done = &prebuilt_;
+#endif
       const uint64_t ps_hash = r.ps;
       std::atomic<bool>* closing = &closing_;
       dispatch_async(AheadQueue(), ^{
@@ -3657,10 +3662,18 @@ void main() {
           pd.fragmentFunction = ps;
         }
         NSError* err = nil;
+#if TARGET_OS_OSX
+        // Library creation has already selected the actual source/offline IR.
+        // Restore only its matching archive, off the encoder thread. A miss
+        // must not become speculative compilation or a wait before drawing.
+        // The content-keyed cache retains the state for normal Pipeline lookup.
+        MetalCachedPipeline(dev, pd, &err, true, "recipe");
+#else
         id<MTLRenderPipelineState> p = [dev newRenderPipelineStateWithDescriptor:pd error:&err];
         if (!p) return;
         std::lock_guard<std::mutex> l(*mu);
         (*done)[k] = p;
+#endif
       });
     }
   }
@@ -3669,13 +3682,33 @@ void main() {
     if (bound_.pipe_set && k == bound_.pipe) return;
     bound_.pipe = k;
     bound_.pipe_set = true;
+#if TARGET_OS_OSX
+    if (!sync_ && !requested_pipelines_.contains(k)) {
+      auto vs = shaders_.find(k.vs), ps = shaders_.find(k.ps);
+      if (vs != shaders_.end() && ps != shaders_.end()) {
+        id<MTLFunction> fragment = (k.lean & kLeanPs) ? FoundLean(ps->second.hash) : ps->second.fn;
+        // An unavailable optional lean variant retains the existing encoder
+        // fallback. Do not wait for it or compile a speculative full variant.
+        if (fragment) {
+          requested_pipelines_.insert(k);
+          MetalRequestPipeline(dev_, Describe(k, vs->second.fn, fragment));
+        }
+      }
+    }
+#endif
     // Found (or compiled) on the encoding thread; consecutive draws mostly
     // share theirs, unhashed.
     Rec([this, k] {
       if (!last_pipe_ || !(k == last_pipe_key_)) {
         last_pipe_ = Pipeline(k);
         last_pipe_key_ = k;
+#if TARGET_OS_OSX
+        last_draw_source_ = size_t(MetalPipelineOrigin(last_pipe_));
+#endif
       }
+#if TARGET_OS_OSX
+      if (cache_report_) shader_binds_[last_draw_source_]++;
+#endif
       [enc_ setRenderPipelineState:last_pipe_];
     });
   }
@@ -4417,9 +4450,17 @@ void main() {
   std::unordered_map<uint64_t, ShaderId> sid_by_hash_;
   std::vector<Recipe> recipes_;
   std::unordered_multimap<uint64_t, size_t> recipe_by_shader_;
-  std::unordered_set<PipeKey, BytesHash<PipeKey>> prebuild_started_;
   std::mutex prebuilt_mu_;
+  std::unordered_set<PipeKey, BytesHash<PipeKey>> prebuild_started_;
+#if !TARGET_OS_OSX
   std::unordered_map<PipeKey, id<MTLRenderPipelineState>, BytesHash<PipeKey>> prebuilt_;
+#endif
+#if TARGET_OS_OSX
+  std::unordered_set<PipeKey, BytesHash<PipeKey>> requested_pipelines_;  // recording side
+  const bool cache_report_ = [] { const char* value = std::getenv("RECOMP_SHADER_CACHE_REPORT"); return value && *value == '1'; }();
+  size_t last_draw_source_ = 0;  // encoding thread, origin of the bound state
+  std::array<uint64_t, 3> shader_draws_{}, shader_binds_{};
+#endif
   size_t prebuilt_used_ = 0;  // encoding thread
   std::mutex recipe_mu_;
   std::unordered_set<uint64_t> recipe_known_;
@@ -4459,6 +4500,11 @@ void main() {
     uint64_t shaders = 0, shader_ns = 0, msl_compiles = 0;
   };
   std::atomic<bool> perf_{false};
+#if TARGET_OS_OSX
+  std::jthread preload_;
+  std::vector<ShaderId> pending_shaders_;
+  size_t next_shader_lane_ = 0;
+#endif
   std::atomic<bool> closing_{false};  // the device is going: prebuild blocks do nothing
   PerfCounts pc_;
   uint64_t perf_t0_ = 0;

@@ -623,7 +623,7 @@ HLE64("kernel32.dll", GetSystemInfo, 1) {
   Wr16(si + 0, 0);            // PROCESSOR_ARCHITECTURE_INTEL
   Wr32(si + 4, 0x1000);       // page size
   Wr32(si + 8, 0x00010000);   // lowest application address
-  Wr32(si + 12, 0x7FFEFFFF);  // highest
+  Wr32(si + 12, g_proc->img.large_address_aware ? 0xFFFEFFFF : 0x7FFEFFFF);  // highest
   Wr32(si + 16, (1u << ncpu) - 1);  // active processor mask
   Wr32(si + 20, ncpu);              // number of processors
   Wr32(si + 24, 586);         // PROCESSOR_INTEL_PENTIUM
@@ -648,8 +648,8 @@ HLE("kernel32.dll", GlobalMemoryStatus, 1) {
   Wr32(ms + 12, cap(phys / 4 * 3));       // avail phys
   Wr32(ms + 16, cap(phys + 0x20000000));  // total page file
   Wr32(ms + 20, cap(phys));               // avail page file
-  Wr32(ms + 24, 0x7FFE0000);  // total virtual
-  Wr32(ms + 28, 0x70000000);  // avail virtual
+  Wr32(ms + 24, g_proc->img.large_address_aware ? 0xFFFE0000 : 0x7FFE0000);  // total virtual
+  Wr32(ms + 28, g_proc->img.large_address_aware ? 0xF0000000 : 0x70000000);  // avail virtual
   return 0;
 }
 
@@ -679,8 +679,8 @@ HLE64("kernel32.dll", GlobalMemoryStatusEx, 1) {
   Wr64(ms + 16, phys / 4 * 3);       // avail phys
   Wr64(ms + 24, phys + 0x20000000);  // total page file (commit limit)
   Wr64(ms + 32, phys);               // avail page file
-  Wr64(ms + 40, 0x7FFE0000);
-  Wr64(ms + 48, 0x70000000);
+  Wr64(ms + 40, g_proc->img.large_address_aware ? 0xFFFE0000 : 0x7FFE0000);
+  Wr64(ms + 48, g_proc->img.large_address_aware ? 0xF0000000 : 0x70000000);
   Wr64(ms + 56, 0);  // ullAvailExtendedVirtual: reserved
   return 1;
 }

@@ -94,6 +94,13 @@ target_compile_features(pacing_test PRIVATE cxx_std_20)
 add_test(NAME pacing COMMAND pacing_test)
 set_tests_properties(pacing PROPERTIES RUN_SERIAL TRUE)
 
+# The same pacer with a controlled platform clock: no wall-clock tolerances.
+add_executable(pacing_schedule_test pacing_schedule_test.cpp
+               ${PROJECT_SOURCE_DIR}/src/runtime/pacing.cpp)
+target_include_directories(pacing_schedule_test PRIVATE ${PROJECT_SOURCE_DIR}/src)
+target_compile_features(pacing_schedule_test PRIVATE cxx_std_20)
+add_test(NAME pacing_schedule COMMAND pacing_schedule_test)
+
 # win32_text_test: UTF-8 <-> UTF-16 conversion (runtime/hle/win32.h);
 # portable.
 add_executable(win32_text_test win32_text_test.cpp)
@@ -182,4 +189,79 @@ if(NOT RECOMP_IOS)
   target_link_libraries(lift_flags_test PRIVATE recomp_x87 recomp_image)
   target_compile_options(lift_flags_test PRIVATE -O1 -fno-strict-aliasing)
   add_test(NAME lift_flags COMMAND lift_flags_test)
+endif()
+
+# Portable regressions for allocation, address-space and COM/HLE behavior.
+option(RECOMP_RUNTIME_TESTS "Build runtime regression tests" ${PROJECT_IS_TOP_LEVEL})
+if(RECOMP_RUNTIME_TESTS)
+  add_executable(guest_address_space_test guest_address_space_test.cpp)
+  target_link_libraries(guest_address_space_test PRIVATE recomp_runtime)
+  foreach(mode laa standard)
+    add_test(NAME guest_address_space_${mode} COMMAND guest_address_space_test ${mode})
+    set_tests_properties(guest_address_space_${mode} PROPERTIES TIMEOUT 15)
+  endforeach()
+  add_executable(wbem_report_test wbem_report_test.cpp)
+  target_link_libraries(wbem_report_test PRIVATE recomp_runtime ${CMAKE_DL_LIBS})
+  add_dependencies(wbem_report_test recomp_xinput)
+  foreach(pads 0 1)
+    add_test(NAME wbem_report_${pads}_pads
+      COMMAND wbem_report_test $<TARGET_FILE:recomp_xinput> ${pads})
+    set_tests_properties(wbem_report_${pads}_pads PROPERTIES TIMEOUT 15)
+  endforeach()
+  add_executable(guest_heap_growth_test guest_heap_growth_test.cpp)
+  target_link_libraries(guest_heap_growth_test PRIVATE recomp_runtime)
+  foreach(scenario tail vm_fragmented heap_fragmented fixed exhausted realloc)
+    add_test(NAME guest_heap_growth_${scenario}
+      COMMAND guest_heap_growth_test ${scenario})
+    set_tests_properties(guest_heap_growth_${scenario} PROPERTIES TIMEOUT 15)
+  endforeach()
+  add_executable(d3d9_texture_lock_test d3d9_texture_lock_test.cpp)
+  target_link_libraries(d3d9_texture_lock_test PRIVATE recomp_d3d9 recomp_runtime)
+  foreach(path texture cube surface)
+    add_test(NAME d3d9_${path}_lock_allocation
+      COMMAND d3d9_texture_lock_test ${path})
+    set_tests_properties(d3d9_${path}_lock_allocation PROPERTIES TIMEOUT 15)
+  endforeach()
+endif()
+
+# Requires a logged-in macOS session, a Metal GPU and the offline Metal tools.
+option(RECOMP_METAL_TESTS "Build Metal cache integration tests" OFF)
+if(APPLE AND NOT RECOMP_IOS AND RECOMP_METAL_TESTS)
+  find_package(Python3 REQUIRED COMPONENTS Interpreter)
+  add_library(metal_test_profile STATIC metal_test_profile.mm)
+  target_compile_options(metal_test_profile PRIVATE -fobjc-arc -std=c++20)
+  target_link_libraries(metal_test_profile PUBLIC recomp_gfx "-framework Foundation" "-framework Metal")
+  add_executable(metal_prepare_test metal_prepare_test.cpp)
+  target_link_libraries(metal_prepare_test PRIVATE metal_test_profile)
+  add_executable(shader_runtime_test shader_runtime_test.mm)
+  target_compile_options(shader_runtime_test PRIVATE -fobjc-arc -std=c++20)
+  target_link_libraries(shader_runtime_test PRIVATE metal_test_profile recomp_gfx "-framework Foundation" "-framework Metal")
+  # Exercise a real build-identity transition using the same cache implementation
+  # and a foreign kit-producer toolchain identity. Recipient tools must work
+  # without rebuilding the renderer inside each integration test.
+  add_library(metal_cache_next_build OBJECT "${RECOMP_ROOT}/src/runtime/gfx/metal_cache.mm")
+  target_compile_options(metal_cache_next_build PRIVATE -fobjc-arc -std=c++20)
+  target_include_directories(metal_cache_next_build PRIVATE "$<TARGET_PROPERTY:recomp_gfx,INCLUDE_DIRECTORIES>")
+  target_compile_definitions(metal_cache_next_build PRIVATE
+    RECOMP_METAL_BUILD_ID="cache-next-build-test" RECOMP_METAL_TOOLCHAIN_ID="different-kit-producer")
+  target_link_libraries(metal_cache_next_build PRIVATE recomp_gfx)
+  add_executable(shader_runtime_next_build_test shader_runtime_test.mm)
+  target_compile_options(shader_runtime_next_build_test PRIVATE -fobjc-arc -std=c++20)
+  target_link_libraries(shader_runtime_next_build_test PRIVATE metal_test_profile metal_cache_next_build recomp_gfx
+    "-framework Foundation" "-framework Metal")
+  add_executable(shader_prepare_next_build_test metal_prepare_test.cpp)
+  target_link_libraries(shader_prepare_next_build_test PRIVATE metal_test_profile metal_cache_next_build recomp_gfx
+    "-framework Foundation" "-framework Metal")
+  add_dependencies(shader_runtime_test shader_runtime_next_build_test shader_prepare_next_build_test)
+  add_test(NAME shader_runtime
+    COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/shader_runtime_test.py"
+      "$<TARGET_FILE:shader_runtime_test>" "$<TARGET_FILE:metal_prepare_test>"
+      "$<TARGET_FILE:shader_runtime_next_build_test>" "$<TARGET_FILE:shader_prepare_next_build_test>")
+  set_tests_properties(shader_runtime PROPERTIES TIMEOUT 300)
+  add_executable(metal_recipe_reuse_test metal_recipe_reuse_test.cpp)
+  target_link_libraries(metal_recipe_reuse_test PRIVATE metal_test_profile recomp_gfx)
+  add_test(NAME metal_recipe_reuse
+    COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/metal_recipe_reuse_test.py"
+      "$<TARGET_FILE:metal_recipe_reuse_test>")
+  set_tests_properties(metal_recipe_reuse PROPERTIES TIMEOUT 60 RUN_SERIAL TRUE)
 endif()

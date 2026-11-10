@@ -240,6 +240,22 @@ if(APPLE)
     target_link_libraries(recomp_gfx PRIVATE "-framework UIKit")
   else()
     target_link_libraries(recomp_gfx PRIVATE "-framework AppKit")
+    target_sources(recomp_gfx PRIVATE src/runtime/gfx/metal_cache.mm)
+    set_source_files_properties(src/runtime/gfx/metal_cache.mm
+      TARGET_DIRECTORY recomp_gfx PROPERTIES COMPILE_OPTIONS "-fobjc-arc;-std=c++20")
+    # Changes to shader translation, baseline recipes, or compile options require
+    # a different cache. Source hashes also cover uncommitted local changes.
+    file(GLOB_RECURSE _metal_inputs CONFIGURE_DEPENDS
+      "${CMAKE_CURRENT_SOURCE_DIR}/src/runtime/gfx/*"
+      "${CMAKE_CURRENT_SOURCE_DIR}/src/runtime/hlsl/*")
+    set(_metal_identity "${CMAKE_CXX_COMPILER_ID};${CMAKE_CXX_COMPILER_VERSION};${glslang_VERSION};${spirv_cross_msl_VERSION}")
+    foreach(_input IN LISTS _metal_inputs)
+      file(SHA256 "${_input}" _input_hash)
+      string(APPEND _metal_identity "${_input_hash}")
+      set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${_input}")
+    endforeach()
+    string(SHA256 _metal_identity "${_metal_identity}")
+    target_compile_definitions(recomp_gfx PRIVATE RECOMP_METAL_BUILD_ID="${_metal_identity}")
     add_subdirectory(tools/shader_check)
   endif()
 endif()

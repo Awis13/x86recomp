@@ -11,8 +11,8 @@ namespace recomp {
 // lie on a grid of exact periods (not rounded to milliseconds), so
 // wake-up latency does not add up and the average rate is the one asked
 // for. A frame that ends late is followed by a shorter wait; one that is
-// more than a whole period late moves the grid instead of being followed
-// by a burst of frames.
+// at least a whole period late moves the grid instead of being followed
+// by a burst of frames. The same rule applies if the wait wakes late.
 class FramePacer {
  public:
   // Call at the start of every frame. fps <= 0: no limit (and the grid

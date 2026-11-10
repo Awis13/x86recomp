@@ -16,8 +16,8 @@
 
 namespace recomp {
 
-// Guest layout constants. Everything stays below 0x80000000 because the
-// game is not large-address-aware and may treat pointers as signed.
+// Guest runtime layout. These fixed addresses stay below 2 GiB for legacy
+// guests; large-address-aware PE32 images may also allocate above 2 GiB.
 inline constexpr gaddr kThunkBase = 0x7F000000;
 inline constexpr uint32_t kThunkStride = 0x10;
 inline constexpr uint32_t kThunkRegionSize = 0x00100000;
@@ -73,6 +73,7 @@ struct PeImage {
   uint64_t stack_reserve = 0;
   bool dll = false;
   bool x64 = false;  // PE32+ for AMD64
+  bool large_address_aware = false;  // IMAGE_FILE_LARGE_ADDRESS_AWARE
   std::vector<PeSection> sections;
   std::vector<PeImport> imports;
   std::vector<PeExport> exports;  // forwarded exports are left out

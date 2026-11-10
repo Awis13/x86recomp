@@ -853,15 +853,25 @@ Wait(fps) at the start of each frame sleeps until the next frame's start
 on a grid of exact periods on the host's monotonic clock. Lateness does
 not add up (the next start is a period after the previous one, not
 after the wake-up), a frame that ends late is followed by a shorter
-wait, and one more than a period late moves the grid instead of causing
-a burst. The sleep is the platform layer's `SleepUntilNs`: an absolute
+wait, and one at least a period late moves the grid instead of causing
+a burst. This is checked after sleeping too: a delayed wake-up must
+rebase before returning the frame to the caller. The sleep is the
+platform layer's `SleepUntilNs`: an absolute
 clock_nanosleep with the thread's timer slack at 1 us on Linux;
 mach_wait_until on macOS, with the thread under a time-constraint
 (real-time) policy only while it waits (a timeshare thread's timer gets
 coalescing leeway: it woke 1-3.5 ms late, whatever its QoS class,
-latency tier or task role). No spinning. tests/pacing_test checks the
-rate (within 1%), the median wake-up lateness, the CPU use and the
-late-frame rule; on an idle host wake-ups land 15-30 us (Linux) or
+latency tier or task role). No spinning. tests/pacing_schedule_test uses
+the real pacer with a controlled platform clock to check varying work,
+wake-up drift, late work, late wake-ups, rate changes and unlimited mode.
+tests/pacing_test checks the unloaded rate (within 1%), the median wake-up
+lateness, CPU use and late-frame recovery with real waits. Synthetic work
+sleeps can overrun and intentionally shift the grid, so they are excluded
+from the rate measurement. Rate and lateness follow deliberate grid
+rebases; the late frame itself still contributes its full lateness, and
+the report includes the raw mean, rebase count and shifted time. The
+timing limits remain 1% mean period, 0.5 ms median lateness and 25% CPU.
+On an idle host wake-ups land 15-30 us (Linux) or
 20-80 us (macOS, Apple silicon) after the deadline.
 
 ### HLE surface
