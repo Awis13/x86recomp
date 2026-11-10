@@ -222,7 +222,7 @@ struct RenderStates {
 // freed when it goes: a member of Device before its gfx, so destroyed
 // after it, once the gfx::Device has waited for its GPU work.
 struct SharedHeapUser {
-  const void* user = nullptr;  // the gfx::Device, while it maps the heap
+  const void* user = nullptr;  // the Device, once its gfx maps the heap
   SharedHeapUser() = default;
   SharedHeapUser(const SharedHeapUser&) = delete;
   SharedHeapUser& operator=(const SharedHeapUser&) = delete;

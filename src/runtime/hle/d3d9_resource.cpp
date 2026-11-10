@@ -45,15 +45,22 @@ namespace recomp::d3d9 {
 
 namespace {
 
+// Never destroyed: a device the guest leaks goes at exit, after the
+// statics, and still gives its blocks back.
 SharedHeap& Shared() {
-  static SharedHeap s;
+  static SharedHeap& s = *new SharedHeap;
   return s;
 }
 
-// A block of the shared heap `dev` will read, or 0 if it is full.
-gaddr SharedAlloc(const gfx::Device* dev, uint32_t size, bool zero) {
+// The heap knows a device by its D3D9 Device: unlike its gfx::Device,
+// destroyed before Forget runs, no other device can have that address
+// until Forget is over (SharedHeapUser).
+
+// A block of the shared heap device `d` (with a gfx) will read, or 0 if
+// it is full.
+gaddr SharedAlloc(const Device* d, uint32_t size, bool zero) {
   SharedHeap& s = Shared();
-  const gaddr p = s.Alloc(dev, dev ? dev->CompletedSerial() : 0, size, zero);
+  const gaddr p = s.Alloc(d, d->gfx->CompletedSerial(), size, zero);
   if (!p && s) {
     static std::atomic<bool> warned{false};
     if (!warned.exchange(true))
@@ -63,22 +70,25 @@ gaddr SharedAlloc(const gfx::Device* dev, uint32_t size, bool zero) {
   return p;
 }
 
-// Gives back a block `dev` (null: no device any more) read last in its
-// frame `serial`.
-void Retire(const gfx::Device* dev, gaddr mem, uint64_t serial) {
-  Shared().Retire(dev, dev ? dev->CompletedSerial() : 0, mem, serial);
+// Gives back a block device `d` read last in its frame `serial` (`d`
+// null or without a gfx any more: nobody reads it).
+void Retire(const Device* d, gaddr mem, uint64_t serial) {
+  if (d && d->gfx)
+    Shared().Retire(d, d->gfx->CompletedSerial(), mem, serial);
+  else
+    Shared().Retire(nullptr, 0, mem, serial);
 }
 
-// A new block for writes to shared block `mem`, which `dev` reads until
+// A new block for writes to shared block `mem`, which device `d` reads until
 // its frame `serial` is over: in the shared heap, or the process heap when
 // that is full (SharedHeap::Rename). With neither, 0, said once: the
 // caller writes the old block and frames in flight may draw what it
 // writes. Waiting for the GPU instead cannot be done here: `serial` may be
 // the frame being recorded, which the device submits only at Present.
-SharedHeap::Renamed RenameShared(const gfx::Device* dev, gaddr mem, uint32_t size,
-                                 uint64_t serial, bool keep) {
+SharedHeap::Renamed RenameShared(const Device* d, gaddr mem, uint32_t size, uint64_t serial,
+                                 bool keep) {
   const SharedHeap::Renamed n =
-      Shared().Rename(dev, dev->CompletedSerial(), mem, size, serial, keep, ProcessHeap());
+      Shared().Rename(d, d->gfx->CompletedSerial(), mem, size, serial, keep, ProcessHeap());
   if (!n.mem) {
     static std::atomic<bool> warned{false};
     if (!warned.exchange(true))
@@ -253,7 +263,7 @@ uint32_t LevelMem(Texture& t, Texture::Level& l) {
     return !e || *e != '0';
   }();
   if (on && t.tex && d && d->shared_buffers) {
-    l.mem = uint32_t(SharedAlloc(d->gfx.get(), l.size, true));
+    l.mem = uint32_t(SharedAlloc(d, l.size, true));
     l.shared = l.mem != 0;
   }
   if (!l.mem) l.mem = HeapAllocProcess(l.size, true);
@@ -268,7 +278,7 @@ uint32_t LevelMem(Texture& t, Texture::Level& l) {
 void RenameLevelIfInUse(Texture& t, Texture::Level& l) {
   Device* d = com::As<Device>(t.device);
   if (!l.shared || !d || !d->gfx || l.gpu_use <= d->gfx->CompletedSerial()) return;
-  const SharedHeap::Renamed n = RenameShared(d->gfx.get(), l.mem, l.size, l.gpu_use, true);
+  const SharedHeap::Renamed n = RenameShared(d, l.mem, l.size, l.gpu_use, true);
   if (!n.mem) return;
   if (!n.shared) {  // the process heap from now on
     CountLevel(t.pool, true, -int64_t(l.size));
@@ -424,7 +434,7 @@ Texture::~Texture() {
   for (Level& l : lv) {
     if (l.mem) CountLevel(pool, l.shared, -int64_t(l.size));
     if (l.mem && l.shared) {
-      Retire(d && d->gfx ? d->gfx.get() : nullptr, l.mem, l.gpu_use);
+      Retire(d, l.mem, l.gpu_use);
     } else if (l.mem) {
       HeapFreeProcess(l.mem);
     }
@@ -444,13 +454,15 @@ void SetUpSharedBuffers(Device& d) {
     return;
   }
   d.shared_buffers = d.gfx->MapSharedMemory(GPtr(s.base()), s.size());
-  if (d.shared_buffers) d.heap_user.user = d.gfx.get();
+  if (d.shared_buffers) d.heap_user.user = &d;
   if (d.shared_buffers)
     std::fprintf(stderr, "d3d9: vertex and index buffers in %llu MB the GPU reads in place\n",
                  (unsigned long long)(s.size() >> 20));
 }
 
-SharedHeapUser::~SharedHeapUser() { Shared().Forget(user); }
+SharedHeapUser::~SharedHeapUser() {
+  if (user) Shared().Forget(user);  // (a device that never mapped the heap: nothing)
+}
 
 Buffer::~Buffer() {
   if (!mem) return;
@@ -460,7 +472,7 @@ Buffer::~Buffer() {
     return;
   }
   Device* d = com::As<Device>(device);
-  Retire(d && d->gfx ? d->gfx.get() : nullptr, mem, last_use);
+  Retire(d, mem, last_use);
 }
 
 uint32_t NewTexture(Device& d, uint32_t device, bool cube, uint32_t w, uint32_t h,
@@ -520,7 +532,10 @@ void FillLevel(Texture& t, uint32_t face, uint32_t level, const uint8_t* src,
   Texture::Level& l = t.At(face, level);
   if (!LevelMem(t, l)) {
     // No guest memory for the lock shadow: the GPU side straight from
-    // `src` (a lock later tries for a shadow again).
+    // `src` (a lock later tries for a shadow again). A known limit under
+    // memory pressure: that shadow starts zeroed, not with these texels,
+    // so unlocking the whole rect uploads zeros where the game did not
+    // write.
     if (t.tex) {
       gfx::Device* g = DeviceOf(t.device)->gfx.get();
       const gfx::Rect r{0, 0, int32_t(l.w), int32_t(l.h)};
@@ -674,7 +689,7 @@ uint32_t CreateBuffer(Ctx& c, bool index) {
   b->pool = Arg(c, 4);
   Device* d = com::As<Device>(b->device);
   if (d && d->shared_buffers) {
-    b->mem = uint32_t(SharedAlloc(d->gfx.get(), length, true));
+    b->mem = uint32_t(SharedAlloc(d, length, true));
     b->shared = b->mem != 0;
   }
   if (!b->mem) b->mem = HeapAllocProcess(length, true);
@@ -1221,7 +1236,7 @@ uint32_t BufferLock(Ctx& c) {
   Device* d = com::As<Device>(b->device);
   if (b->shared && d && d->gfx && !(flags & (D3DLOCK_READONLY | D3DLOCK_NOOVERWRITE)) &&
       b->last_use > d->gfx->CompletedSerial()) {
-    const SharedHeap::Renamed n = RenameShared(d->gfx.get(), b->mem, b->length, b->last_use,
+    const SharedHeap::Renamed n = RenameShared(d, b->mem, b->length, b->last_use,
                                                !(flags & D3DLOCK_DISCARD));
     if (n.mem) {
       if (!n.shared) {  // the process heap from now on: draws copy it
