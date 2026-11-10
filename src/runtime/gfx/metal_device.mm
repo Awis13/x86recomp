@@ -1636,8 +1636,6 @@ class MetalDevice final : public Device {
   }
 
  private:
-  struct Shader;  // (below)
-
   // ---- the scene at an internal resolution, upscaled (RECOMP_UPSCALER)
 
   enum class Upscaler { Off, Bilinear, MetalFX, MetalFXSpatial, Taa, Smaa };
