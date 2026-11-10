@@ -793,6 +793,38 @@ ddraw.cpp):
 - A fault on a lazy page while that thread holds the region lock (a
   runtime bug) is not handled but reported like any other fault.
 
+### Guest memory the GPU reads in place
+A graphics device that can read host memory in place
+(`gfx::Device::SharesMemory`, the Metal backend) maps one heap of guest
+memory whole (src/runtime/hle/shared_heap.{h,cpp}, used by
+hle/d3d9_resource.cpp). Direct3D 9 vertex and index buffers, and the lock
+shadows of textures with a GPU side, are blocks of it, so draws and
+uploads read them without a copy on the CPU.
+- Size: <ID>_GPU_HEAP_MB, by default 256 MB for a 32-bit guest and 512
+  MB for a 64-bit one; 0 turns the heap off. It is reserved and
+  committed whole with the first device, so all of it comes out of a
+  32-bit guest's 2 GiB, used or not. When it is full, new buffers and
+  texture levels go to the process heap and the device copies what it
+  draws from them. <ID>_TEX_SHARED=0 keeps texture levels in the process
+  heap (comparisons).
+- The GPU reads a block for a few frames after the game is done with
+  it. A Lock that would write a buffer a frame in flight may still read
+  (no NOOVERWRITE or READONLY) gives it a new block, as D3D9 drivers
+  rename DISCARDed buffers. The old block, and those of buffers and
+  textures released, are retired with the frame of their last use and
+  freed once the device has finished that frame: at the first
+  allocation after it, not when the heap is full. The heap then holds
+  what the game holds plus the frames in flight (tests/shared_heap_test).
+- <ID>_MEM_REPORT=s: every s seconds, from Present, two `mem:` lines in
+  the log. The first is the guest's address space (reserved, free,
+  largest gap), the process heap and the heaps the guest created; the
+  second what the D3D9 front end keeps in guest memory: texture levels
+  by pool (in the shared heap and in the process heap), vertex and index
+  buffers, offscreen surfaces, and the shared heap's use, the most it
+  has held, its largest free block and the retired blocks waiting for
+  the GPU. A HeapAlloc that fails logs the first line too (its first
+  eight times).
+
 ### Display modes, fullscreen and presentation
 Display modes are virtual: the host's mode never changes behind the
 game's back. What games see and what the host shows:
