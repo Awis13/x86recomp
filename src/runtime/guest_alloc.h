@@ -83,10 +83,10 @@ class GuestHeap {
   // live block.
   uint64_t Size(uint64_t p) const;
 
-  // Bytes of address space the heap holds (its segments), bytes in live
-  // blocks, and its largest free block.
+  // Bytes of address space the heap holds (its segments) and how many
+  // segments, bytes in live blocks, and its largest free block.
   struct Stats {
-    uint64_t segments = 0, used = 0, largest_free = 0;
+    uint64_t segments = 0, segment_count = 0, used = 0, largest_free = 0;
   };
   Stats GetStats() const;
 
@@ -104,7 +104,7 @@ class GuestHeap {
   GuestAllocator& vm_;
   uint64_t max_size_;
   uint64_t handle_ = 0;
-  std::vector<std::pair<uint64_t, uint64_t>> segments_;  // base, size
+  std::map<uint64_t, uint64_t> segments_;  // base -> size
   uint64_t used_bytes_ = 0;  // of used_
   std::map<uint64_t, Block> used_;
   std::map<uint64_t, uint64_t> free_;                // addr -> size

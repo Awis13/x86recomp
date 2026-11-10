@@ -6,7 +6,8 @@
 //     follow reservations and releases, and a heap's segments, bytes in
 //     blocks and largest free block follow Alloc, Free and ReAlloc;
 //   - a heap still grows in an address space with no gap of a whole
-//     segment (16 MB) left, by a segment just big enough;
+//     segment (16 MB) left, by the largest gap there is, so small
+//     allocations add few segments;
 //   - the shared heap takes its whole size from the address space once, and
 //     nothing more whatever is allocated; a size with no gap for it fails;
 //   - a block retired in a frame the device has finished, or with no
@@ -106,8 +107,10 @@ void TestStats() {
   CHECK(vm.GetStats().reserved == (64 + 16 + 256) * kMb);  // the heap gave its segments back
 }
 
-// An address space whose gaps are all 8 MB: a growable heap made there,
-// and its allocations up to that size, take segments just big enough.
+// An address space whose gaps are all 8 MB: a growable heap made there
+// takes the largest gap there is for a segment, not just what it was
+// asked for, and so do its allocations later: many small ones add a few
+// segments, not one each.
 void TestFragmented() {
   GuestAllocator vm;
   vm.Init(&g_mem, kLo, kHi);
@@ -121,14 +124,30 @@ void TestFragmented() {
   {
     GuestHeap h(vm, kMb, 0);
     CHECK(h.handle() != 0);
-    CHECK(h.GetStats().segments == kMb);
+    GuestHeap::Stats hs = h.GetStats();
+    CHECK(hs.segments == 8 * kMb && hs.segment_count == 1);
     const uint64_t p = h.Alloc(512 << 10, true), q = h.Alloc(6 * kMb, true);
     CHECK(p && q);
-    CHECK(h.GetStats().segments == 7 * kMb);
+    CHECK(h.GetStats().segment_count == 1);
     CHECK(!h.Alloc(9 * kMb, false));  // no gap that big
+    std::vector<uint64_t> small;
+    for (int i = 0; i < 4000; i++) small.push_back(h.Alloc(4096, false));  // 16 MB
+    for (uint64_t b : small) CHECK(b);
+    hs = h.GetStats();
+    CHECK(hs.segment_count <= 4 && hs.segments == hs.segment_count * 8 * kMb);
+    for (uint64_t b : small) CHECK(h.Free(b));
     CHECK(h.Free(p) && h.Free(q));
+    CHECK(h.GetStats().used == 0);
   }
   CHECK(vm.GetStats().reserved == before.reserved);
+  // A heap with a maximum size gets the same: one segment, the largest
+  // gap, if its maximum fits there; none if not.
+  {
+    GuestHeap fixed(vm, 0, 2 * kMb);
+    CHECK(fixed.handle() && fixed.GetStats().segments == 8 * kMb);
+    GuestHeap too_big(vm, 0, 12 * kMb);
+    CHECK(!too_big.handle() && too_big.GetStats().segment_count == 0);
+  }
 }
 
 void Fill(uint64_t p, uint8_t v, size_t n) { std::memset(g_mem.ptr(p), v, n); }

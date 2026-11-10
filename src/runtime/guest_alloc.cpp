@@ -164,7 +164,7 @@ GuestHeap::GuestHeap(GuestAllocator& vm, uint64_t initial_size,
   // gap for it.
   Grow(RoundUp(max_size ? max_size : initial_size, kPage));
   // Heap handles are guest pointers on Windows; use the first segment base.
-  handle_ = segments_.empty() ? 0 : segments_.front().first;
+  handle_ = segments_.empty() ? 0 : segments_.begin()->first;
 }
 
 GuestHeap::~GuestHeap() {
@@ -177,23 +177,26 @@ bool GuestHeap::Grow(uint64_t need) {
   uint64_t base = vm_.Reserve(0, size);
   const uint64_t least = RoundUp(std::max<uint64_t>(need, 1), GuestAllocator::kGranularity);
   if (!base && size > least) {
-    // No gap of a whole segment left (a fragmented address space): one
-    // just big enough, as long as there is such a gap.
-    size = least;
-    base = vm_.Reserve(0, size);
+    // No gap of a whole segment left (a fragmented address space): the
+    // largest gap there is, as long as the request fits, so that small
+    // allocations do not add a segment each. A gap that does not start
+    // on the reservation granularity loses up to one granule to it.
+    constexpr uint64_t g = GuestAllocator::kGranularity;
+    const uint64_t gap = vm_.GetStats().largest_free & ~(g - 1);
+    if (gap >= least && gap < size) base = vm_.Reserve(0, size = gap);
+    if (!base && gap >= least + g && gap - g < size) base = vm_.Reserve(0, size = gap - g);
+    if (!base) base = vm_.Reserve(0, size = least);
   }
   if (!base) return false;
   // Committing is cheap: host pages are only materialised when touched.
   vm_.Commit(base, size, Prot::RW);
-  segments_.push_back({base, size});
+  segments_[base] = size;
   InsertFree(base, size);
   return true;
 }
 
 bool GuestHeap::IsSegmentStart(uint64_t addr) const {
-  for (const auto& s : segments_)
-    if (s.first == addr) return true;
-  return false;
+  return segments_.count(addr) != 0;
 }
 
 void GuestHeap::InsertFree(uint64_t addr, uint64_t size) {
@@ -305,6 +308,7 @@ GuestHeap::Stats GuestHeap::GetStats() const {
   std::lock_guard<std::mutex> l(mu_);
   Stats s;
   for (const auto& seg : segments_) s.segments += seg.second;
+  s.segment_count = segments_.size();
   s.used = used_bytes_;
   if (!free_by_size_.empty()) s.largest_free = free_by_size_.rbegin()->first;
   return s;
