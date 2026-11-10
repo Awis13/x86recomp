@@ -136,6 +136,16 @@ struct GameConfig {
   // from it; a game's best profile may need more than the default.
   uint32_t video_memory_mb = 64;
 
+  // The user's language, a Windows LANGID (0x0419: Russian): what
+  // GetUserDefaultLangID, GetUserDefaultUILanguage and
+  // GetSystemDefaultUILanguage answer, and with the default sort order
+  // GetUserDefaultLCID; a locale IsValidLocale accepts and
+  // EnumSystemLocalesA lists, besides US English. Games pick the language
+  // of their text from it. Never a neutral id (0x0019): a primary language
+  // and a sublanguage. Code pages and GetLocaleInfo stay those of US
+  // English. <ID>_LANG_ID=0x0419 (0x required) overrides.
+  uint16_t user_lang_id = 0x0409;
+
   // DLLs the game loads itself (LoadLibrary) whose code is lifted with
   // the EXE (recomp_lift --module), e.g. a game logic DLL. They
   // are read from guest_dir (the host game directory) by file name.

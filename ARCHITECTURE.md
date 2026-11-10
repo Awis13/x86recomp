@@ -99,7 +99,10 @@ its lifted code with `recomp_add_lifted()`, and fills a
 - hooks for the rare behaviour that needs game knowledge (e.g.
   `game_cursor` for games that re-centre the pointer);
 - `fullscreen`: how a window covering the game's screen is shown (see
-  "Display modes, fullscreen and presentation").
+  "Display modes, fullscreen and presentation");
+- `user_lang_id`: the user's language, a Windows LANGID (default 0x0409,
+  US English), for games that pick the language of their text from it
+  (see "HLE surface", kernel32).
 
 The game's executable holds its lifted code, its replacements and
 `main()`; the runtime, the x87 model, the HLE modules and the libraries
@@ -883,6 +886,26 @@ late-frame rule; on an idle host wake-ups land 15-30 us (Linux) or
   path mapping onto the game dir, MapViewOfFile as mmap into the arena,
   threads (one Ctx + guest stack each), events, mutexes, critical
   sections, TLS (TEB at a fixed guest VA, fs:[0x2c]), time, locale.
+  The user's language is `GameConfig::user_lang_id`, which
+  <ID>_LANG_ID=0x0419 overrides (hexadecimal, the 0x prefix required:
+  every other numeric switch is decimal, and 1049 must not quietly be
+  0x1049, another language). Anything but a language id with a primary
+  language and a sublanguage there, or in the field, is a fatal error: a
+  neutral id such as 0x0019 is never a user's language on Windows, and
+  games that compare the whole id would not recognise it.
+  GetUserDefaultLangID, GetUserDefaultUILanguage and
+  GetSystemDefaultUILanguage answer it, GetUserDefaultLCID its locale
+  with the default sort order: one language for the user, the interface
+  and the system, as a machine set up in one language has (and as Wine
+  sets them all from the host's locale). IsValidLocale accepts that
+  locale and US English, EnumSystemLocalesA lists both, smallest first
+  ("%08x", as Wine does), until the callback returns FALSE
+  (hle/locale.h; tests/locale_test). Code pages do not follow the
+  language: GetACP stays 1252 and GetOEMCP 437, and with them every A
+  function's text is Windows-1252 (MultiByteToWideChar, file names).
+  GetLocaleInfo answers US English for any locale, as do GetDateFormat,
+  GetTimeFormat and the keyboard layout (00000409); VerLanguageNameA
+  names only 0x0409 and answers "Language Neutral" for any other id.
 - user32/gdi32: SDL3 windows; SDL events translated to WM_* and fed to
   the guest WndProc through PeekMessage/DispatchMessage.
 - advapi32: registry backed by a small file, seeded per game.

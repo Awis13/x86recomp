@@ -18,6 +18,7 @@
 
 #include "runtime/hle/hle.h"
 #include "runtime/hle/kernel32_state.h"
+#include "runtime/hle/locale.h"
 #include "runtime/perf.h"
 #include "runtime/platform.h"
 #include "runtime/hle/win32.h"
@@ -1570,16 +1571,48 @@ HLE("kernel32.dll", lstrlenW, 1) {
   return Arg(c, 0) ? uint32_t(GWStr(Arg(c, 0)).size()) : 0;
 }
 
-HLE("kernel32.dll", GetUserDefaultLCID, 0) { return 0x0409; }
-HLE("kernel32.dll", GetUserDefaultLangID, 0) { return 0x0409; }
-HLE("kernel32.dll", GetUserDefaultUILanguage, 0) { return 0x0409; }
-HLE("kernel32.dll", GetSystemDefaultUILanguage, 0) { return 0x0409; }
-HLE("kernel32.dll", IsValidLocale, 2) { return Arg(c, 0) == 0x0409 ? 1 : 0; }
+// The user's language (hle/locale.h): GameConfig::user_lang_id, or
+// <ID>_LANG_ID=0x0419 for a test run. Read once; a value that is not a
+// language id is a fatal error.
+uint16_t UserLangId() {
+  static const uint16_t lang = [] {
+    uint16_t v = Game().user_lang_id;
+    if (!IsLangId(v))
+      FatalF("GameConfig::user_lang_id %04X: not a language id with a primary language "
+             "and a sublanguage, such as 0x0419",
+             unsigned(v));
+    if (const char* e = Env("LANG_ID"); e && *e && !ParseLangId(e, &v))
+      FatalF("LANG_ID=%s: expected 0x and a language id with a primary language and a "
+             "sublanguage, such as 0x0419",
+             e);
+    return v;
+  }();
+  return lang;
+}
 
+// One language for the user, the user interface and the system's
+// interface: a game that asks any of them gets the same answer.
+HLE("kernel32.dll", GetUserDefaultLCID, 0) { return LcidOf(UserLangId()); }
+HLE("kernel32.dll", GetUserDefaultLangID, 0) { return UserLangId(); }
+HLE("kernel32.dll", GetUserDefaultUILanguage, 0) { return UserLangId(); }
+HLE("kernel32.dll", GetSystemDefaultUILanguage, 0) { return UserLangId(); }
+// IsValidLocale(lcid, flags): installed and supported are the same here.
+HLE("kernel32.dll", IsValidLocale, 2) {
+  const std::vector<uint32_t> all = InstalledLocales(UserLangId());
+  return std::find(all.begin(), all.end(), uint32_t(Arg(c, 0))) != all.end() ? 1 : 0;
+}
+
+// EnumSystemLocalesA(proc, flags): each locale as 8 hex digits, until
+// proc returns FALSE.
 HLE("kernel32.dll", EnumSystemLocalesA, 2) {
+  const gaddr proc = Arg(c, 0);  // read before CallGuest changes the registers
   uint32_t buf = HeapAllocProcess(16, true);
-  PutStr(buf, "00000409");
-  CallGuest(c, Arg(c, 0), {buf});
+  for (uint32_t lcid : InstalledLocales(UserLangId())) {
+    char name[16];
+    std::snprintf(name, sizeof name, "%08x", unsigned(lcid));
+    PutStr(buf, name);
+    if (!uint32_t(CallGuest(c, proc, {buf}))) break;
+  }
   g_process_heap->Free(buf);
   return 1;
 }
