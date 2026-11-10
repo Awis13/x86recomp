@@ -1,6 +1,7 @@
 #include "runtime/hle/shared_heap.h"
 
 #include <algorithm>
+#include <cstring>
 
 namespace recomp {
 
@@ -9,6 +10,7 @@ bool SharedHeap::Init(GuestAllocator& vm, uint64_t size) {
   if (heap_) return true;
   auto heap = std::make_unique<GuestHeap>(vm, size, size);
   if (!heap->handle()) return false;
+  vm_ = &vm;
   heap_ = std::move(heap);
   size_ = heap_->GetStats().segments;  // (a heap is never under one segment, 16 MB)
   return true;
@@ -56,6 +58,19 @@ void SharedHeap::Retire(const void* user, uint64_t done, uint64_t mem, uint64_t 
   if (size == UINT64_MAX) return;  // not a block of this heap
   retired_.push_back({mem, size, serial, user});
   retired_bytes_ += size;
+}
+
+SharedHeap::Renamed SharedHeap::Rename(const void* user, uint64_t done, uint64_t mem,
+                                       uint64_t size, uint64_t serial, bool keep,
+                                       GuestHeap& fallback) {
+  Renamed r;
+  r.mem = Alloc(user, done, size, false);
+  r.shared = r.mem != 0;
+  if (!r.mem) r.mem = fallback.Alloc(size, false);
+  if (!r.mem) return {};
+  if (keep) std::memcpy(vm_->mem().ptr(r.mem), vm_->mem().ptr(mem), size);
+  Retire(user, done, mem, serial);
+  return r;
 }
 
 SharedHeap::Stats SharedHeap::GetStats() const {

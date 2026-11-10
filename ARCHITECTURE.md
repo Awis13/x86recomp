@@ -810,14 +810,22 @@ uploads read them without a copy on the CPU.
 - The GPU reads a block for a few frames after the game is done with
   it. A Lock that would write a buffer a frame in flight may still read
   (no NOOVERWRITE or READONLY) gives it a new block, as D3D9 drivers
-  rename DISCARDed buffers. The old block, and those of buffers and
-  textures released, are retired with the frame of their last use and
-  freed once the device has finished that frame: at the first
-  allocation after it, not when the heap is full. The heap then holds
-  what the game holds plus the frames in flight (tests/shared_heap_test).
-  Every device maps the whole heap and counts its own frames, so an
-  allocation frees only the blocks its own device retired; a device's
-  remaining blocks are freed when it is destroyed, after its GPU work.
+  rename DISCARDed buffers; a texture level written while the GPU may
+  still copy an upload from it is renamed the same way. The old block,
+  and those of buffers and textures released, are retired with the
+  frame of their last use and freed once the device has finished that
+  frame: at the first allocation after it, not when the heap is full.
+  The heap then holds what the game holds plus the frames in flight
+  (tests/shared_heap_test). Every device maps the whole heap and counts
+  its own frames, so an allocation frees only the blocks its own device
+  retired; a device's remaining blocks are freed when it is destroyed,
+  after its GPU work.
+- A rename that finds the heap full moves the buffer or level to the
+  process heap for good (draws copy it from there). With no room there
+  either, the lock writes the old block, which frames in flight may then
+  draw, and the log says so once. Waiting for the GPU is no way out: the
+  frame may be the one being recorded, which the device submits only at
+  Present.
 - <ID>_MEM_REPORT=s: every s seconds, from Present, two `mem:` lines in
   the log. The first is the guest's address space (reserved, free,
   largest gap), the process heap and the heaps the guest created; the

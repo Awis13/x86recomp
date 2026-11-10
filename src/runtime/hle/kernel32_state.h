@@ -69,6 +69,8 @@ struct WaitLog {
   ~WaitLog();
 };
 void HeapFreeProcess(gaddr p);
+// The process heap itself (GetProcessHeap's), for code that takes a heap.
+GuestHeap& ProcessHeap();
 // HeapReAlloc on the process heap (0 if p is not a live block or the
 // size cannot be had); HeapSize, UINT64_MAX if p is not a live block.
 gaddr HeapReAllocProcess(gaddr p, uint64_t size);

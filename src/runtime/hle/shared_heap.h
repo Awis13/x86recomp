@@ -53,6 +53,19 @@ class SharedHeap {
   // that is gone, once its GPU work is over.
   void Forget(const void* user);
 
+  // Where a block's writes go when frame `serial` of `user`, which may
+  // not be over, reads it: a new block of this heap, or when it is full
+  // one of `fallback` (the process heap; the device then copies what it
+  // draws from it). The `size` bytes are copied over with `keep`, and the
+  // old block is retired. {0, false} if neither heap has room: the caller
+  // can only write the old block.
+  struct Renamed {
+    uint64_t mem = 0;
+    bool shared = false;  // in this heap
+  };
+  Renamed Rename(const void* user, uint64_t done, uint64_t mem, uint64_t size, uint64_t serial,
+                 bool keep, GuestHeap& fallback);
+
   struct Stats {
     uint64_t used = 0;          // bytes in blocks, retired ones included
     uint64_t peak = 0;          // the most `used` has been
@@ -72,6 +85,7 @@ class SharedHeap {
     const void* user;
   };
   mutable std::mutex mu_;
+  GuestAllocator* vm_ = nullptr;
   std::unique_ptr<GuestHeap> heap_;
   uint64_t size_ = 0;
   std::vector<Retired> retired_;

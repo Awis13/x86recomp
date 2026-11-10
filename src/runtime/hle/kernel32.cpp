@@ -57,6 +57,8 @@ gaddr HeapAllocProcess(uint64_t size, bool zero) {
 
 void HeapFreeProcess(gaddr p) { g_process_heap->Free(p); }
 
+GuestHeap& ProcessHeap() { return *g_process_heap; }
+
 std::string GuestMemoryText() {
   const GuestAllocator::Stats vm = g_proc->vm.GetStats();
   const GuestHeap::Stats ph = g_process_heap->GetStats();

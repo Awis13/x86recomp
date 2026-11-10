@@ -69,6 +69,25 @@ void Retire(const gfx::Device* dev, gaddr mem, uint64_t serial) {
   Shared().Retire(dev, dev ? dev->CompletedSerial() : 0, mem, serial);
 }
 
+// A new block for writes to shared block `mem`, which `dev` reads until
+// its frame `serial` is over: in the shared heap, or the process heap when
+// that is full (SharedHeap::Rename). With neither, 0, said once: the
+// caller writes the old block and frames in flight may draw what it
+// writes. Waiting for the GPU instead cannot be done here: `serial` may be
+// the frame being recorded, which the device submits only at Present.
+SharedHeap::Renamed RenameShared(const gfx::Device* dev, gaddr mem, uint32_t size,
+                                 uint64_t serial, bool keep) {
+  const SharedHeap::Renamed n =
+      Shared().Rename(dev, dev->CompletedSerial(), mem, size, serial, keep, ProcessHeap());
+  if (!n.mem) {
+    static std::atomic<bool> warned{false};
+    if (!warned.exchange(true))
+      WarnF("d3d9: no memory for a new copy of a %u byte block the GPU still reads: written in "
+            "place\n", size);
+  }
+  return n;
+}
+
 // Guest memory the resources hold, for MemoryReport: bytes and blocks of
 // texture levels by pool (D3DPOOL) and of vertex and index buffers, each
 // in the shared heap ([1]) or the process heap ([0]).
@@ -244,16 +263,20 @@ uint32_t LevelMem(Texture& t, Texture::Level& l) {
 
 // A shared level about to be written while the GPU may still be copying
 // an upload from it: a new block with the same contents, the old one freed
-// once that frame has finished (as BufferLock renames buffers).
+// once that frame has finished (as BufferLock renames buffers); in the
+// process heap if the shared one is full.
 void RenameLevelIfInUse(Texture& t, Texture::Level& l) {
   Device* d = com::As<Device>(t.device);
   if (!l.shared || !d || !d->gfx || l.gpu_use <= d->gfx->CompletedSerial()) return;
-  if (gaddr n = SharedAlloc(d->gfx.get(), l.size, false)) {
-    std::memcpy(GPtr(n), GPtr(l.mem), l.size);
-    Retire(d->gfx.get(), l.mem, l.gpu_use);
-    l.mem = uint32_t(n);
-    l.gpu_use = 0;
+  const SharedHeap::Renamed n = RenameShared(d->gfx.get(), l.mem, l.size, l.gpu_use, true);
+  if (!n.mem) return;
+  if (!n.shared) {  // the process heap from now on
+    CountLevel(t.pool, true, -int64_t(l.size));
+    CountLevel(t.pool, false, l.size);
+    l.shared = false;
   }
+  l.mem = uint32_t(n.mem);
+  l.gpu_use = 0;
 }
 
 // Uploads `r` of a level from its lock shadow.
@@ -1174,10 +1197,15 @@ uint32_t BufferLock(Ctx& c) {
   Device* d = com::As<Device>(b->device);
   if (b->shared && d && d->gfx && !(flags & (D3DLOCK_READONLY | D3DLOCK_NOOVERWRITE)) &&
       b->last_use > d->gfx->CompletedSerial()) {
-    if (gaddr n = SharedAlloc(d->gfx.get(), b->length, false)) {
-      if (!(flags & D3DLOCK_DISCARD)) std::memcpy(GPtr(n), GPtr(b->mem), b->length);
-      Retire(d->gfx.get(), b->mem, b->last_use);
-      b->mem = uint32_t(n);
+    const SharedHeap::Renamed n = RenameShared(d->gfx.get(), b->mem, b->length, b->last_use,
+                                               !(flags & D3DLOCK_DISCARD));
+    if (n.mem) {
+      if (!n.shared) {  // the process heap from now on: draws copy it
+        CountBuffer(true, -int64_t(b->length));
+        CountBuffer(false, b->length);
+        b->shared = false;
+      }
+      b->mem = uint32_t(n.mem);
       b->last_use = 0;
     }
   }

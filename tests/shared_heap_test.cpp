@@ -22,7 +22,11 @@
 //   - a block retired with a frame already over by the time of the last
 //     collection is collected when the heap is full (the done the caller
 //     read may be older than the one the heap last collected at);
-//   - Init once the heap exists keeps it (two devices made at once).
+//   - Init once the heap exists keeps it (two devices made at once);
+//   - Rename gives a block that a frame in flight reads a new one, with its
+//     bytes when asked: in the heap while it has room, then in the
+//     fallback heap, and 0 (the old block untouched, not retired) when
+//     neither has.
 // Scenarios come from raw mt19937 output, which the standard fixes.
 
 #include <algorithm>
@@ -233,6 +237,56 @@ void TestStaleDone() {
   CHECK(h.GetStats().waiting == 1);
 }
 
+void TestRename() {
+  GuestAllocator vm;
+  vm.Init(&g_mem, kLo, kHi);
+  SharedHeap h;
+  CHECK(h.Init(vm, 16 * kMb));
+  GuestHeap fallback(vm, 16 * kMb, 16 * kMb);
+  CHECK(fallback.handle());
+  int dev = 0;
+  auto in_heap = [&](uint64_t p) { return p >= h.base() && p < h.base() + h.size(); };
+
+  // Room in the heap: a block of it, the bytes copied, the old one waiting
+  // for frame 3 with its bytes.
+  const uint64_t a = h.Alloc(&dev, 0, 4 * kMb, false);
+  Fill(a, 0x11, 4 * kMb);
+  SharedHeap::Renamed n = h.Rename(&dev, 0, a, 4 * kMb, 3, true, fallback);
+  CHECK(n.mem && n.shared && in_heap(n.mem) && n.mem != a);
+  CHECK(AllEqual(n.mem, 0x11, 4 * kMb) && AllEqual(a, 0x11, 4 * kMb));
+  CHECK(h.GetStats().waiting == 1 && h.GetStats().waiting_bytes == 4 * kMb);
+  const uint64_t live = n.mem;
+
+  // Full (two blocks of 4 MB waiting, two live): the fallback heap.
+  const uint64_t b = h.Alloc(&dev, 0, 4 * kMb, false), c = h.Alloc(&dev, 0, 4 * kMb, false);
+  CHECK(b && c && !h.Alloc(&dev, 0, kMb, false));
+  Fill(b, 0x22, 4 * kMb);
+  n = h.Rename(&dev, 0, b, 4 * kMb, 3, true, fallback);
+  CHECK(n.mem && !n.shared && !in_heap(n.mem));
+  CHECK(n.mem >= fallback.handle() && n.mem < fallback.handle() + 16 * kMb);
+  CHECK(AllEqual(n.mem, 0x22, 4 * kMb) && AllEqual(b, 0x22, 4 * kMb));
+  CHECK(h.GetStats().waiting == 2);
+  // Without keep (DISCARD) nothing is copied, still a fresh block.
+  Fill(c, 0x33, 4 * kMb);
+  const uint64_t m = h.Rename(&dev, 0, c, 4 * kMb, 3, false, fallback).mem;
+  CHECK(m && !in_heap(m) && m != n.mem);
+  CHECK(h.GetStats().waiting == 3);
+
+  // Neither heap has room (the shared one is full of waiting blocks and
+  // `live`): 0, and the old block stays live, unretired.
+  while (fallback.Alloc(kMb, false)) {
+  }
+  Fill(live, 0x44, 4 * kMb);
+  n = h.Rename(&dev, 0, live, 4 * kMb, 3, true, fallback);
+  CHECK(!n.mem && !n.shared);
+  CHECK(h.GetStats().waiting == 3 && AllEqual(live, 0x44, 4 * kMb));
+  CHECK(h.GetStats().used == 16 * kMb);
+
+  // Frame 3 over: the retired blocks are what the next allocation gets.
+  CHECK(h.Alloc(&dev, 3, 4 * kMb, false));
+  CHECK(h.GetStats().waiting == 0);
+}
+
 // A game renaming buffers: each frame it locks some of its buffers with
 // DISCARD (a new block, the old one retired with the current frame), and
 // the device finishes frames `lag` behind.
@@ -292,6 +346,7 @@ int main() {
   TestStats();
   TestRetire();
   TestStaleDone();
+  TestRename();
   for (uint32_t seed = 1; seed <= 4; seed++) TestRenames(seed);
   if (g_failures) {
     std::fprintf(stderr, "shared_heap_test: %d failures\n", g_failures);
