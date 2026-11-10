@@ -845,7 +845,10 @@ uploads read them without a copy on the CPU.
   has held, its largest free block and the retired blocks waiting for
   the GPU. An allocation that fails for want of address space (a
   HeapAlloc on a heap without a maximum size, a VirtualAlloc reservation
-  at no given address) logs the first line too, the first eight times.
+  at no given address) logs the first line too, the first eight times
+  for each of the two. Not a request for nothing or for more than all
+  the free space together: those are a program probing how much it can
+  have, not running out.
 
 ### Display modes, fullscreen and presentation
 Display modes are virtual: the host's mode never changes behind the

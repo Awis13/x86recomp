@@ -754,10 +754,14 @@ HLE("kernel32.dll", HeapDestroy, 1) {
 namespace {
 
 // An allocation that failed for want of address space: the guest's
-// memory as GuestMemoryText says, the first eight times, for the log of a
-// game that then gives up.
-void ReportOutOfAddressSpace(const char* what, uint64_t size, uint64_t heap) {
-  static std::atomic<int> left{8};
+// memory as GuestMemoryText says, for the log of a game that then gives
+// up, while `left` (one budget per kind of call) lasts. Not for nothing
+// asked, nor for more than all the free space together: a program
+// probing how much it can have (1 GB, then 512 MB, ...) is not out of
+// it, and must not use up the reports before it is.
+void ReportOutOfAddressSpace(std::atomic<int>& left, const char* what, uint64_t size,
+                             uint64_t heap) {
+  if (!size || size > g_proc->vm.GetStats().free) return;
   if (left.load() <= 0 || left.fetch_sub(1) <= 0) return;
   if (heap)
     WarnF("%s of %llu bytes failed (heap %08llX): %s\n", what, (unsigned long long)size,
@@ -775,7 +779,8 @@ HLE64("kernel32.dll", HeapAlloc, 3) {
   const gaddr p = h->Alloc(Arg(c, 2), Arg(c, 1) & kHeapZeroMemory);
   // A heap with a maximum size is full when it is, whatever the address
   // space has left: that is the guest's business.
-  if (!p && h->growable()) ReportOutOfAddressSpace("HeapAlloc", Arg(c, 2), Arg(c, 0));
+  static std::atomic<int> reports{8};
+  if (!p && h->growable()) ReportOutOfAddressSpace(reports, "HeapAlloc", Arg(c, 2), Arg(c, 0));
   return p;
 }
 
@@ -866,7 +871,8 @@ HLE64("kernel32.dll", VirtualAlloc, 4) {
     gaddr base = vm.Reserve(addr, size + (addr & 0xFFFF), type & kMemTopDown);
     if (!base) {
       // Anywhere: out of address space (a given address may just be taken).
-      if (!addr) ReportOutOfAddressSpace("VirtualAlloc", size, 0);
+      static std::atomic<int> reports{8};
+      if (!addr) ReportOutOfAddressSpace(reports, "VirtualAlloc", size, 0);
       SetLastError(kErrorNotEnoughMemory);
       return 0;
     }
