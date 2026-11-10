@@ -406,22 +406,22 @@ Texture::~Texture() {
 void SetUpSharedBuffers(Device& d) {
   if (!d.gfx->SharesMemory()) return;
   SharedHeap& s = Shared();
-  if (!s) {
-    const char* e = Env("GPU_HEAP_MB");
-    const uint64_t mb = e ? std::strtoull(e, nullptr, 10)
-                          : (g_proc->x64 ? SharedHeap::kDefault64 : SharedHeap::kDefault32) >> 20;
-    if (!mb) return;
-    if (!s.Init(g_proc->vm, mb << 20)) {
-      WarnF("d3d9: no room for a %llu MB shared buffer heap\n", (unsigned long long)mb);
-      return;
-    }
+  const char* e = Env("GPU_HEAP_MB");
+  const uint64_t mb = e ? std::strtoull(e, nullptr, 10)
+                        : (g_proc->x64 ? SharedHeap::kDefault64 : SharedHeap::kDefault32) >> 20;
+  if (!mb) return;
+  if (!s.Init(g_proc->vm, mb << 20)) {  // (the heap of an earlier device, if there is one)
+    WarnF("d3d9: no room for a %llu MB shared buffer heap\n", (unsigned long long)mb);
+    return;
   }
-  s.Reclaim(nullptr, 0);  // an earlier device's blocks
   d.shared_buffers = d.gfx->MapSharedMemory(GPtr(s.base()), s.size());
+  if (d.shared_buffers) d.heap_user.user = d.gfx.get();
   if (d.shared_buffers)
     std::fprintf(stderr, "d3d9: vertex and index buffers in %llu MB the GPU reads in place\n",
                  (unsigned long long)(s.size() >> 20));
 }
+
+SharedHeapUser::~SharedHeapUser() { Shared().Forget(user); }
 
 Buffer::~Buffer() {
   if (!mem) return;

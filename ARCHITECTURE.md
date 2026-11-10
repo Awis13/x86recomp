@@ -815,6 +815,9 @@ uploads read them without a copy on the CPU.
   freed once the device has finished that frame: at the first
   allocation after it, not when the heap is full. The heap then holds
   what the game holds plus the frames in flight (tests/shared_heap_test).
+  Every device maps the whole heap and counts its own frames, so an
+  allocation frees only the blocks its own device retired; a device's
+  remaining blocks are freed when it is destroyed, after its GPU work.
 - <ID>_MEM_REPORT=s: every s seconds, from Present, two `mem:` lines in
   the log. The first is the guest's address space (reserved, free,
   largest gap), the process heap and the heaps the guest created; the

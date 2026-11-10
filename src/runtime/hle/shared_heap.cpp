@@ -6,6 +6,7 @@ namespace recomp {
 
 bool SharedHeap::Init(GuestAllocator& vm, uint64_t size) {
   std::lock_guard<std::mutex> l(mu_);
+  if (heap_) return true;
   auto heap = std::make_unique<GuestHeap>(vm, size, size);
   if (!heap->handle()) return false;
   heap_ = std::move(heap);
@@ -13,20 +14,21 @@ bool SharedHeap::Init(GuestAllocator& vm, uint64_t size) {
   return true;
 }
 
-void SharedHeap::ReclaimLocked(const void* user, uint64_t done) {
+void SharedHeap::ReclaimLocked(const void* user, uint64_t done, bool all) {
   std::erase_if(retired_, [&](const Retired& r) {
-    if (r.user == user && r.serial > done) return false;
+    if (r.user != user || (!all && r.serial > done)) return false;
     heap_->Free(r.mem);
     retired_bytes_ -= r.size;
     return true;
   });
+  if (all) return;
   reclaimed_user_ = user;
   reclaimed_done_ = done;
 }
 
-void SharedHeap::Reclaim(const void* user, uint64_t done) {
+void SharedHeap::Forget(const void* user) {
   std::lock_guard<std::mutex> l(mu_);
-  if (heap_) ReclaimLocked(user, done);
+  if (heap_ && user) ReclaimLocked(user, 0, true);
 }
 
 uint64_t SharedHeap::Alloc(const void* user, uint64_t done, uint64_t size, bool zero) {
@@ -34,7 +36,11 @@ uint64_t SharedHeap::Alloc(const void* user, uint64_t done, uint64_t size, bool 
   if (!heap_) return 0;
   if (!retired_.empty() && (done != reclaimed_done_ || user != reclaimed_user_))
     ReclaimLocked(user, done);
-  const uint64_t p = heap_->Alloc(size, zero);
+  uint64_t p = heap_->Alloc(size, zero);
+  if (!p && !retired_.empty()) {
+    ReclaimLocked(user, done);
+    p = heap_->Alloc(size, zero);
+  }
   if (p) peak_ = std::max(peak_, heap_->GetStats().used);
   return p;
 }

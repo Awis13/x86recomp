@@ -16,7 +16,13 @@
 //     number of frames (collected only when full, the heap would fill);
 //   - a full heap gives 0 while the frames are in flight and a block again
 //     once they are over;
-//   - a new device's first Reclaim frees the blocks of the one before.
+//   - an allocation for one device leaves another device's retired blocks
+//     alone (their bytes too), whatever frames the first has finished;
+//     Forget frees them;
+//   - a block retired with a frame already over by the time of the last
+//     collection is collected when the heap is full (the done the caller
+//     read may be older than the one the heap last collected at);
+//   - Init once the heap exists keeps it (two devices made at once).
 // Scenarios come from raw mt19937 output, which the standard fixes.
 
 #include <algorithm>
@@ -162,12 +168,69 @@ void TestRetire() {
   CHECK(p && h.GetStats().waiting == 0 && h.GetStats().used == kMb);
   CHECK(h.GetStats().peak == 32 * kMb);  // it was full
 
-  // Another device: the first one's blocks are over, whatever their frame.
+  // Another device draws from the same heap: its allocations, at any of
+  // its frames, leave dev_a's blocks waiting with their bytes; the heap
+  // being full does not change that.
+  Fill(p, 0xA5, kMb);
   h.Retire(&dev_a, 9, p, 1000);
   CHECK(h.GetStats().waiting == 1);
-  h.Reclaim(&dev_b, 0);
+  uint64_t b1 = h.Alloc(&dev_b, 0, kMb, false);
+  uint64_t b2 = h.Alloc(&dev_b, 5000, kMb, false);
+  CHECK(b1 && b2 && b1 != p && b2 != p);
+  CHECK(h.GetStats().waiting == 1 && AllEqual(p, 0xA5, kMb));
+  std::vector<uint64_t> rest;
+  while (uint64_t b = h.Alloc(&dev_b, 5000, kMb, false)) rest.push_back(b);
+  CHECK(h.GetStats().waiting == 1 && AllEqual(p, 0xA5, kMb));
+  CHECK(std::find(rest.begin(), rest.end(), p) == rest.end());
+  for (uint64_t b : rest) h.Retire(&dev_b, 5000, b, 0);
+  h.Retire(&dev_b, 5000, b1, 0);
+  h.Retire(&dev_b, 5000, b2, 0);
+  CHECK(h.GetStats().used == kMb);
+  // dev_a is gone (its GPU work over): Forget frees its blocks, and only
+  // its own.
+  h.Retire(&dev_b, 0, h.Alloc(&dev_b, 0, kMb, false), 3);
+  h.Forget(&dev_a);
+  CHECK(h.GetStats().waiting == 1 && h.GetStats().used == kMb);
+  h.Forget(&dev_b);
   CHECK(h.GetStats().waiting == 0 && h.GetStats().used == 0);
   CHECK(vm.GetStats().reserved == 32 * kMb);  // never more than its size
+
+  // Init again (a second device made at the same time): the same heap.
+  const uint64_t base = h.base();
+  q = h.Alloc(&dev_a, 0, kMb, false);
+  Fill(q, 0x3C, kMb);
+  CHECK(h.Init(vm, 64 * kMb));
+  CHECK(h.base() == base && h.size() == 32 * kMb);
+  CHECK(vm.GetStats().reserved == 32 * kMb);
+  CHECK(AllEqual(q, 0x3C, kMb) && h.GetStats().used == kMb);
+  h.Retire(nullptr, 0, q, 0);
+}
+
+// A block retired with a `done` older than the one the heap last
+// collected at (two threads: one read the device's frame, the other
+// collected at a later one first) is collected when the heap is full.
+void TestStaleDone() {
+  GuestAllocator vm;
+  vm.Init(&g_mem, kLo, kHi);
+  SharedHeap h;
+  CHECK(h.Init(vm, 32 * kMb));
+  int dev = 0;
+  std::vector<uint64_t> blocks;
+  for (int i = 0; i < 8; i++) blocks.push_back(h.Alloc(&dev, 5, 4 * kMb, false));
+  for (uint64_t b : blocks) CHECK(b);
+  h.Retire(&dev, 5, blocks[0], 6);
+  h.Retire(&dev, 5, blocks[1], 7);
+  // The device has finished frame 6: blocks[0] goes to this allocation,
+  // and the heap has collected at 6.
+  const uint64_t q = h.Alloc(&dev, 6, 4 * kMb, false);
+  CHECK(q == blocks[0]);
+  // Retired with done 5 read before that collection: it waits.
+  h.Retire(&dev, 5, q, 6);
+  CHECK(h.GetStats().waiting == 2);
+  // Full, at the frame it last collected at: frame 6 is over, so q is
+  // free to take.
+  CHECK(h.Alloc(&dev, 6, 4 * kMb, false) == q);
+  CHECK(h.GetStats().waiting == 1);
 }
 
 // A game renaming buffers: each frame it locks some of its buffers with
@@ -228,6 +291,7 @@ int main() {
   if (!g_mem.Reserve()) return 1;
   TestStats();
   TestRetire();
+  TestStaleDone();
   for (uint32_t seed = 1; seed <= 4; seed++) TestRenames(seed);
   if (g_failures) {
     std::fprintf(stderr, "shared_heap_test: %d failures\n", g_failures);

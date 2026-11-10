@@ -217,11 +217,23 @@ struct RenderStates {
   }
 };
 
+// The blocks a device retired in the shared heap (d3d9_resource.cpp),
+// freed when it goes: a member of Device before its gfx, so destroyed
+// after it, once the gfx::Device has waited for its GPU work.
+struct SharedHeapUser {
+  const void* user = nullptr;  // the gfx::Device, while it maps the heap
+  SharedHeapUser() = default;
+  SharedHeapUser(const SharedHeapUser&) = delete;
+  SharedHeapUser& operator=(const SharedHeapUser&) = delete;
+  ~SharedHeapUser();
+};
+
 struct Device final : com::Tagged<com::TagOf("d3d9.Device")> {
   uint32_t d3d = 0;  // IDirect3D9 guest pointer
   guest::D3DDEVICE_CREATION_PARAMETERS creation{};
   guest::D3DPRESENT_PARAMETERS pp{};
   uint32_t hwnd = 0;
+  SharedHeapUser heap_user;  // before gfx: see SharedHeapUser
   std::unique_ptr<gfx::Device> gfx;
   bool shared_buffers = false;  // vertex and index buffers in the shared heap
   std::shared_ptr<Surface> backbuffer, auto_depth;
