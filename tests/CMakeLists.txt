@@ -110,6 +110,29 @@ target_include_directories(display_modes_test PRIVATE ${PROJECT_SOURCE_DIR}/src)
 target_compile_features(display_modes_test PRIVATE cxx_std_20)
 add_test(NAME display_modes COMMAND display_modes_test)
 
+# locale_test: the user's language (GameConfig::user_lang_id,
+# <ID>_LANG_ID) as kernel32 answers it to a guest, one run per case: the
+# default, a port's language, the switch over the port's, a malformed
+# switch (decimal, without 0x) and a port's neutral language id (both
+# fatal, their crash reports in the build tree); portable.
+add_executable(locale_test locale_test.cpp)
+target_link_libraries(locale_test PRIVATE recomp_runtime)
+set(_locale_data XDG_DATA_HOME=${CMAKE_CURRENT_BINARY_DIR}/locale_data)
+add_test(NAME locale_default COMMAND locale_test 0409 0409)
+add_test(NAME locale_port COMMAND locale_test 0419 0419)
+add_test(NAME locale_switch COMMAND locale_test 0407 0419)
+add_test(NAME locale_switch_malformed COMMAND locale_test 0409 0409)
+add_test(NAME locale_port_invalid COMMAND locale_test 0019 0019)
+set_tests_properties(locale_default locale_port locale_port_invalid PROPERTIES
+                     ENVIRONMENT ${_locale_data})
+set_tests_properties(locale_switch PROPERTIES
+                     ENVIRONMENT "${_locale_data};LOCALETEST_LANG_ID=0x0419")
+set_tests_properties(locale_switch_malformed PROPERTIES
+                     ENVIRONMENT "${_locale_data};LOCALETEST_LANG_ID=1049"
+                     PASS_REGULAR_EXPRESSION "FATAL: LANG_ID=1049: expected 0x and a language id")
+set_tests_properties(locale_port_invalid PROPERTIES
+                     PASS_REGULAR_EXPRESSION "FATAL: GameConfig::user_lang_id 0019: not a language id")
+
 # lazy_mem_test: lazily read-back images (DirectDraw Lock of GPU
 # surfaces) through real page faults; portable.
 add_executable(lazy_mem_test lazy_mem_test.cpp
