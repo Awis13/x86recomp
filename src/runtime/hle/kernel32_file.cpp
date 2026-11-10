@@ -35,7 +35,8 @@ std::map<uint32_t, std::shared_ptr<KObject>> g_handles;
 uint32_t g_next_handle = 0x100;
 
 std::mutex g_cwd_mu;
-std::string g_cwd;  // guest current directory; empty: GuestGameDir()
+std::string g_cwd;  // guest current directory; empty: configured initial directory
+std::map<char, std::string> g_drive_cwds;  // last current directory on each drive
 
 struct StdIoObject : KObject {
   explicit StdIoObject(int f) : KObject(Type::StdIo), fd(f) {}
@@ -80,13 +81,25 @@ std::vector<std::string> Components(const std::string& p) {
   return out;
 }
 
+// A drive-relative path uses that drive's last directory, even when another
+// drive is current. Drives not yet visited start at their root.
+std::string DriveCurrentDir(char drive) {
+  std::lock_guard<std::mutex> l(g_cwd_mu);
+  if (!g_cwd.empty() && char(std::toupper(g_cwd[0])) == drive) return g_cwd;
+  if (auto it = g_drive_cwds.find(drive); it != g_drive_cwds.end()) return it->second;
+  const auto& initial = Game().current_dir.empty() ? GuestGameDir() : Game().current_dir;
+  if (char(std::toupper(initial[0])) == drive) return initial;
+  return std::string(1, drive) + ":\\";
+}
+
 // Absolute, normalised guest path: "C:\x\y".
 std::string AbsGuest(std::string p) {
   std::replace(p.begin(), p.end(), '/', '\\');
   if (p.size() >= 2 && p[1] == ':') {
-    if (p.size() == 2) p += '\\';
+    if (p.size() == 2 || p[2] != '\\')
+      p = DriveCurrentDir(char(std::toupper(p[0]))) + "\\" + p.substr(2);
   } else if (!p.empty() && p[0] == '\\') {
-    p = "C:" + p;
+    p = GuestCurrentDir().substr(0, 2) + p;
   } else {
     p = GuestCurrentDir() + "\\" + p;
   }
@@ -820,6 +833,10 @@ uint32_t SetCurrentDirectory(const std::string& path) {
     return 0;
   }
   std::lock_guard<std::mutex> l(g_cwd_mu);
+  const auto& previous = g_cwd.empty()
+      ? (Game().current_dir.empty() ? GuestGameDir() : Game().current_dir) : g_cwd;
+  g_drive_cwds[char(std::toupper(previous[0]))] = previous;
+  g_drive_cwds[char(std::toupper(g[0]))] = g;
   g_cwd = g;
   return 1;
 }
