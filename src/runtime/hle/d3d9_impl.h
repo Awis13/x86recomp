@@ -26,6 +26,7 @@ constexpr uint32_t D3D_OK = 0;
 constexpr uint32_t D3DERR_NOTFOUND = 0x88760866;
 constexpr uint32_t D3DERR_NOTAVAILABLE = 0x8876086A;
 constexpr uint32_t D3DERR_INVALIDCALL = 0x8876086C;
+constexpr uint32_t E_OUTOFMEMORY = 0x8007000E;
 constexpr uint32_t S_FALSE = 1;
 
 // D3DFORMAT values
@@ -377,7 +378,8 @@ struct PerfCounts {
 extern PerfCounts g_perf;
 
 // A standalone surface (back buffer, depth stencil, render target,
-// offscreen plain): published with refcount 1, kept in *keep if given.
+// offscreen plain): published with refcount 1, kept in *keep if given; 0
+// for an offscreen plain one that gets no guest memory for its pixels.
 uint32_t NewSurface(Device& d, uint32_t device, Surface::Kind kind, uint32_t w,
                     uint32_t h, uint32_t fmt, uint32_t usage, uint32_t pool,
                     std::shared_ptr<Surface>* keep);

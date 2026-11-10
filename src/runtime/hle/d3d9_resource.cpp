@@ -306,7 +306,13 @@ uint32_t LockLevel(Texture& t, uint32_t face, uint32_t level, uint32_t out, uint
   if (l.locked) return D3DERR_INVALIDCALL;
   if ((t.usage & (D3DUSAGE_RENDERTARGET | D3DUSAGE_DEPTHSTENCIL)) && t.pool == D3DPOOL_DEFAULT)
     return D3DERR_INVALIDCALL;  // GPU-only
-  LevelMem(t, l);
+  if (!LevelMem(t, l)) {
+    // The guest is out of address space. The documentation lists only
+    // INVALIDCALL; a caller that checks FAILED sees this alike, and one
+    // that does not gets a null pointer, not one into page 0's neighbours.
+    *G<D3DLOCKED_RECT>(out) = {0, 0};
+    return E_OUTOFMEMORY;
+  }
   if (!(flags & (D3DLOCK_READONLY | D3DLOCK_NO_DIRTY_UPDATE))) RenameLevelIfInUse(t, l);
   gfx::Rect r{0, 0, int32_t(l.w), int32_t(l.h)};
   if (rect) r = *G<gfx::Rect>(rect);
@@ -512,7 +518,19 @@ uint32_t NewTexture(Device& d, uint32_t device, bool cube, uint32_t w, uint32_t 
 void FillLevel(Texture& t, uint32_t face, uint32_t level, const uint8_t* src,
                uint32_t pitch) {
   Texture::Level& l = t.At(face, level);
-  LevelMem(t, l);
+  if (!LevelMem(t, l)) {
+    // No guest memory for the lock shadow: the GPU side straight from
+    // `src` (a lock later tries for a shadow again).
+    if (t.tex) {
+      gfx::Device* g = DeviceOf(t.device)->gfx.get();
+      const gfx::Rect r{0, 0, int32_t(l.w), int32_t(l.h)};
+      if (t.cube)
+        g->UpdateCubeTexture(t.tex, int(face), int(level), r, src, pitch);
+      else
+        g->UpdateTexture(t.tex, int(level), r, src, pitch);
+    }
+    return;
+  }
   RenameLevelIfInUse(t, l);
   uint32_t row = gfx::RowPitch(t.fmt, l.w), rows = gfx::RowCount(t.fmt, l.h);
   for (uint32_t y = 0; y < rows; y++)
@@ -569,7 +587,8 @@ uint32_t NewSurface(Device& d, uint32_t device, Surface::Kind kind, uint32_t w,
     case Surface::Kind::Offscreen:
       s->pitch = gfx::RowPitch(f, w);
       s->mem = HeapAllocProcess(s->pitch * gfx::RowCount(f, h), true);
-      if (s->mem) g_mem.surface_bytes += int64_t(s->pitch) * gfx::RowCount(f, h);
+      if (!s->mem) return 0;  // out of address space
+      g_mem.surface_bytes += int64_t(s->pitch) * gfx::RowCount(f, h);
       break;
     default:
       break;
@@ -659,7 +678,11 @@ uint32_t CreateBuffer(Ctx& c, bool index) {
     b->shared = b->mem != 0;
   }
   if (!b->mem) b->mem = HeapAllocProcess(length, true);
-  if (b->mem) CountBuffer(b->shared, length);
+  if (!b->mem) {  // out of address space (a documented result)
+    Wr32(out, 0);
+    return E_OUTOFMEMORY;
+  }
+  CountBuffer(b->shared, length);
   Wr32(out, com::Publish(b, BufferVtable(index)));
   return D3D_OK;
 }
@@ -711,9 +734,10 @@ HLE_NAMED("d3d9.dll", "IDirect3DDevice9::CreateOffscreenPlainSurface", D3DDev9_C
     Wr32(out, 0);
     return D3DERR_INVALIDCALL;
   }
-  Wr32(out, NewSurface(*d, Arg(c, 0), Surface::Kind::Offscreen, Arg(c, 1),
-                       Arg(c, 2), fmt, 0, Arg(c, 4), nullptr));
-  return D3D_OK;
+  const uint32_t s = NewSurface(*d, Arg(c, 0), Surface::Kind::Offscreen, Arg(c, 1), Arg(c, 2),
+                                fmt, 0, Arg(c, 4), nullptr);
+  Wr32(out, s);
+  return s ? D3D_OK : E_OUTOFMEMORY;  // no memory for its pixels
 }
 
 // (pVertexElements, ppDecl)

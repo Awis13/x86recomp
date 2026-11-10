@@ -826,6 +826,13 @@ uploads read them without a copy on the CPU.
   draw, and the log says so once. Waiting for the GPU is no way out: the
   frame may be the one being recorded, which the device submits only at
   Present.
+- With no guest memory left in either heap, CreateVertexBuffer,
+  CreateIndexBuffer and CreateOffscreenPlainSurface fail with
+  E_OUTOFMEMORY, and so does a LockRect whose level has no lock shadow
+  yet (shadows are made on first use), rather than handing the game a
+  null pointer; D3DX fills such a level's GPU side from its source
+  directly. A growable guest heap (the process heap among them) that
+  finds no gap for a whole 16 MB segment takes one just big enough.
 - <ID>_MEM_REPORT=s: every s seconds, from Present, two `mem:` lines in
   the log. The first is the guest's address space (reserved, free,
   largest gap), the process heap and the heaps the guest created; the

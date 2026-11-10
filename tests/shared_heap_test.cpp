@@ -5,6 +5,8 @@
 //   - the address space's reserved and free bytes and its largest gap
 //     follow reservations and releases, and a heap's segments, bytes in
 //     blocks and largest free block follow Alloc, Free and ReAlloc;
+//   - a heap still grows in an address space with no gap of a whole
+//     segment (16 MB) left, by a segment just big enough;
 //   - the shared heap takes its whole size from the address space once, and
 //     nothing more whatever is allocated; a size with no gap for it fails;
 //   - a block retired in a frame the device has finished, or with no
@@ -102,6 +104,31 @@ void TestStats() {
     CHECK(vm.GetStats().reserved == (64 + 16 + 256 + 36) * kMb);
   }
   CHECK(vm.GetStats().reserved == (64 + 16 + 256) * kMb);  // the heap gave its segments back
+}
+
+// An address space whose gaps are all 8 MB: a growable heap made there,
+// and its allocations up to that size, take segments just big enough.
+void TestFragmented() {
+  GuestAllocator vm;
+  vm.Init(&g_mem, kLo, kHi);
+  std::vector<uint64_t> chunks;
+  while (uint64_t c = vm.Reserve(0, 8 * kMb)) chunks.push_back(c);
+  // Every other one back (the odd ones: the rest at the top, under 8 MB,
+  // stays a gap of its own).
+  for (size_t i = 1; i < chunks.size(); i += 2) CHECK(vm.Release(chunks[i]));
+  const GuestAllocator::Stats before = vm.GetStats();
+  CHECK(before.largest_free == 8 * kMb);
+  {
+    GuestHeap h(vm, kMb, 0);
+    CHECK(h.handle() != 0);
+    CHECK(h.GetStats().segments == kMb);
+    const uint64_t p = h.Alloc(512 << 10, true), q = h.Alloc(6 * kMb, true);
+    CHECK(p && q);
+    CHECK(h.GetStats().segments == 7 * kMb);
+    CHECK(!h.Alloc(9 * kMb, false));  // no gap that big
+    CHECK(h.Free(p) && h.Free(q));
+  }
+  CHECK(vm.GetStats().reserved == before.reserved);
 }
 
 void Fill(uint64_t p, uint8_t v, size_t n) { std::memset(g_mem.ptr(p), v, n); }
@@ -344,6 +371,7 @@ void TestRenames(uint32_t seed) {
 int main() {
   if (!g_mem.Reserve()) return 1;
   TestStats();
+  TestFragmented();
   TestRetire();
   TestStaleDone();
   TestRename();

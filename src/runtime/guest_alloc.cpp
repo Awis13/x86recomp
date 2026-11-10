@@ -160,10 +160,9 @@ constexpr uint64_t kDefaultSegment = 16u << 20;
 GuestHeap::GuestHeap(GuestAllocator& vm, uint64_t initial_size,
                      uint64_t max_size)
     : vm_(vm), max_size_(max_size) {
-  uint64_t first = max_size ? RoundUp(max_size, kPage)
-                            : std::max(RoundUp(initial_size, kPage),
-                                       kDefaultSegment);
-  Grow(first);
+  // A growable heap's first segment is a whole one (Grow) when there is a
+  // gap for it.
+  Grow(RoundUp(max_size ? max_size : initial_size, kPage));
   // Heap handles are guest pointers on Windows; use the first segment base.
   handle_ = segments_.empty() ? 0 : segments_.front().first;
 }
@@ -176,6 +175,13 @@ bool GuestHeap::Grow(uint64_t need) {
   uint64_t size = RoundUp(std::max(need, kDefaultSegment),
                           GuestAllocator::kGranularity);
   uint64_t base = vm_.Reserve(0, size);
+  const uint64_t least = RoundUp(std::max<uint64_t>(need, 1), GuestAllocator::kGranularity);
+  if (!base && size > least) {
+    // No gap of a whole segment left (a fragmented address space): one
+    // just big enough, as long as there is such a gap.
+    size = least;
+    base = vm_.Reserve(0, size);
+  }
   if (!base) return false;
   // Committing is cheap: host pages are only materialised when touched.
   vm_.Commit(base, size, Prot::RW);

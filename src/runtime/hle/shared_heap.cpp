@@ -12,7 +12,7 @@ bool SharedHeap::Init(GuestAllocator& vm, uint64_t size) {
   if (!heap->handle()) return false;
   vm_ = &vm;
   heap_ = std::move(heap);
-  size_ = heap_->GetStats().segments;  // (a heap is never under one segment, 16 MB)
+  size_ = heap_->GetStats().segments;  // (one heap segment, 16 MB, if there is a gap for it)
   return true;
 }
 
