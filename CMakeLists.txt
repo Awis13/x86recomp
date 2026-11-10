@@ -338,7 +338,7 @@ endif()
 
 # Direct3D 9 and D3DX 9 over gfx::Device.
 add_library(recomp_d3d9 SHARED src/runtime/hle/d3d9.cpp src/runtime/hle/d3d9_draw.cpp
-  src/runtime/hle/d3d9_resource.cpp src/runtime/hle/d3dx9.cpp)
+  src/runtime/hle/d3d9_resource.cpp src/runtime/hle/shared_heap.cpp src/runtime/hle/d3dx9.cpp)
 target_link_libraries(recomp_d3d9 PUBLIC recomp_runtime recomp_gfx recomp_hlsl)
 # D3DX's maths rounds like the original only without contraction into FMA.
 set_source_files_properties(src/runtime/hle/d3dx9.cpp TARGET_DIRECTORY recomp_d3d9

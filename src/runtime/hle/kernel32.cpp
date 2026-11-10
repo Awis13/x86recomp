@@ -8,11 +8,13 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <ctime>
 #include <map>
 #include <memory>
 #include <mutex>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -54,6 +56,28 @@ gaddr HeapAllocProcess(uint64_t size, bool zero) {
 }
 
 void HeapFreeProcess(gaddr p) { g_process_heap->Free(p); }
+
+GuestHeap& ProcessHeap() { return *g_process_heap; }
+
+std::string GuestMemoryText() {
+  const GuestAllocator::Stats vm = g_proc->vm.GetStats();
+  const GuestHeap::Stats ph = g_process_heap->GetStats();
+  uint64_t others = 0;
+  {
+    std::lock_guard<std::mutex> l(g_heaps_mu);
+    for (const auto& [handle, heap] : g_heaps)
+      if (heap.get() != g_process_heap) others += heap->GetStats().segments;
+  }
+  char b[256];
+  std::snprintf(b, sizeof b,
+                "address space: %llu MB reserved, %llu free (largest gap %llu); process heap %llu "
+                "(%llu in blocks, largest free block %llu); other heaps %llu",
+                (unsigned long long)(vm.reserved >> 20), (unsigned long long)(vm.free >> 20),
+                (unsigned long long)(vm.largest_free >> 20), (unsigned long long)(ph.segments >> 20),
+                (unsigned long long)(ph.used >> 20), (unsigned long long)(ph.largest_free >> 20),
+                (unsigned long long)(others >> 20));
+  return b;
+}
 
 gaddr HeapReAllocProcess(gaddr p, uint64_t size) {
   return g_process_heap->ReAlloc(p, size, false, false);
@@ -727,10 +751,39 @@ HLE("kernel32.dll", HeapDestroy, 1) {
   return g_heaps.erase(Arg(c, 0)) ? 1 : 0;
 }
 
+namespace {
+
+// An allocation that failed for want of address space: the guest's
+// memory as GuestMemoryText says, for the log of a game that then gives
+// up, while `left` (one budget per kind of call) lasts. With `probe`
+// (reservations), not for nothing asked, nor for more than all the free
+// space together: a program probing how much it can have (1 GB, then
+// 512 MB, ...) is not out of it, and must not use up the reports before
+// it is. A heap allocation is never a probe.
+void ReportOutOfAddressSpace(std::atomic<int>& left, bool probe, const char* what,
+                             uint64_t size, uint64_t heap) {
+  if (left.load() <= 0) return;  // (a game retrying every frame pays nothing more)
+  if (probe && (!size || size > g_proc->vm.GetStats().free)) return;
+  if (left.fetch_sub(1) <= 0) return;
+  if (heap)
+    WarnF("%s of %llu bytes failed (heap %08llX): %s\n", what, (unsigned long long)size,
+          (unsigned long long)heap, GuestMemoryText().c_str());
+  else
+    WarnF("%s of %llu bytes failed: %s\n", what, (unsigned long long)size,
+          GuestMemoryText().c_str());
+}
+
+}  // namespace
+
 HLE64("kernel32.dll", HeapAlloc, 3) {
   GuestHeap* h = FindHeap(Arg(c, 0));
   if (!h) FatalF("HeapAlloc on unknown heap %08llX", (unsigned long long)Arg(c, 0));
-  return h->Alloc(Arg(c, 2), Arg(c, 1) & kHeapZeroMemory);
+  const gaddr p = h->Alloc(Arg(c, 2), Arg(c, 1) & kHeapZeroMemory);
+  // A heap with a maximum size is full when it is, whatever the address
+  // space has left: that is the guest's business.
+  static std::atomic<int> reports{8};
+  if (!p && h->growable()) ReportOutOfAddressSpace(reports, false, "HeapAlloc", Arg(c, 2), Arg(c, 0));
+  return p;
 }
 
 HLE64("kernel32.dll", HeapFree, 3) {
@@ -819,6 +872,9 @@ HLE64("kernel32.dll", VirtualAlloc, 4) {
   if (type & kMemReserve) {
     gaddr base = vm.Reserve(addr, size + (addr & 0xFFFF), type & kMemTopDown);
     if (!base) {
+      // Anywhere: out of address space (a given address may just be taken).
+      static std::atomic<int> reports{8};
+      if (!addr) ReportOutOfAddressSpace(reports, true, "VirtualAlloc", size, 0);
       SetLastError(kErrorNotEnoughMemory);
       return 0;
     }

@@ -45,6 +45,13 @@ class GuestAllocator {
   // VirtualQuery on unreserved memory).
   void FreeGap(uint64_t va, uint64_t* base, uint64_t* size) const;
 
+  // The address space as a whole: bytes reserved, bytes free, and the
+  // largest free gap (what the next big reservation can get).
+  struct Stats {
+    uint64_t reserved = 0, free = 0, largest_free = 0;
+  };
+  Stats GetStats() const;
+
   GuestMemory& mem() { return *mem_; }
 
  private:
@@ -63,6 +70,9 @@ class GuestHeap {
   ~GuestHeap();
 
   uint64_t handle() const { return handle_; }
+  // Whether it takes more address space when full (no maximum size): if
+  // so, an allocation fails only for want of address space.
+  bool growable() const { return max_size_ == 0; }
 
   uint64_t Alloc(uint64_t size, bool zero);
   bool Free(uint64_t p);
@@ -72,6 +82,13 @@ class GuestHeap {
   // Requested size of block p, or UINT64_MAX ((SIZE_T)-1) if p is not a
   // live block.
   uint64_t Size(uint64_t p) const;
+
+  // Bytes of address space the heap holds (its segments) and how many
+  // segments, bytes in live blocks, and its largest free block.
+  struct Stats {
+    uint64_t segments = 0, segment_count = 0, used = 0, largest_free = 0;
+  };
+  Stats GetStats() const;
 
  private:
   struct Block {
@@ -87,7 +104,8 @@ class GuestHeap {
   GuestAllocator& vm_;
   uint64_t max_size_;
   uint64_t handle_ = 0;
-  std::vector<std::pair<uint64_t, uint64_t>> segments_;  // base, size
+  std::map<uint64_t, uint64_t> segments_;  // base -> size
+  uint64_t used_bytes_ = 0;  // of used_
   std::map<uint64_t, Block> used_;
   std::map<uint64_t, uint64_t> free_;                // addr -> size
   std::multimap<uint64_t, uint64_t> free_by_size_;   // size -> addr

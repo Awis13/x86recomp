@@ -776,6 +776,7 @@ void ReportPerf() {
 HLE_NAMED("d3d9.dll", "IDirect3DDevice9::Present", D3DDev9_Present, 5) {
   Device* d = Dev(c);
   if (perf::On()) ReportPerf();
+  MemoryReport();
   PresentFrame(*d->gfx, int(d->pp.BackBufferWidth), int(d->pp.BackBufferHeight));
   return D3D_OK;
 }
@@ -838,6 +839,7 @@ HLE_NAMED("d3d9.dll", "IDirect3DSwapChain9::Release", D3DSwap9_Release, 1) { ret
 HLE_NAMED("d3d9.dll", "IDirect3DSwapChain9::Present", D3DSwap9_Present, 6) {
   Device* d = SwapDev(c);
   if (perf::On()) ReportPerf();
+  MemoryReport();
   PresentFrame(*d->gfx, int(d->pp.BackBufferWidth), int(d->pp.BackBufferHeight));
   return D3D_OK;
 }

@@ -1,5 +1,6 @@
 #include "runtime/guest_alloc.h"
 
+#include <algorithm>
 #include <cstring>
 
 namespace recomp {
@@ -129,6 +130,26 @@ bool GuestAllocator::Release(uint64_t base, bool zero) {
   return true;
 }
 
+GuestAllocator::Stats GuestAllocator::GetStats() const {
+  std::lock_guard<std::recursive_mutex> l(mu_);
+  Stats s;
+  uint64_t at = lo_;
+  auto gap = [&](uint64_t end) {
+    if (end <= at) return;
+    s.free += end - at;
+    s.largest_free = std::max(s.largest_free, end - at);
+  };
+  for (const auto& [base, size] : regions_) {
+    if (base >= hi_) break;
+    if (base + size <= lo_) continue;
+    gap(base);
+    s.reserved += std::min(base + size, hi_) - std::max(base, lo_);
+    at = std::max(at, base + size);
+  }
+  gap(hi_);
+  return s;
+}
+
 // ---- GuestHeap -------------------------------------------------------------
 
 namespace {
@@ -139,12 +160,11 @@ constexpr uint64_t kDefaultSegment = 16u << 20;
 GuestHeap::GuestHeap(GuestAllocator& vm, uint64_t initial_size,
                      uint64_t max_size)
     : vm_(vm), max_size_(max_size) {
-  uint64_t first = max_size ? RoundUp(max_size, kPage)
-                            : std::max(RoundUp(initial_size, kPage),
-                                       kDefaultSegment);
-  Grow(first);
+  // A growable heap's first segment is a whole one (Grow) when there is a
+  // gap for it.
+  Grow(RoundUp(max_size ? max_size : initial_size, kPage));
   // Heap handles are guest pointers on Windows; use the first segment base.
-  handle_ = segments_.empty() ? 0 : segments_.front().first;
+  handle_ = segments_.empty() ? 0 : segments_.begin()->first;
 }
 
 GuestHeap::~GuestHeap() {
@@ -155,18 +175,32 @@ bool GuestHeap::Grow(uint64_t need) {
   uint64_t size = RoundUp(std::max(need, kDefaultSegment),
                           GuestAllocator::kGranularity);
   uint64_t base = vm_.Reserve(0, size);
+  const uint64_t least = RoundUp(std::max<uint64_t>(need, 1), GuestAllocator::kGranularity);
+  if (!base && size > least) {
+    // No gap of a whole segment left (a fragmented address space). A
+    // growable heap takes the largest gap there is, as long as the request
+    // fits, so that small allocations do not add a segment each; a gap
+    // that does not start on the reservation granularity loses up to one
+    // granule to it. A heap with a maximum size never grows: it takes what
+    // it needs and leaves the rest of the gap to the guest.
+    if (!max_size_) {
+      constexpr uint64_t g = GuestAllocator::kGranularity;
+      const uint64_t gap = vm_.GetStats().largest_free & ~(g - 1);
+      if (gap >= least && gap < size) base = vm_.Reserve(0, size = gap);
+      if (!base && gap >= least + g && gap - g < size) base = vm_.Reserve(0, size = gap - g);
+    }
+    if (!base) base = vm_.Reserve(0, size = least);
+  }
   if (!base) return false;
   // Committing is cheap: host pages are only materialised when touched.
   vm_.Commit(base, size, Prot::RW);
-  segments_.push_back({base, size});
+  segments_[base] = size;
   InsertFree(base, size);
   return true;
 }
 
 bool GuestHeap::IsSegmentStart(uint64_t addr) const {
-  for (const auto& s : segments_)
-    if (s.first == addr) return true;
-  return false;
+  return segments_.count(addr) != 0;
 }
 
 void GuestHeap::InsertFree(uint64_t addr, uint64_t size) {
@@ -201,6 +235,7 @@ uint64_t GuestHeap::Alloc(uint64_t size, bool zero) {
   else
     size = have;
   used_[addr] = {size, req};
+  used_bytes_ += size;
   if (zero) std::memset(vm_.mem().ptr(addr), 0, size);
   return addr;
 }
@@ -211,6 +246,7 @@ bool GuestHeap::Free(uint64_t p) {
   if (it == used_.end()) return false;
   uint64_t addr = p, size = it->second.size;
   used_.erase(it);
+  used_bytes_ -= size;
   // Coalesce with the following free block, unless it starts a segment.
   auto nx = free_.find(addr + size);
   if (nx != free_.end() && !IsSegmentStart(nx->first)) {
@@ -257,6 +293,7 @@ uint64_t GuestHeap::ReAlloc(uint64_t p, uint64_t size, bool zero,
         InsertFree(p + want, total - want);
         total = want;
       }
+      used_bytes_ += total - old_size;
       it->second = {total, size};
       if (zero)
         std::memset(vm_.mem().ptr(p + old_req), 0, total - old_req);
@@ -269,6 +306,16 @@ uint64_t GuestHeap::ReAlloc(uint64_t p, uint64_t size, bool zero,
   std::memcpy(vm_.mem().ptr(n), vm_.mem().ptr(p), std::min(old_req, size));
   Free(p);
   return n;
+}
+
+GuestHeap::Stats GuestHeap::GetStats() const {
+  std::lock_guard<std::mutex> l(mu_);
+  Stats s;
+  for (const auto& seg : segments_) s.segments += seg.second;
+  s.segment_count = segments_.size();
+  s.used = used_bytes_;
+  if (!free_by_size_.empty()) s.largest_free = free_by_size_.rbegin()->first;
+  return s;
 }
 
 uint64_t GuestHeap::Size(uint64_t p) const {

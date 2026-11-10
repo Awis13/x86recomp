@@ -793,6 +793,63 @@ ddraw.cpp):
 - A fault on a lazy page while that thread holds the region lock (a
   runtime bug) is not handled but reported like any other fault.
 
+### Guest memory the GPU reads in place
+A graphics device that can read host memory in place
+(`gfx::Device::SharesMemory`, the Metal backend) maps one heap of guest
+memory whole (src/runtime/hle/shared_heap.{h,cpp}, used by
+hle/d3d9_resource.cpp). Direct3D 9 vertex and index buffers, and the lock
+shadows of textures with a GPU side, are blocks of it, so draws and
+uploads read them without a copy on the CPU.
+- Size: <ID>_GPU_HEAP_MB, by default 256 MB for a 32-bit guest and 512
+  MB for a 64-bit one; 0 turns the heap off. It is reserved and
+  committed whole with the first device, so all of it comes out of a
+  32-bit guest's 2 GiB, used or not. When it is full, new buffers and
+  texture levels go to the process heap and the device copies what it
+  draws from them. <ID>_TEX_SHARED=0 keeps texture levels in the process
+  heap (comparisons).
+- The GPU reads a block for a few frames after the game is done with
+  it. A Lock that would write a buffer a frame in flight may still read
+  (no NOOVERWRITE or READONLY) gives it a new block, as D3D9 drivers
+  rename DISCARDed buffers; a texture level written while the GPU may
+  still copy an upload from it is renamed the same way. The old block,
+  and those of buffers and textures released, are retired with the
+  frame of their last use and freed once the device has finished that
+  frame: at the first allocation after it, not when the heap is full.
+  The heap then holds what the game holds plus the frames in flight
+  (tests/shared_heap_test). Every device maps the whole heap and counts
+  its own frames, so an allocation frees only the blocks its own device
+  retired; a device's remaining blocks are freed when it is destroyed,
+  after its GPU work.
+- A rename that finds the heap full moves the buffer or level to the
+  process heap for good (draws copy it from there). With no room there
+  either, the lock writes the old block, which frames in flight may then
+  draw, and the log says so once. Waiting for the GPU is no way out: the
+  frame may be the one being recorded, which the device submits only at
+  Present.
+- With no guest memory left in either heap, CreateVertexBuffer,
+  CreateIndexBuffer and CreateOffscreenPlainSurface fail with
+  E_OUTOFMEMORY, and so does a LockRect whose level has no lock shadow
+  yet (shadows are made on first use), rather than handing the game a
+  null pointer; D3DX fills such a level's GPU side from its source
+  directly. A growable guest heap (the process heap among them) that
+  finds no gap for a whole 16 MB segment takes the largest gap there is
+  instead, so that small allocations do not add a segment each. A heap
+  with a maximum size (HeapCreate with one; the shared heap with a small
+  <ID>_GPU_HEAP_MB) never grows and takes just what it needs.
+- <ID>_MEM_REPORT=s: every s seconds, from Present, two `mem:` lines in
+  the log. The first is the guest's address space (reserved, free,
+  largest gap), the process heap and the heaps the guest created; the
+  second what the D3D9 front end keeps in guest memory: texture levels
+  by pool (in the shared heap and in the process heap), vertex and index
+  buffers, offscreen surfaces, and the shared heap's use, the most it
+  has held, its largest free block and the retired blocks waiting for
+  the GPU. An allocation that fails for want of address space (a
+  HeapAlloc on a heap without a maximum size, a VirtualAlloc reservation
+  at no given address) logs the first line too, the first eight times
+  for each of the two. Not a reservation of nothing or of more than all
+  the free space together: those are a program probing how much it can
+  have, not running out.
+
 ### Display modes, fullscreen and presentation
 Display modes are virtual: the host's mode never changes behind the
 game's back. What games see and what the host shows:

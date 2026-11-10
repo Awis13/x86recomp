@@ -26,6 +26,7 @@ constexpr uint32_t D3D_OK = 0;
 constexpr uint32_t D3DERR_NOTFOUND = 0x88760866;
 constexpr uint32_t D3DERR_NOTAVAILABLE = 0x8876086A;
 constexpr uint32_t D3DERR_INVALIDCALL = 0x8876086C;
+constexpr uint32_t E_OUTOFMEMORY = 0x8007000E;
 constexpr uint32_t S_FALSE = 1;
 
 // D3DFORMAT values
@@ -217,11 +218,23 @@ struct RenderStates {
   }
 };
 
+// The blocks a device retired in the shared heap (d3d9_resource.cpp),
+// freed when it goes: a member of Device before its gfx, so destroyed
+// after it, once the gfx::Device has waited for its GPU work.
+struct SharedHeapUser {
+  const void* user = nullptr;  // the Device, once its gfx maps the heap
+  SharedHeapUser() = default;
+  SharedHeapUser(const SharedHeapUser&) = delete;
+  SharedHeapUser& operator=(const SharedHeapUser&) = delete;
+  ~SharedHeapUser();
+};
+
 struct Device final : com::Tagged<com::TagOf("d3d9.Device")> {
   uint32_t d3d = 0;  // IDirect3D9 guest pointer
   guest::D3DDEVICE_CREATION_PARAMETERS creation{};
   guest::D3DPRESENT_PARAMETERS pp{};
   uint32_t hwnd = 0;
+  SharedHeapUser heap_user;  // before gfx: see SharedHeapUser
   std::unique_ptr<gfx::Device> gfx;
   bool shared_buffers = false;  // vertex and index buffers in the shared heap
   std::shared_ptr<Surface> backbuffer, auto_depth;
@@ -297,6 +310,11 @@ struct Device final : com::Tagged<com::TagOf("d3d9.Device")> {
 // reads in place (gfx::Device::MapSharedMemory), when it can: set up for
 // `d` once d.gfx exists.
 void SetUpSharedBuffers(Device& d);
+// <ID>_MEM_REPORT=s: every s seconds, two log lines saying what the guest's
+// address space holds: the whole of it and the process heap, then this
+// front end's texture levels by pool, buffers and the shared heap. Called
+// once a frame.
+void MemoryReport();
 // A draw of `d` reads buffer `b`.
 inline void NoteBufferUse(Device& d, Buffer* b) {
   if (b->shared) b->last_use = d.gfx->FrameSerial();
@@ -360,7 +378,8 @@ struct PerfCounts {
 extern PerfCounts g_perf;
 
 // A standalone surface (back buffer, depth stencil, render target,
-// offscreen plain): published with refcount 1, kept in *keep if given.
+// offscreen plain): published with refcount 1, kept in *keep if given; 0
+// for an offscreen plain one that gets no guest memory for its pixels.
 uint32_t NewSurface(Device& d, uint32_t device, Surface::Kind kind, uint32_t w,
                     uint32_t h, uint32_t fmt, uint32_t usage, uint32_t pool,
                     std::shared_ptr<Surface>* keep);
