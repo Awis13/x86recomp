@@ -34,10 +34,10 @@ class SharedHeap {
   // its address space, for a 64-bit one, which has the room, twice that.
   static constexpr uint64_t kDefault32 = 256ull << 20, kDefault64 = 512ull << 20;
 
-  // Reserves `size` bytes of `vm`, rounded up to 16 MB, or to the largest
-  // gap when none is that big (size() says); false if no gap holds
-  // `size`. Once the heap exists, true and nothing else: the devices
-  // already mapping it keep it (devices made on two threads).
+  // Reserves `size` bytes of `vm`, rounded up to 16 MB, or just `size`
+  // when no gap is that big (size() says); false if no gap holds `size`.
+  // Once the heap exists, true and nothing else: the devices already
+  // mapping it keep it (devices made on two threads).
   bool Init(GuestAllocator& vm, uint64_t size);
   explicit operator bool() const { return heap_ != nullptr; }
   uint64_t base() const { return heap_ ? heap_->handle() : 0; }

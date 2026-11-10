@@ -6,8 +6,9 @@
 //     follow reservations and releases, and a heap's segments, bytes in
 //     blocks and largest free block follow Alloc, Free and ReAlloc;
 //   - a heap still grows in an address space with no gap of a whole
-//     segment (16 MB) left, by the largest gap there is, so small
-//     allocations add few segments;
+//     segment (16 MB) left, by the largest gap there is (less what a gap
+//     off a 64 KB boundary loses), so small allocations add few segments;
+//     a heap with a maximum size takes just that;
 //   - the shared heap takes its whole size from the address space once, and
 //     nothing more whatever is allocated; a size with no gap for it fails;
 //   - a block retired in a frame the device has finished, or with no
@@ -140,14 +141,29 @@ void TestFragmented() {
     CHECK(h.GetStats().used == 0);
   }
   CHECK(vm.GetStats().reserved == before.reserved);
-  // A heap with a maximum size gets the same: one segment, the largest
-  // gap, if its maximum fits there; none if not.
+  // A heap with a maximum size never grows: it takes what it needs and
+  // leaves the rest of the gap; none if its maximum fits nowhere.
   {
     GuestHeap fixed(vm, 0, 2 * kMb);
-    CHECK(fixed.handle() && fixed.GetStats().segments == 8 * kMb);
+    CHECK(fixed.handle() && fixed.GetStats().segments == 2 * kMb);
     GuestHeap too_big(vm, 0, 12 * kMb);
     CHECK(!too_big.handle() && too_big.GetStats().segment_count == 0);
   }
+}
+
+// The one gap left starts 4 KB past a 64 KB boundary and is 8 MB long:
+// a reservation there starts on the next boundary, so a growable heap
+// gets 8 MB less 64 KB, not just its request.
+void TestUnalignedGap() {
+  constexpr uint64_t kGap = 0x10000000 + 0x1000;
+  GuestAllocator vm;
+  vm.Init(&g_mem, kLo, kHi);
+  vm.MarkReserved(kLo, kGap - kLo);
+  vm.MarkReserved(kGap + 8 * kMb, kHi - kGap - 8 * kMb);
+  CHECK(vm.GetStats().largest_free == 8 * kMb);
+  GuestHeap h(vm, kMb, 0);
+  CHECK(h.handle() == 0x10000000 + 0x10000);
+  CHECK(h.GetStats().segments == 8 * kMb - 0x10000 && h.GetStats().segment_count == 1);
 }
 
 void Fill(uint64_t p, uint8_t v, size_t n) { std::memset(g_mem.ptr(p), v, n); }
@@ -391,6 +407,7 @@ int main() {
   if (!g_mem.Reserve()) return 1;
   TestStats();
   TestFragmented();
+  TestUnalignedGap();
   TestRetire();
   TestStaleDone();
   TestRename();

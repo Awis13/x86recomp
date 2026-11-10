@@ -177,14 +177,18 @@ bool GuestHeap::Grow(uint64_t need) {
   uint64_t base = vm_.Reserve(0, size);
   const uint64_t least = RoundUp(std::max<uint64_t>(need, 1), GuestAllocator::kGranularity);
   if (!base && size > least) {
-    // No gap of a whole segment left (a fragmented address space): the
-    // largest gap there is, as long as the request fits, so that small
-    // allocations do not add a segment each. A gap that does not start
-    // on the reservation granularity loses up to one granule to it.
-    constexpr uint64_t g = GuestAllocator::kGranularity;
-    const uint64_t gap = vm_.GetStats().largest_free & ~(g - 1);
-    if (gap >= least && gap < size) base = vm_.Reserve(0, size = gap);
-    if (!base && gap >= least + g && gap - g < size) base = vm_.Reserve(0, size = gap - g);
+    // No gap of a whole segment left (a fragmented address space). A
+    // growable heap takes the largest gap there is, as long as the request
+    // fits, so that small allocations do not add a segment each; a gap
+    // that does not start on the reservation granularity loses up to one
+    // granule to it. A heap with a maximum size never grows: it takes what
+    // it needs and leaves the rest of the gap to the guest.
+    if (!max_size_) {
+      constexpr uint64_t g = GuestAllocator::kGranularity;
+      const uint64_t gap = vm_.GetStats().largest_free & ~(g - 1);
+      if (gap >= least && gap < size) base = vm_.Reserve(0, size = gap);
+      if (!base && gap >= least + g && gap - g < size) base = vm_.Reserve(0, size = gap - g);
+    }
     if (!base) base = vm_.Reserve(0, size = least);
   }
   if (!base) return false;

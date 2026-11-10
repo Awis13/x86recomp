@@ -831,11 +831,11 @@ uploads read them without a copy on the CPU.
   E_OUTOFMEMORY, and so does a LockRect whose level has no lock shadow
   yet (shadows are made on first use), rather than handing the game a
   null pointer; D3DX fills such a level's GPU side from its source
-  directly. A guest heap that finds no gap for a whole 16 MB segment
-  takes the largest gap there is instead, so that small allocations do
-  not add a segment each: a growable heap (the process heap among them) for
-  each segment it adds, a heap with a maximum size (HeapCreate with one;
-  the shared heap with a small <ID>_GPU_HEAP_MB) for its only one.
+  directly. A growable guest heap (the process heap among them) that
+  finds no gap for a whole 16 MB segment takes the largest gap there is
+  instead, so that small allocations do not add a segment each. A heap
+  with a maximum size (HeapCreate with one; the shared heap with a small
+  <ID>_GPU_HEAP_MB) never grows and takes just what it needs.
 - <ID>_MEM_REPORT=s: every s seconds, from Present, two `mem:` lines in
   the log. The first is the guest's address space (reserved, free,
   largest gap), the process heap and the heaps the guest created; the
@@ -846,7 +846,7 @@ uploads read them without a copy on the CPU.
   the GPU. An allocation that fails for want of address space (a
   HeapAlloc on a heap without a maximum size, a VirtualAlloc reservation
   at no given address) logs the first line too, the first eight times
-  for each of the two. Not a request for nothing or for more than all
+  for each of the two. Not a reservation of nothing or of more than all
   the free space together: those are a program probing how much it can
   have, not running out.
 
