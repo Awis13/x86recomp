@@ -1348,6 +1348,7 @@ class MetalDevice final : public Device {
   // compiled shaders was empty.)
   ShaderId MakeShader(const hlsl::Program& prog, bool ahead) {
     std::lock_guard<std::recursive_mutex> l(mu_);
+    TakeOverFinished();
     const uint64_t perf_t0 = perf_ ? NowNs() : 0;
     @autoreleasepool {
       Shader sh;
@@ -1590,6 +1591,8 @@ class MetalDevice final : public Device {
   // Before a draw with shader `sid` is recorded: it compiled, if it is
   // not yet (its job run here, or waited for on the lane running it).
   void EnsureShader(ShaderId sid) {
+    if (shaders_.at(sid).fn) return;
+    TakeOverFinished();  // (this one's, if a lane has just done it)
     const Shader& sh = shaders_.at(sid);
     if (sh.fn) return;
     const uint64_t t0 = NowNs();
@@ -1613,6 +1616,18 @@ class MetalDevice final : public Device {
   // all the shaders not compiled yet, in the order they were made.
   void AdoptFinished() {
     if (!lazy_) return;
+    TakeOverFinished();
+    if (prefetching_ || lanes_.empty()) return;
+    prefetching_ = true;
+    for (uint64_t hash : waiters_.KeysInOrder()) Prefetch(hash);
+  }
+
+  // The shaders the lanes have compiled taken over: at Present, and when a
+  // shader is made or first drawn (a load presents seldom, and its
+  // recipes' pipelines are built ahead as each pair is done, not all in
+  // the first frame). A lock and an empty list when there are none.
+  void TakeOverFinished() {
+    if (!lazy_) return;
     const uint64_t t0 = perf_ ? NowNs() : 0;
     for (uint64_t hash : shader_jobs_.TakeFinished()) {
       if (!waiters_.Has(hash)) {
@@ -1622,9 +1637,6 @@ class MetalDevice final : public Device {
       if (std::shared_ptr<Compiled> c = shader_jobs_.Get(hash)) Finish(hash, *c, false);
     }
     if (t0) pc_.shader_ns += NowNs() - t0;
-    if (prefetching_ || lanes_.empty()) return;
-    prefetching_ = true;
-    for (uint64_t hash : waiters_.KeysInOrder()) Prefetch(hash);
   }
 
   // The job of translation `hash` queued on the next shader lane.
