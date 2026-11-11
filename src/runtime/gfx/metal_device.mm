@@ -3848,6 +3848,9 @@ void main() {
     }
     if (!msl_cache_.empty()) std::fprintf(stderr, "gfx: %zu translated shaders from earlier runs\n", msl_cache_.size());
     msl_file_ = std::fopen(msl_path_.c_str(), "ab");
+    // Used: a run that only reads it must keep it from being taken for
+    // another generation's, unused (RemoveOldGenerations goes by time).
+    utimes(msl_path_.c_str(), nullptr);
   }
 
   // Null if none (shared: a shader's job keeps it until it has run).
@@ -3883,6 +3886,7 @@ void main() {
     if (!recipes_.empty())
       std::fprintf(stderr, "gfx: %zu pipeline recipes from earlier runs\n", recipes_.size());
     recipe_file_ = std::fopen(recipe_path_.c_str(), "ab");
+    utimes(recipe_path_.c_str(), nullptr);  // used (as the MSL cache)
   }
 
   // On the encoding thread: a pipeline just compiled, kept for later runs.

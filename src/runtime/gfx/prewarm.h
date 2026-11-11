@@ -45,4 +45,12 @@ using PrewarmProgress = std::function<void(size_t done, size_t total, const char
 PrewarmResult PrewarmCaches(const PrewarmProgress& progress, const std::atomic<bool>& cancel,
                             const std::string& cache_dir = {});
 
+// The pipeline archive's limits for PrewarmCaches (tests): saved after
+// save_every new pipelines; at most max_unsaved waiting to be saved.
+struct PrewarmArchiveLimits {
+  unsigned save_every = 64, max_unsaved = 1024;
+};
+PrewarmResult PrewarmCaches(const PrewarmProgress& progress, const std::atomic<bool>& cancel,
+                            const std::string& cache_dir, const PrewarmArchiveLimits& limits);
+
 }  // namespace recomp::gfx

@@ -144,6 +144,11 @@ bool PrewarmNeeded(const std::string& cache_dir) {
 
 PrewarmResult PrewarmCaches(const PrewarmProgress& progress, const std::atomic<bool>& cancel,
                             const std::string& cache_dir) {
+  return PrewarmCaches(progress, cancel, cache_dir, PrewarmArchiveLimits());
+}
+
+PrewarmResult PrewarmCaches(const PrewarmProgress& progress, const std::atomic<bool>& cancel,
+                            const std::string& cache_dir, const PrewarmArchiveLimits& limits) {
   @autoreleasepool {
     id<MTLDevice> dev = MTLCreateSystemDefaultDevice();
     if (!dev) return PrewarmResult::Unavailable;
@@ -155,8 +160,8 @@ PrewarmResult PrewarmCaches(const PrewarmProgress& progress, const std::atomic<b
     PipelineArchive::Options o;
     o.dir = ArchiveFolder(dir);
     o.scope = ArchiveScope(dev);
-    o.save_every = 64;
-    o.max_unsaved = 1024;
+    o.save_every = limits.save_every;
+    o.max_unsaved = limits.max_unsaved;
     std::shared_ptr<PipelineArchive> archive = PipelineArchive::Open(dev, o);
     // Another process (the game) saves to it: nothing built here would be
     // kept.
@@ -213,8 +218,14 @@ PrewarmResult PrewarmCaches(const PrewarmProgress& progress, const std::atomic<b
       }
       if (vs && ps) {
         // Room in the archive's list (it keeps no more): else this one
-        // would not be saved, and would be needed again next time.
-        while (archive->Pending() + threads >= o.max_unsaved && !cancel.load()) usleep(10000);
+        // would not be saved, and would be needed again next time. A save
+        // asked for every 0.5 s meanwhile (after a failed one, none starts
+        // by itself until a new pipeline comes; two failures in a row stop
+        // saving and empty the list).
+        for (int waited = 0; archive->Pending() + threads >= o.max_unsaved && !cancel.load(); waited++) {
+          if (waited % 50 == 0) archive->SaveSoon();
+          usleep(10000);
+        }
         NSError* err = nil;
         archive->Build(DescribePipeline(r.key, vs, ps), ArchiveKey(r), &err);
       }
@@ -239,6 +250,11 @@ namespace recomp::gfx {
 bool PrewarmNeeded(const std::string&) { return false; }
 
 PrewarmResult PrewarmCaches(const PrewarmProgress&, const std::atomic<bool>&, const std::string&) {
+  return PrewarmResult::Unavailable;
+}
+
+PrewarmResult PrewarmCaches(const PrewarmProgress&, const std::atomic<bool>&, const std::string&,
+                            const PrewarmArchiveLimits&) {
   return PrewarmResult::Unavailable;
 }
 

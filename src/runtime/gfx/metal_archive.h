@@ -143,8 +143,10 @@ class PipelineArchive : public std::enable_shared_from_this<PipelineArchive> {
   Stats TakeStats();
 
   // New pipelines kept and not saved yet (Build keeps no more than
-  // max_unsaved: a caller that must not lose any waits below it).
+  // max_unsaved: a caller that must not lose any waits below it, asking
+  // for a save meanwhile).
   uint64_t Pending() const { return pending_.load(); }
+  void SaveSoon();  // a save queued, unless one is
 
   // Tests: loading done; a save now (waited for); whether this process
   // saves (not when another has the scope); the queue; a shard's file.

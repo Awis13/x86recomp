@@ -539,6 +539,8 @@ bool PipelineArchive::SaveShard() {
       } else {
         std::fprintf(stderr, "gfx: pipeline archive: saving %s failed (%s): tried again at the next save\n",
                      path.c_str(), Text(e));
+        // Soon, also if no new pipeline comes to start one.
+        if (!closing_.load()) SaveLater();
       }
       return false;
     }
@@ -603,6 +605,14 @@ void PipelineArchive::Unlock() {
 }
 
 void PipelineArchive::BeginClose() { closing_ = true; }
+
+void PipelineArchive::SaveSoon() {
+  if (closing_.load() || save_queued_.exchange(true)) return;
+  auto self = shared_from_this();
+  dispatch_async(q_, ^{
+    self->Save();
+  });
+}
 
 void PipelineArchive::Flush() {
   dispatch_sync(q_, ^{

@@ -17,8 +17,8 @@
 // a runtime that translates differently starts new ones, so that what an
 // older one recorded is never built again (PrewarmCaches would build
 // every past generation). Other generations' files are removed once
-// unused for 30 days (RemoveOldGenerations): another game in the folder
-// may still be on one.
+// unused for 30 days (RemoveOldGenerations; a run touches its files when
+// it opens them): another game in the folder may still be on one.
 
 #pragma once
 

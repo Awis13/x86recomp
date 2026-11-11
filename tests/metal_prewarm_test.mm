@@ -7,13 +7,15 @@
 // - with more of them, setting `cancel` stops it soon, with work left;
 // - other translation generations' files are not used (the old ones
 //   removed once unused for 30 days), nor keys files without their shard;
-// - with the archive saved to by another process, it does nothing.
+// - with the archive saved to by another process, it does nothing;
+// - saves that fail (a read-only folder) do not hold it up: it finishes.
 //
 //   metal_prewarm_test        (skipped, exit 77, without a Metal device)
 
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 
+#include <sys/stat.h>
 #include <sys/time.h>
 #include <unistd.h>
 
@@ -225,6 +227,37 @@ int main() {
       }
       Check(found_all == recipes.size(), "the archive finds every pipeline");
       a->Close(2.0);
+      [NSFileManager.defaultManager removeItemAtPath:@(dir.c_str()) error:nil];
+    }
+
+    // ---- saves that fail: the work goes on (waiting for room in the
+    // archive's list asks for saves; two failures stop saving).
+    {
+      std::vector<PipelineRecipe> recipes;
+      const std::string dir = MakeCache(40, &recipes);
+      {
+        PipelineArchive::Options o;  // the archive's folder and sidecar made
+        o.dir = ArchiveFolder(dir);
+        o.scope = ArchiveScope(dev);
+        PipelineArchive::Open(dev, o)->Close(2.0);
+      }
+      chmod(ArchiveFolder(dir).c_str(), 0555);
+      std::atomic<bool> cancel{false};
+      size_t last_done = 0, last_total = 0;
+      PrewarmArchiveLimits limits;
+      limits.save_every = 4;
+      limits.max_unsaved = 8;
+      const auto t0 = std::chrono::steady_clock::now();
+      const PrewarmResult r = PrewarmCaches(
+          [&](size_t done, size_t total, const char*) {
+            last_done = done;
+            last_total = total;
+          },
+          cancel, dir, limits);
+      const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+      chmod(ArchiveFolder(dir).c_str(), 0755);
+      std::printf("metal_prewarm_test: with failing saves %zu of %zu in %.1f s\n", last_done, last_total, s);
+      Check(r == PrewarmResult::Done && last_done == last_total && s < 20, "failing saves do not hold it up");
       [NSFileManager.defaultManager removeItemAtPath:@(dir.c_str()) error:nil];
     }
 
