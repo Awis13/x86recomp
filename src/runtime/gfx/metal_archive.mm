@@ -85,6 +85,24 @@ std::string PipelineArchive::DefaultScope(id<MTLDevice> dev) {
   return s;
 }
 
+std::unordered_set<uint64_t> PipelineArchive::SavedKeys(const std::string& dir, const std::string& scope) {
+  char hex[17];
+  std::snprintf(hex, sizeof hex, "%016llx", (unsigned long long)Fnv64(scope.data(), scope.size()));
+  std::unordered_set<uint64_t> keys;
+  for (NSString* ns in [NSFileManager.defaultManager contentsOfDirectoryAtPath:@(dir.c_str()) error:nil]) {
+    const std::string name = ns.UTF8String;
+    if (name.size() < 23 || name.compare(0, 17, std::string(hex) + "-") != 0 ||
+        name.compare(name.size() - 5, 5, ".keys") != 0)
+      continue;
+    if (FILE* f = std::fopen((dir + "/" + name).c_str(), "rb")) {
+      uint64_t k;
+      while (std::fread(&k, 8, 1, f) == 1) keys.insert(k);
+      std::fclose(f);
+    }
+  }
+  return keys;
+}
+
 std::shared_ptr<PipelineArchive> PipelineArchive::Open(id<MTLDevice> dev, Options o) {
   std::shared_ptr<PipelineArchive> a(new PipelineArchive(dev, std::move(o)));
   dispatch_async(a->q_, ^{
@@ -590,7 +608,7 @@ void PipelineArchive::Flush() {
   });
 }
 
-void PipelineArchive::Close(double cap_s) {
+void PipelineArchive::Close(double cap_s, const std::atomic<bool>* cancel) {
   BeginClose();
   if (closed_.exchange(true)) return;
   dispatch_semaphore_t done = dispatch_semaphore_create(0);
@@ -601,8 +619,13 @@ void PipelineArchive::Close(double cap_s) {
     self->Unlock();
     dispatch_semaphore_signal(done);
   });
-  if (dispatch_semaphore_wait(done, dispatch_time(DISPATCH_TIME_NOW, int64_t(cap_s * 1e9))) != 0)
-    std::fprintf(stderr, "gfx: pipeline archive: not saved within %.1f s, left to finish\n", cap_s);
+  // In slices of 50 ms (one at least), to see `cancel`.
+  bool saved = false;
+  do
+    saved = dispatch_semaphore_wait(done, dispatch_time(DISPATCH_TIME_NOW, 50000000)) == 0;
+  while (!saved && NowNs() - t0 < uint64_t(cap_s * 1e9) && !(cancel && cancel->load()));
+  if (!saved)
+    std::fprintf(stderr, "gfx: pipeline archive: not saved within %.1f s, left to finish\n", double(NowNs() - t0) / 1e9);
   else if (NowNs() - t0 > 500000000ull)
     std::fprintf(stderr, "gfx: pipeline archive: saved in %.1f s at exit\n", double(NowNs() - t0) / 1e9);
 }

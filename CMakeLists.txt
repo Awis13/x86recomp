@@ -238,8 +238,11 @@ if(APPLE)
   find_package(spirv_cross_msl CONFIG REQUIRED)
   target_link_libraries(recomp_gfx PRIVATE spirv-cross-msl)
   # The Metal backend (Objective-C++, ARC).
-  target_sources(recomp_gfx PRIVATE src/runtime/gfx/metal_device.mm src/runtime/gfx/metal_archive.mm)
+  # prewarm.mm: PrewarmCaches (gfx/prewarm.h), for launchers.
+  target_sources(recomp_gfx PRIVATE src/runtime/gfx/metal_device.mm src/runtime/gfx/metal_archive.mm
+                 src/runtime/gfx/prewarm.mm)
   set_source_files_properties(src/runtime/gfx/metal_device.mm src/runtime/gfx/metal_archive.mm
+    src/runtime/gfx/prewarm.mm
     TARGET_DIRECTORY recomp_gfx PROPERTIES COMPILE_OPTIONS "-fobjc-arc;-std=c++20")
   target_link_libraries(recomp_gfx PRIVATE "-framework Metal" "-framework MetalFX"
                         "-framework QuartzCore" "-framework Foundation")

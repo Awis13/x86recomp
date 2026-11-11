@@ -256,6 +256,19 @@ if(APPLE)
   set_tests_properties(metal_archive PROPERTIES SKIP_RETURN_CODE 77)
 endif()
 
+# metal_prewarm_test: PrewarmCaches (gfx/prewarm.h) on a cache folder of
+# its own: everything a game's recipes list built into the pipeline
+# archive, and stopped soon when cancelled (skipped without a Metal
+# device); macOS.
+if(APPLE AND NOT RECOMP_IOS)
+  add_executable(metal_prewarm_test metal_prewarm_test.mm)
+  set_source_files_properties(metal_prewarm_test.mm PROPERTIES COMPILE_OPTIONS "-fobjc-arc;-std=c++20")
+  target_link_libraries(metal_prewarm_test PRIVATE recomp_gfx recomp_hlsl "-framework Metal"
+                        "-framework Foundation")
+  add_test(NAME metal_prewarm COMMAND metal_prewarm_test)
+  set_tests_properties(metal_prewarm PROPERTIES SKIP_RETURN_CODE 77)
+endif()
+
 # lift_flags_test: programs whose flags cross calls, returns, tail calls
 # and indirect calls, lifted with the lifter's flag analysis and with
 # every flag spilled (recomp_lift --flags-test), must behave the same;

@@ -70,6 +70,7 @@
 
 #include "runtime/gfx/device.h"
 #include "runtime/gfx/metal_archive.h"
+#include "runtime/gfx/metal_cache.h"
 // kSmaaHlsl: SMAA.hlsl (smaa/, MIT), and its lookup textures.
 #include "runtime/gfx/smaa/AreaTex.h"
 #include "runtime/gfx/smaa/SearchTex.h"
@@ -233,22 +234,8 @@ Rect Intersect(const Rect& a, const Rect& b) {
 Rect Clip(const Rect& r, int w, int h) { return Intersect(r, {0, 0, w, h}); }
 bool Empty(const Rect& r) { return r.right <= r.left || r.bottom <= r.top; }
 
-// ---- cache keys (compared and hashed as bytes: no padding)
-
-// A render pipeline: shaders, the pass's attachment formats, blending and
-// write masks (Metal enums).
-struct PipeKey {
-  uint32_t vs, ps;
-  uint16_t color[4];  // MTLPixelFormat per colour target (0: none)
-  uint16_t depth, stencil;
-  uint8_t blend, src, dst, op, src_a, dst_a, op_a;
-  uint8_t mask[4];
-  uint8_t lean;  // kLean*: the shaders' lean variants
-  bool operator==(const PipeKey& o) const { return std::memcmp(this, &o, sizeof *this) == 0; }
-};
-static_assert(sizeof(PipeKey) == 32, "no padding");
-// PipeKey::lean: a shader made without what the draw does not use.
-constexpr uint8_t kLeanPs = 1;  // the pixel shader without the alpha test
+// ---- cache keys (compared and hashed as bytes: no padding; PipeKey in
+// metal_cache.h)
 
 struct DepthKey {
   uint8_t test, write, func, stencil;
@@ -3798,29 +3785,9 @@ void main() {
     }
   }
 
-  // A pipeline's descriptor from its key and functions.
+  // A pipeline's descriptor from its key and functions (metal_cache.h).
   static MTLRenderPipelineDescriptor* Describe(const PipeKey& k, id<MTLFunction> vs, id<MTLFunction> ps) {
-    {
-      MTLRenderPipelineDescriptor* pd = [MTLRenderPipelineDescriptor new];
-      pd.vertexFunction = vs;
-      pd.fragmentFunction = ps;
-      for (int i = 0; i < 4; i++) {
-        if (!k.color[i]) continue;
-        MTLRenderPipelineColorAttachmentDescriptor* a = pd.colorAttachments[NSUInteger(i)];
-        a.pixelFormat = MTLPixelFormat(k.color[i]);
-        a.blendingEnabled = k.blend != 0;
-        a.sourceRGBBlendFactor = MTLBlendFactor(k.src);
-        a.destinationRGBBlendFactor = MTLBlendFactor(k.dst);
-        a.rgbBlendOperation = MTLBlendOperation(k.op);
-        a.sourceAlphaBlendFactor = MTLBlendFactor(k.src_a);
-        a.destinationAlphaBlendFactor = MTLBlendFactor(k.dst_a);
-        a.alphaBlendOperation = MTLBlendOperation(k.op_a);
-        a.writeMask = MTLColorWriteMask(k.mask[i]);
-      }
-      pd.depthAttachmentPixelFormat = MTLPixelFormat(k.depth);
-      pd.stencilAttachmentPixelFormat = MTLPixelFormat(k.stencil);
-      return pd;
-    }
+    return DescribePipeline(k, vs, ps);
   }
 
   // ---- pipelines built ahead: each pipeline compiled in a run is kept as
@@ -3828,17 +3795,7 @@ void main() {
   // caches; in later runs, once both shaders of a recipe exist, it is
   // compiled in the background and drawing finds it ready.
 
-  struct Recipe {
-    uint64_t vs, ps;  // Shader::hash
-    PipeKey key;      // vs, ps 0
-  };
-  static_assert(sizeof(Recipe) == 48, "no padding");
-
-  static uint64_t Fnv64(const void* p, size_t n) {
-    uint64_t h = 0xCBF29CE484222325ull;
-    for (size_t i = 0; i < n; i++) h = (h ^ static_cast<const uint8_t*>(p)[i]) * 0x100000001B3ull;
-    return h;
-  }
+  using Recipe = PipelineRecipe;  // metal_cache.h
 
   // The recipe of a pipeline of key `k` whose shaders' translations are
   // `vs` and `ps` (the key without the run's shader ids).
@@ -3848,28 +3805,13 @@ void main() {
     return r;
   }
 
-  static std::string RecipePath() {
-    NSString* dir = [NSSearchPathForDirectoriesInDomains(NSCachesDirectory, NSUserDomainMask, YES).firstObject
-        stringByAppendingPathComponent:@"x86recomp"];
-    [NSFileManager.defaultManager createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
-    return [dir stringByAppendingPathComponent:@"metal-pipelines-v1.bin"].fileSystemRepresentation;
-  }
+  static std::string RecipePath() { return RecipeFile(MetalCacheDir()); }
 
   // ---- shaders' lean variants (MetalLeanMacros): pixel shaders without
   // the alpha test, from the same MSL with the macro R_ALPHA_TEST false (a
   // function constant left in it would need every function specialised).
 
-  static MTLCompileOptions* MslOptions(bool full) {
-    static MTLCompileOptions* options[2];
-    static std::once_flag once;
-    std::call_once(once, [] {
-      for (int i = 0; i < 2; i++) {
-        options[i] = [MTLCompileOptions new];
-        options[i].preprocessorMacros = @{@"R_ALPHA_TEST" : i ? @"true" : @"false"};
-      }
-    });
-    return options[full ? 1 : 0];
-  }
+  static MTLCompileOptions* MslOptions(bool full) { return LeanMslOptions(full); }
 
   // The lean variant of the shader of `hash` (MSL `src`), made once; any
   // thread.
@@ -3890,15 +3832,10 @@ void main() {
   }
 
   // ---- translated shaders' MSL from earlier runs, by Shader::hash (one
-  // file of records: hash, length, text). The version changes with the
-  // translation's settings (shader_compile.cpp).
-  static constexpr uint32_t kMslCacheVersion = 1;
+  // file of records: hash, length, text; metal_cache.h).
 
   void LoadMslCache() {
-    NSString* dir = [NSString stringWithUTF8String:RecipePath().c_str()].stringByDeletingLastPathComponent;
-    msl_path_ = [dir stringByAppendingPathComponent:[NSString stringWithFormat:@"metal-msl-v%u.bin",
-                                                                                kMslCacheVersion]]
-                    .fileSystemRepresentation;
+    msl_path_ = MslCacheFile(MetalCacheDir());
     if (FILE* f = std::fopen(msl_path_.c_str(), "rb")) {
       uint64_t h;
       uint32_t n;
@@ -3971,17 +3908,8 @@ void main() {
       return;
     }
     PipelineArchive::Options o;
-    o.dir = [[NSString stringWithUTF8String:RecipePath().c_str()].stringByDeletingLastPathComponent
-               stringByAppendingPathComponent:@"metal-archives-v1"]
-                .fileSystemRepresentation;
-    // The scope with the shader translation's version (the MSL cache's and
-    // the preludes'): after a change of it, the old shards would only be
-    // looked in for nothing.
-    const std::string prelude = Prelude(hlsl::Stage::Vertex) + Prelude(hlsl::Stage::Pixel);
-    char msl[64];
-    std::snprintf(msl, sizeof msl, "msl=%u-%016llx\n", kMslCacheVersion,
-                  (unsigned long long)Fnv64(prelude.data(), prelude.size()));
-    o.scope = PipelineArchive::DefaultScope(dev_) + msl;
+    o.dir = ArchiveFolder(MetalCacheDir());
+    o.scope = ArchiveScope(dev_);  // with the translation's version (metal_cache.h)
 #if TARGET_OS_IOS || TARGET_OS_TV
     o.target = AheadQueue();
     // Each save writes the whole shard: smaller ones, and fewer saves.
