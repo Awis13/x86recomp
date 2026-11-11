@@ -77,6 +77,7 @@
 #include "runtime/gfx/rcas.h"
 #include "runtime/gfx/reversed_z.h"
 #include "runtime/gfx/shader_compile.h"
+#include "runtime/gfx/shader_jobs.h"
 #include "runtime/log.h"
 
 // RECOMP_DISPLAY_LINK=1 (macOS 14+): the display hands out each drawable
@@ -500,6 +501,7 @@ class MetalDevice final : public Device {
       internal_lib_ = lib;
       LoadRecipes();
       LoadMslCache();
+      SetUpShaderLanes();
       MTLDepthStencilDescriptor* dd = [MTLDepthStencilDescriptor new];
       dd.depthCompareFunction = MTLCompareFunctionAlways;
       dd.depthWriteEnabled = YES;
@@ -636,12 +638,14 @@ class MetalDevice final : public Device {
 
   ~MetalDevice() override {
     if (!dev_) return;
-    // Lean shader and pipeline prebuild blocks capture this device's state:
-    // they are finished below, before its maps, mutexes and Metal objects
-    // are destroyed. Those still queued see closing_ and do nothing, so only
-    // the one running is waited for (quitting while loading, hundreds are
-    // queued).
+    // Lean shader and pipeline prebuild blocks, and the shader lanes',
+    // capture this device's state: they are finished below, before its
+    // maps, mutexes and Metal objects are destroyed. Those still queued see
+    // closing_ (the lanes' a closed shader_jobs_) and do nothing, so only
+    // the one running on each queue is waited for (quitting while loading,
+    // hundreds are queued).
     closing_ = true;
+    shader_jobs_.Close();
     // Each step that takes long is told, to find what holds a quit up.
     uint64_t t = NowNs();
     auto step = [&t](const char* what) {
@@ -665,6 +669,10 @@ class MetalDevice final : public Device {
     step("the GPU");
     dispatch_sync(AheadQueue(), ^{});
     step("the build ahead");
+    // The shader lanes likewise: a compile running is waited for, those
+    // queued do nothing (shader_jobs_ closed).
+    for (dispatch_queue_t q : lanes_) dispatch_sync(q, ^{});
+    step("the shader lanes");
     StopDisplayLink();
     if (view_) SDL_Metal_DestroyView(view_);
   }
@@ -754,7 +762,8 @@ class MetalDevice final : public Device {
                   "%llu depth buffers created, %llu arena buffers (%.0f MB) + %llu made ahead, %llu shaders (%.1f ms, "
                   "%llu MSL compiles), %llu pipelines compiled while drawing (%.1f ms, max %.1f), "
                   "%llu built ahead used; of the shaders' time %.1f ms translating, %.1f ms compiling MSL; "
-                  "%llu waiting to be built ahead",
+                  "%llu waiting to be built ahead; shaders %llu compiled when first drawn, %llu waited for on a "
+                  "lane (%.1f ms), %llu compiled on the lanes (%.1f ms there), %zu not compiled yet",
                   double(c.draws) / f, double(c.w_draws) / f, double(c.w_other) / f, double(c.draw_ns) / f / 1e6,
                   c.draws ? double(c.draw_ns) / double(c.draws) / 1e3 : 0.0, double(c.ops) / f,
                   double(c.passes) / f, double(c.uploads_ahead) / f, double(c.uploads_in_order) / f,
@@ -767,7 +776,9 @@ class MetalDevice final : public Device {
                   (unsigned long long)c.msl_compiles, (unsigned long long)pipes, double(pipe_ns) / 1e6,
                   double(pipe_max) / 1e6, (unsigned long long)prebuilt, double(c.translate_ns) / 1e6,
                   double(c.library_ns) / 1e6,
-                  (unsigned long long)(ahead_queued > ahead_done ? ahead_queued - ahead_done : 0));
+                  (unsigned long long)(ahead_queued > ahead_done ? ahead_queued - ahead_done : 0),
+                  (unsigned long long)c.first_drawn, (unsigned long long)c.joins, double(c.join_ns) / 1e6,
+                  (unsigned long long)c.ahead_compiles, double(c.ahead_ns) / 1e6, shader_jobs_.Pending());
     return b;
   }
 
@@ -1230,6 +1241,7 @@ class MetalDevice final : public Device {
     std::lock_guard<std::recursive_mutex> l(mu_);
     {
       FirstScene();
+      AdoptFinished();
       EndUpscalerFrame();
       Settle();
       EnsureFrame();
@@ -1299,7 +1311,15 @@ class MetalDevice final : public Device {
 
   static std::string Prelude(hlsl::Stage stage) { return MetalShaderPrelude(stage); }
 
-  ShaderId CreateShader(const hlsl::Program& prog) override {
+  ShaderId CreateShader(const hlsl::Program& prog) override { return MakeShader(prog, true); }
+
+  // CreateShader's: the shader registered and, unless it is compiled now,
+  // compiled when first drawn (EnsureShader) or ahead on the shader lanes
+  // (`ahead`: once they have started, Prefetch). Compiled now: with
+  // RECOMP_LAZY_SHADERS=0, or when an earlier run's recipe names it (so
+  // its pipelines are built ahead, PrebuildFor, as soon as the shaders
+  // are both there).
+  ShaderId MakeShader(const hlsl::Program& prog, bool ahead) {
     std::lock_guard<std::recursive_mutex> l(mu_);
     const uint64_t perf_t0 = perf_ ? NowNs() : 0;
     @autoreleasepool {
@@ -1328,76 +1348,235 @@ class MetalDevice final : public Device {
           std::fclose(f);
         }
       }
-      // GLSL to SPIR-V to MSL takes most of the time (Metal's own compile
-      // of the MSL is cached by the system): the MSL comes from earlier
-      // runs when it can.
-      std::string msl = CachedMsl(hash);
-      NSError* err = nil;
-      bool has_lean = MetalLeanMacros(&msl, vertex);
-      uint64_t t = perf_t0 ? NowNs() : 0;
-      // The time since `t` added to `*ns` (PERF only).
-      auto lap = [&t](uint64_t* ns) {
-        if (!t) return;
-        const uint64_t now = NowNs();
-        *ns += now - t;
-        t = now;
-      };
-      id<MTLLibrary> lib = msl.empty() ? nil
-                                       : [dev_ newLibraryWithSource:@(msl.c_str())
-                                                            options:has_lean ? MslOptions(true) : nil
-                                                              error:&err];
-      if (!msl.empty()) lap(&pc_.library_ns);
-      if (!lib) {
-        std::vector<uint32_t> spirv;
-        std::string log;
-        if (!GlslToSpirv(glsl, vertex ? ShaderStage::Vertex : ShaderStage::Fragment, &spirv, &log)) {
-          std::fprintf(stderr, "%s\n", glsl.c_str());
-          FatalF("gfx: compiling a translated shader (source above): %s", log.c_str());
-        }
-        msl.clear();
-        if (!SpirvToMsl(spirv, &msl, &log)) FatalF("gfx: SPIR-V to MSL: %s", log.c_str());
-        if (perf_) pc_.msl_compiles++;
-        has_lean = MetalLeanMacros(&msl, vertex);
-        lap(&pc_.translate_ns);
-        lib = [dev_ newLibraryWithSource:@(msl.c_str())
-                                 options:has_lean ? MslOptions(true) : nil
-                                   error:&err];
-        lap(&pc_.library_ns);
-        if (lib) CacheMsl(hash, msl);
-      }
-      if (!lib) {
-        std::fprintf(stderr, "%s\n", msl.c_str());
-        FatalF("gfx: compiling MSL (above): %s", err.localizedDescription.UTF8String);
-      }
-      sh.fn = [lib newFunctionWithName:@"main0"];
       sh.hash = hash;
       sh.varyings = hlsl::VaryingMask(prog);
       if (!vertex) sh.program = std::make_shared<const hlsl::Program>(prog);
-      sh.has_lean = has_lean;
-      if (has_lean) {
-        NSString* src = @(msl.c_str());
-        std::atomic<bool>* closing = &closing_;
-        Ahead(^{
-          if (closing->load()) return;
-          Lean(hash, src);
-        });
-      }
       ShaderId sid = next_id_++;
       shaders_[sid] = sh;
       sid_by_hash_[sh.hash] = sid;
-      Keep(sh.fn);
-      __unsafe_unretained id<MTLFunction> fn = sh.fn;
-      Rec([this, sid, fn, hash] {
-        enc_shaders_[sid] = fn;
-        enc_shader_hash_[sid] = hash;
-      });
-      PrebuildFor(sh.hash);
+      // The MSL comes from earlier runs when it can (CompileShader).
+      std::shared_ptr<const std::string> msl = CachedMsl(hash);
+      if (!lazy_ || recipe_by_shader_.count(hash)) {
+        Compiled c = CompileShader(dev_, glsl, vertex, msl.get());
+        Adopt(sid, c, true);
+        PrebuildFor(sh.hash);
+      } else {
+        id<MTLDevice> dev = dev_;
+        shader_jobs_.Add(sid, [dev, glsl = std::move(glsl), vertex, msl = std::move(msl)] {
+          return CompileShader(dev, glsl, vertex, msl.get());
+        });
+        if (ahead && prefetching_) Prefetch(sid);
+      }
       if (perf_t0) {
         pc_.shaders++;
         pc_.shader_ns += NowNs() - perf_t0;
       }
       return sid;
     }
+  }
+
+  // ---- shaders compiled when first drawn (RECOMP_LAZY_SHADERS, on by
+  // default). Games create most of their shaders long before drawing with
+  // them (at loading, by the hundred), and not all are drawn with in a
+  // session: compiling each in CreateShader (translation then Metal's
+  // compile, tens of ms each when not cached) held the game's thread for
+  // the whole of it. MakeShader registers a job per shader instead
+  // (shader_jobs_, OnceJobs: run once, by whoever needs it first); the
+  // draw that first uses one runs it there and then on the game's thread
+  // (EnsureShader), or waits for it if a shader lane is running it. From
+  // the first presented frame on, the lanes compile the rest in the
+  // background, in the order the game created them; what they finished
+  // is taken over at each Present (AdoptFinished).
+  //
+  // Threads and locks: jobs are made, taken and dropped on the game's
+  // thread under mu_; a lane takes only shader_jobs_'s own lock (never
+  // mu_, so the game's thread may wait for a lane while holding it), and
+  // a job touches nothing of the device's but the MTLDevice. Everything a
+  // compile changes in the device (Shader::fn and has_lean, the MSL cache,
+  // the lean variant, the encoding thread's maps) is done by Adopt, on the
+  // game's thread, before any draw with the shader is recorded: the
+  // encoding thread sees a shader only once it is whole.
+
+  // A translated shader compiled: its function, its MSL (for the cache
+  // and its lean variant), and what it took; or an error, reported where
+  // it is adopted. Made on any thread.
+  struct Compiled {
+    id<MTLFunction> fn = nil;
+    std::string msl;
+    bool has_lean = false;
+    bool fresh = false;  // translated (the MSL not from an earlier run)
+    uint64_t translate_ns = 0, library_ns = 0;
+    std::string error, error_source;  // FatalF's message; the source printed before it
+  };
+  using ShaderJobs = OnceJobs<ShaderId, Compiled>;
+
+  // GLSL to SPIR-V to MSL takes most of the time (Metal's own compile of
+  // the MSL is cached by the system): `cached` is the MSL from earlier
+  // runs, if any. Any thread: only `dev` of the device is used.
+  static Compiled CompileShader(id<MTLDevice> dev, const std::string& glsl, bool vertex,
+                                const std::string* cached) {
+    @autoreleasepool {
+      Compiled c;
+      std::string msl = cached ? *cached : std::string();
+      NSError* err = nil;
+      // Before any compile: the MSL may declare the alpha test's function
+      // constant, which a pipeline cannot be made with (MetalLeanMacros).
+      bool has_lean = MetalLeanMacros(&msl, vertex);
+      uint64_t t = NowNs();
+      auto lap = [&t](uint64_t* ns) {
+        const uint64_t now = NowNs();
+        *ns += now - t;
+        t = now;
+      };
+      id<MTLLibrary> lib = msl.empty() ? nil
+                                       : [dev newLibraryWithSource:@(msl.c_str())
+                                                           options:has_lean ? MslOptions(true) : nil
+                                                             error:&err];
+      if (!msl.empty()) lap(&c.library_ns);
+      if (!lib) {
+        std::vector<uint32_t> spirv;
+        std::string log;
+        if (!GlslToSpirv(glsl, vertex ? ShaderStage::Vertex : ShaderStage::Fragment, &spirv, &log)) {
+          c.error_source = glsl;
+          c.error = "gfx: compiling a translated shader (source above): " + log;
+          return c;
+        }
+        msl.clear();
+        if (!SpirvToMsl(spirv, &msl, &log)) {
+          c.error = "gfx: SPIR-V to MSL: " + log;
+          return c;
+        }
+        c.fresh = true;
+        has_lean = MetalLeanMacros(&msl, vertex);
+        lap(&c.translate_ns);
+        lib = [dev newLibraryWithSource:@(msl.c_str()) options:has_lean ? MslOptions(true) : nil error:&err];
+        lap(&c.library_ns);
+      }
+      if (!lib) {
+        c.error_source = msl;
+        c.error = std::string("gfx: compiling MSL (above): ") + err.localizedDescription.UTF8String;
+        return c;
+      }
+      c.fn = [lib newFunctionWithName:@"main0"];
+      c.has_lean = has_lean;
+      c.msl = std::move(msl);
+      return c;
+    }
+  }
+
+  // On the game's thread: shader `sid` compiled (`c`; `here`: on this
+  // thread), taken over by the device and handed to the encoding thread.
+  void Adopt(ShaderId sid, Compiled& c, bool here) {
+    if (!c.error.empty()) {
+      if (!c.error_source.empty()) std::fprintf(stderr, "%s\n", c.error_source.c_str());
+      FatalF("%s", c.error.c_str());
+    }
+    Shader& sh = shaders_.at(sid);
+    const uint64_t hash = sh.hash;
+    sh.fn = c.fn;
+    sh.has_lean = c.has_lean;
+    if (perf_) {
+      if (c.fresh) pc_.msl_compiles++;
+      if (here) {
+        pc_.translate_ns += c.translate_ns;
+        pc_.library_ns += c.library_ns;
+      } else {
+        pc_.ahead_compiles++;
+        pc_.ahead_ns += c.translate_ns + c.library_ns;
+      }
+    }
+    if (c.fresh && !msl_cache_.count(hash)) CacheMsl(hash, c.msl);
+    if (c.has_lean) {
+      NSString* src = @(c.msl.c_str());
+      std::atomic<bool>* closing = &closing_;
+      Ahead(^{
+        if (closing->load()) return;
+        Lean(hash, src);
+      });
+    }
+    c.msl = std::string();
+    Keep(sh.fn);
+    __unsafe_unretained id<MTLFunction> fn = sh.fn;
+    Rec([this, sid, fn, hash] {
+      enc_shaders_[sid] = fn;
+      enc_shader_hash_[sid] = hash;
+    });
+  }
+
+  // Before a draw with shader `sid` is recorded: it compiled, if it is
+  // not yet (its job run here, or waited for on the lane running it).
+  void EnsureShader(ShaderId sid) {
+    Shader& sh = shaders_.at(sid);
+    if (sh.fn) return;
+    const uint64_t t0 = NowNs();
+    ShaderJobs::How how;
+    Compiled* c = shader_jobs_.Get(sid, &how);
+    if (!c) FatalF("gfx: shader %u has neither a function nor a job", sid);
+    Adopt(sid, *c, how == ShaderJobs::How::RanHere);
+    shader_jobs_.Remove(sid);
+    if (perf_) {
+      const uint64_t ns = NowNs() - t0;
+      pc_.shader_ns += ns;
+      if (how == ShaderJobs::How::RanHere) pc_.first_drawn++;
+      if (how == ShaderJobs::How::Joined) {
+        pc_.joins++;
+        pc_.join_ns += ns;
+      }
+    }
+  }
+
+  // At Present: the shaders the lanes have compiled taken over (so their
+  // first draws find them ready); the first time, the lanes started on
+  // all the shaders not compiled yet, in the order they were made.
+  void AdoptFinished() {
+    if (!lazy_) return;
+    const uint64_t t0 = perf_ ? NowNs() : 0;
+    for (ShaderId sid : shader_jobs_.TakeFinished()) {
+      auto it = shaders_.find(sid);
+      if (it == shaders_.end() || it->second.fn) continue;
+      if (Compiled* c = shader_jobs_.Get(sid)) Adopt(sid, *c, false);
+      shader_jobs_.Remove(sid);
+    }
+    if (t0) pc_.shader_ns += NowNs() - t0;
+    if (prefetching_ || lanes_.empty()) return;
+    prefetching_ = true;
+    std::vector<ShaderId> todo;
+    for (const auto& [sid, sh] : shaders_)
+      if (!sh.fn && shader_jobs_.Contains(sid)) todo.push_back(sid);
+    std::sort(todo.begin(), todo.end());
+    for (ShaderId sid : todo) Prefetch(sid);
+  }
+
+  // Shader `sid`'s job queued on the next shader lane.
+  void Prefetch(ShaderId sid) {
+    dispatch_queue_t q = lanes_[next_lane_++ % lanes_.size()];
+    shader_jobs_.Prefetch(sid, [q](std::function<void()> task) { dispatch_async(q, ^{ task(); }); });
+  }
+
+  // RECOMP_LAZY_SHADERS=0: every shader compiled in CreateShader, as
+  // before. RECOMP_SHADER_LANES=0..8: the lanes compiling shaders ahead (0:
+  // none, only when first drawn); by default 3 on macOS, at user-initiated
+  // priority, and 1 on iOS and tvOS, at background priority (as the build
+  // ahead, AheadQueue: an iPad's GPU compiler and cores at the lanes'
+  // priority slowed the game for minutes).
+  void SetUpShaderLanes() {
+    const char* lz = std::getenv("RECOMP_LAZY_SHADERS");
+    lazy_ = !(lz && *lz == '0');
+    if (!lazy_) {
+      std::fprintf(stderr, "gfx: shaders compiled when created (RECOMP_LAZY_SHADERS=0)\n");
+      return;
+    }
+#if TARGET_OS_IOS || TARGET_OS_TV
+    int n = 1;
+    const qos_class_t qos = QOS_CLASS_BACKGROUND;
+#else
+    int n = 3;
+    const qos_class_t qos = QOS_CLASS_USER_INITIATED;
+#endif
+    if (const char* e = std::getenv("RECOMP_SHADER_LANES")) n = std::clamp(std::atoi(e), 0, 8);
+    for (int i = 0; i < n; i++)
+      lanes_.push_back(dispatch_queue_create(
+          "recomp.gfx.shaders", dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, qos, 0)));
   }
 
   void DestroyShader(ShaderId sid) override {
@@ -1407,6 +1586,7 @@ class MetalDevice final : public Device {
     const auto variants = std::move(it->second.variants);
     for (const auto& [mask, vid] : variants) DestroyShader(vid);  // `it` stays valid
     Keep(it->second.fn);
+    shader_jobs_.Remove(sid);  // not compiled yet: never will be
     auto h = sid_by_hash_.find(it->second.hash);
     if (h != sid_by_hash_.end() && h->second == sid) sid_by_hash_.erase(h);
     shaders_.erase(it);
@@ -1505,7 +1685,12 @@ class MetalDevice final : public Device {
     for (int i = 1; i < 4; i++) pk.mask[i] = i < pass_.targets ? WriteMask(rs_[189 + i]) : 0;
     // ALPHATESTENABLE off, or ALPHAFUNC ALWAYS: the shader without it.
     // (Of the pixel shader drawn: a variant for unwritten varyings has its own.)
-    const bool ps_lean = (ps_id == d.ps ? ps : shaders_.at(ps_id)).has_lean;
+    // Compiled when first drawn (EnsureShader); of the pixel shader, only
+    // the variant drawn.
+    const Shader& drawn_ps = ps_id == d.ps ? ps : shaders_.at(ps_id);
+    if (!vs.fn) EnsureShader(d.vs);
+    if (!drawn_ps.fn) EnsureShader(ps_id);
+    const bool ps_lean = drawn_ps.has_lean;
     if (ps_lean && (!rs_[15] || rs_[25] == 8)) pk.lean |= kLeanPs;
     BindPipeline(pk);
 
@@ -2596,7 +2781,7 @@ void main() {
       int l = hlsl::VaryingLocation(s);
       return l >= 0 && !(written & (1u << l));
     });
-    ShaderId vid = CreateShader(v);  // ps stays valid: shaders_ is node-based
+    ShaderId vid = MakeShader(v, false);  // drawn at once; ps stays valid: shaders_ is node-based
     ps.variants[written] = vid;
     return vid;
   }
@@ -2618,7 +2803,7 @@ void main() {
       at = end;
     }
     v.glsl = std::move(glsl);
-    const ShaderId vid = CreateShader(v);  // ps stays valid: shaders_ is node-based
+    const ShaderId vid = MakeShader(v, false);  // drawn at once; ps stays valid: shaders_ is node-based
     ps.without_depth = vid;
     return vid;
   }
@@ -3601,7 +3786,7 @@ void main() {
       while (std::fread(&h, 8, 1, f) == 1 && std::fread(&n, 4, 1, f) == 1 && n < (16u << 20)) {
         std::string text(n, '\0');
         if (std::fread(text.data(), 1, n, f) != n) break;
-        msl_cache_[h] = std::move(text);
+        msl_cache_[h] = std::make_shared<const std::string>(std::move(text));
       }
       std::fclose(f);
     }
@@ -3609,13 +3794,14 @@ void main() {
     msl_file_ = std::fopen(msl_path_.c_str(), "ab");
   }
 
-  std::string CachedMsl(uint64_t hash) {
+  // Null if none (shared: a shader's job keeps it until it has run).
+  std::shared_ptr<const std::string> CachedMsl(uint64_t hash) {
     auto it = msl_cache_.find(hash);
-    return it == msl_cache_.end() ? std::string() : it->second;
+    return it == msl_cache_.end() ? nullptr : it->second;
   }
 
   void CacheMsl(uint64_t hash, const std::string& msl) {
-    msl_cache_[hash] = msl;
+    msl_cache_[hash] = std::make_shared<const std::string>(msl);
     if (!msl_file_) return;
     const uint32_t n = uint32_t(msl.size());
     std::fwrite(&hash, 8, 1, msl_file_);
@@ -3725,8 +3911,10 @@ void main() {
       if (k.lean & kLeanPs) {
         auto m = msl_cache_.find(r.ps);
         if (m == msl_cache_.end() || !shaders_.at(k.ps).has_lean) continue;
-        src = @(m->second.c_str());
+        src = @(m->second->c_str());
       }
+      // (Shaders a recipe names are compiled when made, MakeShader.)
+      if (!shaders_.at(k.vs).fn || !shaders_.at(k.ps).fn) continue;
       if (!prebuild_started_.insert(k).second) continue;
       MTLRenderPipelineDescriptor* pd = Describe(k, shaders_.at(k.vs).fn, shaders_.at(k.ps).fn);
       id<MTLDevice> dev = dev_;
@@ -4512,7 +4700,14 @@ void main() {
   std::unordered_map<uint64_t, id<MTLFunction>> lean_;  // by Shader::hash (Lean)
   std::string recipe_path_;
   FILE* recipe_file_ = nullptr;
-  std::unordered_map<uint64_t, std::string> msl_cache_;  // recording side (CreateShader)
+  std::unordered_map<uint64_t, std::shared_ptr<const std::string>> msl_cache_;  // recording side (CreateShader)
+  // Shaders compiled when first drawn (MakeShader): their jobs (under
+  // their own lock; taken after mu_, never before it); the rest under mu_.
+  ShaderJobs shader_jobs_;
+  bool lazy_ = true;          // RECOMP_LAZY_SHADERS
+  bool prefetching_ = false;  // the lanes have started (AdoptFinished)
+  std::vector<dispatch_queue_t> lanes_;  // RECOMP_SHADER_LANES
+  size_t next_lane_ = 0;
   std::string msl_path_;
   FILE* msl_file_ = nullptr;
   id<MTLSamplerState> quad_sampler_[2] = {};
@@ -4545,6 +4740,9 @@ void main() {
     // Of shader_ns: GLSL to SPIR-V to MSL, and Metal's compile of the MSL
     // (newLibraryWithSource).
     uint64_t translate_ns = 0, library_ns = 0;
+    // Shaders compiled when first drawn: here, and waited for on a lane;
+    // compiled on the lanes (and the lanes' time on them).
+    uint64_t first_drawn = 0, joins = 0, join_ns = 0, ahead_compiles = 0, ahead_ns = 0;
   };
   std::atomic<bool> perf_{false};
   std::atomic<bool> closing_{false};  // the device is going: prebuild blocks do nothing

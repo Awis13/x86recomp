@@ -94,6 +94,16 @@ target_compile_features(pacing_test PRIVATE cxx_std_20)
 add_test(NAME pacing COMMAND pacing_test)
 set_tests_properties(pacing PROPERTIES RUN_SERIAL TRUE)
 
+# shader_jobs_test: work done once per key (runtime/gfx/shader_jobs.h,
+# shaders compiled when first drawn): run by whoever asks first, waited
+# for by those who ask while it runs, run ahead on lanes, nothing queued
+# done after Close; portable.
+add_executable(shader_jobs_test shader_jobs_test.cpp)
+target_include_directories(shader_jobs_test PRIVATE ${PROJECT_SOURCE_DIR}/src)
+target_compile_features(shader_jobs_test PRIVATE cxx_std_20)
+target_link_libraries(shader_jobs_test PRIVATE Threads::Threads)
+add_test(NAME shader_jobs COMMAND shader_jobs_test)
+
 # win32_text_test: UTF-8 <-> UTF-16 conversion (runtime/hle/win32.h);
 # portable.
 add_executable(win32_text_test win32_text_test.cpp)
