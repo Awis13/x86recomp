@@ -94,6 +94,8 @@ std::unordered_set<uint64_t> PipelineArchive::SavedKeys(const std::string& dir, 
     if (name.size() < 23 || name.compare(0, 17, std::string(hex) + "-") != 0 ||
         name.compare(name.size() - 5, 5, ".keys") != 0)
       continue;
+    const std::string shard = dir + "/" + name.substr(0, name.size() - 5) + ".bin";
+    if (access(shard.c_str(), F_OK) != 0) continue;  // a shard removed, its keys left
     if (FILE* f = std::fopen((dir + "/" + name).c_str(), "rb")) {
       uint64_t k;
       while (std::fread(&k, 8, 1, f) == 1) keys.insert(k);

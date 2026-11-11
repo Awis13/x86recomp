@@ -4,13 +4,17 @@
 // - PrewarmNeeded says so; PrewarmCaches builds them all, its progress
 //   reaching the total; afterwards nothing is needed, and the pipeline
 //   archive finds every pipeline built as the game builds it;
-// - with more of them, setting `cancel` stops it soon, with work left.
+// - with more of them, setting `cancel` stops it soon, with work left;
+// - other translation generations' files are not used (the old ones
+//   removed once unused for 30 days), nor keys files without their shard;
+// - with the archive saved to by another process, it does nothing.
 //
 //   metal_prewarm_test        (skipped, exit 77, without a Metal device)
 
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 
+#include <sys/time.h>
 #include <unistd.h>
 
 #include <atomic>
@@ -102,6 +106,34 @@ std::string MakeCache(int n, std::vector<PipelineRecipe>* recipes) {
   return dir;
 }
 
+// A cache file of another translation generation: the unversioned one of
+// earlier runtimes (old: unused for 40 days) or a newer one. Shaders and
+// recipes the current generation must not build.
+void OtherGeneration(const std::string& path, bool msl, bool old) {
+  FILE* f = std::fopen(path.c_str(), "wb");
+  if (msl) {
+    const std::string text = PixelMsl(50);
+    const uint64_t h = 7777;
+    const uint32_t len = uint32_t(text.size());
+    std::fwrite(&h, 8, 1, f);
+    std::fwrite(&len, 4, 1, f);
+    std::fwrite(text.data(), 1, len, f);
+  } else {
+    const PipelineRecipe r = Recipe(7777, false);
+    std::fwrite(&r, sizeof r, 1, f);
+  }
+  std::fclose(f);
+  if (old) {
+    timeval t[2];
+    gettimeofday(&t[0], nullptr);
+    t[0].tv_sec -= 40 * 86400;
+    t[1] = t[0];
+    utimes(path.c_str(), t);
+  }
+}
+
+bool Exists(const std::string& p) { return access(p.c_str(), F_OK) == 0; }
+
 }  // namespace
 
 int main() {
@@ -116,7 +148,38 @@ int main() {
     {
       std::vector<PipelineRecipe> recipes;
       const std::string dir = MakeCache(3, &recipes);
-      Check(PrewarmNeeded(dir), "needed: nothing in the archive");
+      // Other generations' files, and keys of every recipe in a keys file
+      // whose shard is gone: none of it counts.
+      OtherGeneration(dir + "/metal-msl-v1.bin", true, true);
+      OtherGeneration(dir + "/metal-pipelines-v1.bin", false, true);
+      OtherGeneration(dir + "/metal-msl-v9-0000000000000000.bin", true, false);
+      {
+        const std::string scope = ArchiveScope(dev);
+        char name[64];
+        std::snprintf(name, sizeof name, "/%016llx-7.keys", (unsigned long long)Fnv64(scope.data(), scope.size()));
+        [NSFileManager.defaultManager createDirectoryAtPath:@(ArchiveFolder(dir).c_str())
+                                withIntermediateDirectories:YES
+                                                 attributes:nil
+                                                      error:nil];
+        FILE* f = std::fopen((ArchiveFolder(dir) + name).c_str(), "wb");
+        for (const PipelineRecipe& rc : recipes) {
+          const uint64_t k = ArchiveKey(rc);
+          std::fwrite(&k, 8, 1, f);
+        }
+        std::fclose(f);
+      }
+      Check(PrewarmNeeded(dir), "needed: nothing in the archive (a keys file without its shard does not count)");
+      {
+        // The game saving to the archive: nothing done meanwhile.
+        PipelineArchive::Options o;
+        o.dir = ArchiveFolder(dir);
+        o.scope = ArchiveScope(dev);
+        auto game = PipelineArchive::Open(dev, o);
+        Check(game->Saves(), "the game's archive saves");
+        std::atomic<bool> no{false};
+        Check(PrewarmCaches(nullptr, no, dir) == PrewarmResult::Busy, "busy while another process saves");
+        game->Close(2.0);
+      }
       size_t last_done = 0, last_total = 0, calls = 0;
       bool pipelines = false;
       std::atomic<bool> cancel{false};
@@ -129,8 +192,12 @@ int main() {
           },
           cancel, dir);
       Check(r == PrewarmResult::Done, "done");
-      // 1 vertex + 3 pixel + 1 lean function, 4 pipelines.
+      // 1 vertex + 3 pixel + 1 lean function, 4 pipelines (none of other
+      // generations).
       Check(last_total == 9 && last_done == 9 && calls == 10 && pipelines, "progress reaches the total");
+      Check(!Exists(dir + "/metal-msl-v1.bin") && !Exists(dir + "/metal-pipelines-v1.bin") &&
+                Exists(dir + "/metal-msl-v9-0000000000000000.bin"),
+            "other generations' files removed once unused for 30 days, not before");
       Check(!PrewarmNeeded(dir), "nothing needed afterwards (the recipe without its shader not counted)");
       Check(PrewarmCaches(nullptr, cancel, dir) == PrewarmResult::NothingToDo, "a second run has nothing to do");
 

@@ -11,6 +11,10 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <sys/stat.h>
+#include <unistd.h>
+
+#include <memory>
 #include <mutex>
 #include <thread>
 #include <unordered_map>
@@ -33,46 +37,81 @@ struct FunctionSpec {
 
 uint64_t FunctionKey(uint64_t hash, bool full) { return hash * 2 + (full ? 0 : 1); }
 
+// The cache files' content: the translated shaders' MSL and the recipes
+// (each once), of this translation generation (metal_cache.h).
+struct Sources {
+  std::unordered_map<uint64_t, std::string> msl;  // Shader::hash -> MSL
+  std::vector<PipelineRecipe> recipes;
+};
+
+// A file's size and time, to tell whether it changed.
+std::string Stamp(const std::string& path) {
+  struct stat st {};
+  if (stat(path.c_str(), &st) != 0) return "-";
+  return std::to_string(st.st_size) + "/" + std::to_string(st.st_mtimespec.tv_sec) + "." +
+         std::to_string(st.st_mtimespec.tv_nsec);
+}
+
+// Read once for PrewarmNeeded and PrewarmCaches (again only if the files
+// changed in between).
+std::shared_ptr<const Sources> LoadSources(const std::string& dir) {
+  static std::mutex mu;
+  static std::string last_stamp;
+  static std::shared_ptr<const Sources> last;
+  const std::string msl_path = MslCacheFile(dir), recipe_path = RecipeFile(dir);
+  const std::string stamp = dir + "|" + Stamp(msl_path) + "|" + Stamp(recipe_path);
+  std::lock_guard<std::mutex> l(mu);
+  if (last && stamp == last_stamp) return last;
+  auto src = std::make_shared<Sources>();
+  if (FILE* f = std::fopen(msl_path.c_str(), "rb")) {
+    uint64_t h;
+    uint32_t n;
+    while (std::fread(&h, 8, 1, f) == 1 && std::fread(&n, 4, 1, f) == 1 && n < (16u << 20)) {
+      std::string text(n, '\0');
+      if (std::fread(text.data(), 1, n, f) != n) break;
+      src->msl[h] = std::move(text);  // the last of a hash wins, as in the game
+    }
+    std::fclose(f);
+  }
+  std::unordered_set<uint64_t> seen;
+  if (FILE* f = std::fopen(recipe_path.c_str(), "rb")) {
+    PipelineRecipe r;
+    while (std::fread(&r, sizeof r, 1, f) == 1)
+      if (seen.insert(ArchiveKey(r)).second) src->recipes.push_back(r);
+    std::fclose(f);
+  }
+  last_stamp = stamp;
+  last = src;
+  return src;
+}
+
 // What is missing: the recipes whose pipelines the archive does not have
 // (and whose shaders were kept), and the functions they need.
 struct Plan {
-  std::unordered_map<uint64_t, std::string> msl;  // Shader::hash -> MSL
+  std::shared_ptr<const Sources> src;
   std::vector<PipelineRecipe> recipes;
   std::vector<FunctionSpec> functions;
 };
 
 Plan MakePlan(const std::string& dir, id<MTLDevice> dev) {
   Plan p;
-  if (FILE* f = std::fopen(MslCacheFile(dir).c_str(), "rb")) {
-    uint64_t h;
-    uint32_t n;
-    while (std::fread(&h, 8, 1, f) == 1 && std::fread(&n, 4, 1, f) == 1 && n < (16u << 20)) {
-      std::string text(n, '\0');
-      if (std::fread(text.data(), 1, n, f) != n) break;
-      p.msl[h] = std::move(text);  // the last of a hash wins, as in the game
-    }
-    std::fclose(f);
-  }
+  p.src = LoadSources(dir);
+  const auto& msl = p.src->msl;
   const std::unordered_set<uint64_t> saved = PipelineArchive::SavedKeys(ArchiveFolder(dir), ArchiveScope(dev));
-  std::unordered_set<uint64_t> seen, fns;
-  if (FILE* f = std::fopen(RecipeFile(dir).c_str(), "rb")) {
-    PipelineRecipe r;
-    while (std::fread(&r, sizeof r, 1, f) == 1) {
-      const uint64_t key = ArchiveKey(r);
-      if (saved.count(key) || !seen.insert(key).second) continue;
-      auto vs = p.msl.find(r.vs), ps = p.msl.find(r.ps);
-      if (vs == p.msl.end() || ps == p.msl.end()) continue;
-      const bool lean = r.key.lean & kLeanPs;
-      if (lean) {
-        // A lean variant needs the alpha test's macro (MetalLeanMacros).
-        std::string text = ps->second;
-        if (!MetalLeanMacros(&text, false)) continue;
-      }
-      p.recipes.push_back(r);
-      if (fns.insert(FunctionKey(r.vs, true)).second) p.functions.push_back({r.vs, true, true});
-      if (fns.insert(FunctionKey(r.ps, !lean)).second) p.functions.push_back({r.ps, false, !lean});
+  std::unordered_set<uint64_t> fns;
+  for (const PipelineRecipe& r : p.src->recipes) {
+    if (saved.count(ArchiveKey(r))) continue;
+    auto vs = msl.find(r.vs), ps = msl.find(r.ps);
+    if (vs == msl.end() || ps == msl.end()) continue;
+    const bool lean = r.key.lean & kLeanPs;
+    if (lean) {
+      // A lean variant needs the alpha test's macro (MetalLeanMacros).
+      std::string text = ps->second;
+      if (!MetalLeanMacros(&text, false)) continue;
     }
-    std::fclose(f);
+    p.recipes.push_back(r);
+    if (fns.insert(FunctionKey(r.vs, true)).second) p.functions.push_back({r.vs, true, true});
+    if (fns.insert(FunctionKey(r.ps, !lean)).second) p.functions.push_back({r.ps, false, !lean});
   }
   return p;
 }
@@ -109,6 +148,7 @@ PrewarmResult PrewarmCaches(const PrewarmProgress& progress, const std::atomic<b
     id<MTLDevice> dev = MTLCreateSystemDefaultDevice();
     if (!dev) return PrewarmResult::Unavailable;
     const std::string dir = cache_dir.empty() ? MetalCacheDir() : cache_dir;
+    RemoveOldGenerations(dir);
     Plan plan = MakePlan(dir, dev);
     if (plan.recipes.empty()) return PrewarmResult::NothingToDo;
 
@@ -116,8 +156,15 @@ PrewarmResult PrewarmCaches(const PrewarmProgress& progress, const std::atomic<b
     o.dir = ArchiveFolder(dir);
     o.scope = ArchiveScope(dev);
     o.save_every = 64;
+    o.max_unsaved = 1024;
     std::shared_ptr<PipelineArchive> archive = PipelineArchive::Open(dev, o);
-    archive->WaitLoaded();
+    // Another process (the game) saves to it: nothing built here would be
+    // kept.
+    if (!archive->Saves()) {
+      archive->Close(0.1);
+      std::fprintf(stderr, "gfx: prewarm: the pipeline archive is in use: not now\n");
+      return PrewarmResult::Busy;
+    }
 
     const size_t total = plan.functions.size() + plan.recipes.size();
     std::atomic<size_t> done{0};
@@ -140,7 +187,7 @@ PrewarmResult PrewarmCaches(const PrewarmProgress& progress, const std::atomic<b
     std::unordered_map<uint64_t, id<MTLFunction>> fns;
     Parallel(plan.functions.size(), threads, cancel, [&](size_t i) {
       const FunctionSpec& f = plan.functions[i];
-      std::string text = plan.msl.at(f.hash);
+      std::string text = plan.src->msl.at(f.hash);
       const bool has_lean = MetalLeanMacros(&text, f.vertex);
       NSError* err = nil;
       id<MTLLibrary> lib = [dev newLibraryWithSource:@(text.c_str())
@@ -165,6 +212,9 @@ PrewarmResult PrewarmCaches(const PrewarmProgress& progress, const std::atomic<b
         ps = fns[FunctionKey(r.ps, !(r.key.lean & kLeanPs))];
       }
       if (vs && ps) {
+        // Room in the archive's list (it keeps no more): else this one
+        // would not be saved, and would be needed again next time.
+        while (archive->Pending() + threads >= o.max_unsaved && !cancel.load()) usleep(10000);
         NSError* err = nil;
         archive->Build(DescribePipeline(r.key, vs, ps), ArchiveKey(r), &err);
       }

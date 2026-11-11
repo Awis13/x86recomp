@@ -119,8 +119,8 @@ class PipelineArchive : public std::enable_shared_from_this<PipelineArchive> {
   // build, GPU (name and architecture).
   static std::string DefaultScope(id<MTLDevice> dev);
 
-  // The keys of the pipelines saved in `dir` for `scope` (its shards' keys
-  // files), without opening it: cheap.
+  // The keys of the pipelines saved in `dir` for `scope` (the keys files of
+  // its shards that are there), without opening it: cheap.
   static std::unordered_set<uint64_t> SavedKeys(const std::string& dir, const std::string& scope);
 
   // Any thread. The pipeline of `pd`: from a shard if it is there (*found
@@ -141,6 +141,10 @@ class PipelineArchive : public std::enable_shared_from_this<PipelineArchive> {
   void Close(double cap_s, const std::atomic<bool>* cancel = nullptr);
 
   Stats TakeStats();
+
+  // New pipelines kept and not saved yet (Build keeps no more than
+  // max_unsaved: a caller that must not lose any waits below it).
+  uint64_t Pending() const { return pending_.load(); }
 
   // Tests: loading done; a save now (waited for); whether this process
   // saves (not when another has the scope); the queue; a shard's file.

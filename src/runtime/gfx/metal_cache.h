@@ -4,12 +4,21 @@
 // for the pipeline archive (metal_archive.h) to hold what the game looks
 // for. Objective-C++ only.
 //
-// In the user's caches, folder x86recomp (MetalCacheDir):
-// - metal-msl-v<kMslCacheVersion>.bin: translated shaders' MSL, records of
-//   Shader::hash (8 bytes), length (4) and text, the last of a hash wins;
-// - metal-pipelines-v1.bin: pipelines compiled in earlier runs, as
-//   PipelineRecipe records;
+// In the user's caches, folder x86recomp (MetalCacheDir), shared by every
+// game on this runtime (their records are named by content):
+// - metal-msl-v<kMslCacheVersion>-<prelude>.bin: translated shaders' MSL,
+//   records of Shader::hash (8 bytes), length (4) and text, the last of a
+//   hash wins;
+// - metal-pipelines-v1-<generation>.bin: pipelines compiled in earlier
+//   runs, as PipelineRecipe records;
 // - metal-archives-v1/: the pipeline archive.
+// Both files are of one translation generation (CacheGeneration: the MSL
+// cache's version and the preludes' hash, which shader hashes include):
+// a runtime that translates differently starts new ones, so that what an
+// older one recorded is never built again (PrewarmCaches would build
+// every past generation). Other generations' files are removed once
+// unused for 30 days (RemoveOldGenerations): another game in the folder
+// may still be on one.
 
 #pragma once
 
@@ -109,21 +118,46 @@ inline std::string MetalCacheDir() {
   return dir.fileSystemRepresentation;
 }
 
-inline std::string RecipeFile(const std::string& dir) { return dir + "/metal-pipelines-v1.bin"; }
-inline std::string MslCacheFile(const std::string& dir) {
-  return dir + "/metal-msl-v" + std::to_string(kMslCacheVersion) + ".bin";
+// The shader translation's generation: "<kMslCacheVersion>-<the preludes'
+// hash>".
+inline const std::string& CacheGeneration() {
+  static const std::string g = [] {
+    const std::string prelude = MetalShaderPrelude(hlsl::Stage::Vertex) + MetalShaderPrelude(hlsl::Stage::Pixel);
+    char s[48];
+    std::snprintf(s, sizeof s, "%u-%016llx", kMslCacheVersion,
+                  (unsigned long long)Fnv64(prelude.data(), prelude.size()));
+    return std::string(s);
+  }();
+  return g;
 }
+
+inline std::string RecipeFile(const std::string& dir) {
+  return dir + "/metal-pipelines-v1-" + CacheGeneration() + ".bin";
+}
+inline std::string MslCacheFile(const std::string& dir) { return dir + "/metal-msl-v" + CacheGeneration() + ".bin"; }
 inline std::string ArchiveFolder(const std::string& dir) { return dir + "/metal-archives-v1"; }
 
+// Other generations' MSL caches and recipe files in `dir` (ours by their
+// names, the earlier unversioned ones too) removed once unused for 30 days.
+inline void RemoveOldGenerations(const std::string& dir) {
+  const std::string msl = MslCacheFile(dir), recipes = RecipeFile(dir);
+  NSFileManager* fm = NSFileManager.defaultManager;
+  for (NSString* ns in [fm contentsOfDirectoryAtPath:@(dir.c_str()) error:nil]) {
+    const std::string name = ns.UTF8String, path = dir + "/" + name;
+    const bool ours = (name.rfind("metal-msl-v", 0) == 0 || name.rfind("metal-pipelines-v", 0) == 0) &&
+                      name.size() > 4 && name.compare(name.size() - 4, 4, ".bin") == 0;
+    if (!ours || path == msl || path == recipes) continue;
+    NSDate* m = [fm attributesOfItemAtPath:@(path.c_str()) error:nil].fileModificationDate;
+    if (m && -m.timeIntervalSinceNow > 30 * 86400.0 && [fm removeItemAtPath:@(path.c_str()) error:nil])
+      std::fprintf(stderr, "gfx: %s removed (another shader translation, unused for 30 days)\n", name.c_str());
+  }
+}
+
 // The pipeline archive's scope: PipelineArchive::DefaultScope with the
-// shader translation's version (the MSL cache's and the preludes'): after
-// a change of it, older shards would only be looked in for nothing.
+// shader translation's generation: after a change of it, older shards
+// would only be looked in for nothing.
 inline std::string ArchiveScope(id<MTLDevice> dev) {
-  const std::string prelude = MetalShaderPrelude(hlsl::Stage::Vertex) + MetalShaderPrelude(hlsl::Stage::Pixel);
-  char msl[64];
-  std::snprintf(msl, sizeof msl, "msl=%u-%016llx\n", kMslCacheVersion,
-                (unsigned long long)Fnv64(prelude.data(), prelude.size()));
-  return PipelineArchive::DefaultScope(dev) + msl;
+  return PipelineArchive::DefaultScope(dev) + "msl=" + CacheGeneration() + "\n";
 }
 
 }  // namespace recomp::gfx

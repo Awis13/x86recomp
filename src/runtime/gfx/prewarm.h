@@ -29,6 +29,7 @@ enum class PrewarmResult {
   Done,         // all built
   Cancelled,    // `cancel` was set: stopped (what was built is kept)
   NothingToDo,  // nothing missing
+  Busy,         // another process (the game) is saving to the archive
   Unavailable,  // no Metal device, or not macOS
 };
 

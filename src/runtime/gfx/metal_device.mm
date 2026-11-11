@@ -3867,6 +3867,8 @@ void main() {
   }
 
   void LoadRecipes() {
+    // This translation generation's files only (metal_cache.h).
+    RemoveOldGenerations(MetalCacheDir());
     recipe_path_ = RecipePath();
     if (FILE* f = std::fopen(recipe_path_.c_str(), "rb")) {
       Recipe r;
