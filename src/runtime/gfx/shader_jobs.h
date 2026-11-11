@@ -7,7 +7,8 @@
 //
 // For shaders compiled when first drawn (metal_device.mm): the game's
 // thread asks for a shader mid-frame (Get), background lanes compile the
-// others meanwhile. The thread that waits for a job running on a lane
+// others meanwhile; one job per translation, the shaders made from it its
+// Waiters. The thread that waits for a job running on a lane
 // lends that lane its priority: the runner holds the job's RunLock for as
 // long as it runs, and the waiter blocks on it (on Apple's systems an
 // os_unfair_lock, whose owner the kernel boosts; a lane at background
@@ -17,6 +18,7 @@
 // calls Close and then waits for every lane's tasks to finish (those
 // still queued then do nothing) before destroying it.
 
+#include <algorithm>
 #include <cstddef>
 #include <functional>
 #include <memory>
@@ -48,7 +50,8 @@ using RunLock = std::mutex;
 template <class Key, class Value, class Hash = std::hash<Key>>
 class OnceJobs {
  public:
-  using Job = std::function<Value()>;
+  // Told whether a lane runs it (else a thread that asked for its value).
+  using Job = std::function<Value(bool on_lane)>;
   // Runs a task later on some thread (a background lane).
   using Lane = std::function<void(std::function<void()>)>;
 
@@ -79,9 +82,9 @@ class OnceJobs {
 
   // The value of key's job: at once if the job has run, once it has if it
   // is running on another thread, else run on this one. Null if the key
-  // has no job. Valid until the key is removed (the caller may move from
-  // it; Remove, then, when done with it).
-  Value* Get(const Key& key, How* how = nullptr) {
+  // has no job. The value stays valid as long as it is held, the key
+  // removed meanwhile or not (the caller may move from it).
+  std::shared_ptr<Value> Get(const Key& key, How* how = nullptr) {
     std::unique_lock<std::mutex> l(mu_);
     auto it = slots_.find(key);
     if (it == slots_.end()) return nullptr;
@@ -95,10 +98,10 @@ class OnceJobs {
       l.lock();
     } else if (s->state != State::Done) {
       h = How::RanHere;
-      RunLocked(s, l);
+      RunLocked(s, l, false);
     }
     if (how) *how = h;
-    return &*s->value;
+    return std::shared_ptr<Value>(s, &*s->value);  // (keeps the slot)
   }
 
   // Key's job queued on `lane`, unless it has been started or queued
@@ -117,7 +120,7 @@ class OnceJobs {
       std::unique_lock<std::mutex> l(mu_);
       // Asked for (run or running), removed, or closing: nothing to do.
       if (closing_ || s->state != State::Queued || s->forgotten) return;
-      RunLocked(s, l);
+      RunLocked(s, l, true);
       if (!s->forgotten) finished_.push_back(key);
     });
   }
@@ -158,12 +161,12 @@ class OnceJobs {
 
   // The job of `s` run on this thread, `l` (mu_) released meanwhile and
   // held again when it returns.
-  void RunLocked(const std::shared_ptr<Slot>& s, std::unique_lock<std::mutex>& l) {
+  void RunLocked(const std::shared_ptr<Slot>& s, std::unique_lock<std::mutex>& l, bool on_lane) {
     s->state = State::Running;
     s->run.lock();  // free: only a waiter takes it, and only while Running
     Job job = std::move(s->job);
     l.unlock();
-    Value v = job();
+    Value v = job(on_lane);
     job = nullptr;  // what it captured, freed outside the lock
     l.lock();
     s->value = std::move(v);
@@ -186,6 +189,57 @@ class OnceJobs {
   std::vector<Key> finished_;
   size_t done_ = 0;  // slots_ whose jobs have finished
   bool closing_ = false;
+};
+
+// The ids waiting for each key's job: shaders made from one translation
+// (the same source) share one compile. Not thread-safe (the device's under
+// its lock).
+template <class Key, class Id, class Hash = std::hash<Key>>
+class Waiters {
+ public:
+  // `id` waits for key's job; true if it is the first (the job to make).
+  bool Add(const Key& key, Id id) {
+    std::vector<Id>& ids = by_key_[key];
+    ids.push_back(id);
+    return ids.size() == 1;
+  }
+
+  // `id` waits no more; true if it was the last (the job to drop).
+  bool Remove(const Key& key, Id id) {
+    auto it = by_key_.find(key);
+    if (it == by_key_.end()) return false;
+    auto at = std::find(it->second.begin(), it->second.end(), id);
+    if (at == it->second.end()) return false;
+    it->second.erase(at);
+    if (!it->second.empty()) return false;
+    by_key_.erase(it);
+    return true;
+  }
+
+  bool Has(const Key& key) const { return by_key_.count(key) != 0; }
+
+  // Key's ids, in the order they came, and the key forgotten.
+  std::vector<Id> Take(const Key& key) {
+    auto it = by_key_.find(key);
+    if (it == by_key_.end()) return {};
+    std::vector<Id> ids = std::move(it->second);
+    by_key_.erase(it);
+    return ids;
+  }
+
+  // The keys, in the order of the first id of each (ids grow as they are
+  // made: the order the first shader of each was made in).
+  std::vector<Key> KeysInOrder() const {
+    std::vector<std::pair<Id, Key>> firsts;
+    for (const auto& [key, ids] : by_key_) firsts.emplace_back(ids.front(), key);
+    std::sort(firsts.begin(), firsts.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
+    std::vector<Key> keys;
+    for (const auto& f : firsts) keys.push_back(f.second);
+    return keys;
+  }
+
+ private:
+  std::unordered_map<Key, std::vector<Id>, Hash> by_key_;
 };
 
 }  // namespace recomp::gfx
