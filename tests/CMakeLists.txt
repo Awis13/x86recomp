@@ -220,6 +220,18 @@ if(APPLE)
   set_tests_properties(metal_depth PROPERTIES SKIP_RETURN_CODE 77)
 endif()
 
+# metal_rcas_test: sharpening on the Metal backend (gfx/rcas.h), rcas_cs on
+# the GPU against a C++ copy of AMD's FsrRcasF, and what it must and must
+# not sharpen (skipped without a Metal device); macOS.
+if(APPLE)
+  add_executable(metal_rcas_test metal_rcas_test.mm)
+  set_source_files_properties(metal_rcas_test.mm PROPERTIES COMPILE_OPTIONS "-fobjc-arc;-std=c++20")
+  target_include_directories(metal_rcas_test PRIVATE "${PROJECT_SOURCE_DIR}/src")
+  target_link_libraries(metal_rcas_test PRIVATE "-framework Metal" "-framework Foundation")
+  add_test(NAME metal_rcas COMMAND metal_rcas_test)
+  set_tests_properties(metal_rcas PROPERTIES SKIP_RETURN_CODE 77)
+endif()
+
 # lift_flags_test: programs whose flags cross calls, returns, tail calls
 # and indirect calls, lifted with the lifter's flag analysis and with
 # every flag spilled (recomp_lift --flags-test), must behave the same;
