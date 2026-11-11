@@ -10,6 +10,7 @@
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <sys/sysctl.h>
+#include <sys/time.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -107,7 +108,9 @@ std::shared_ptr<PipelineArchive> PipelineArchive::Open(id<MTLDevice> dev, Option
                                         [app endBackgroundTask:task];
                                         task = UIBackgroundTaskInvalid;
                                       }];
-                dispatch_async(self->q_, ^{
+                // Not behind the compiles ahead on AheadQueue (the lock keeps
+                // it apart from the queue's saves).
+                dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
                   self->Save();
                   dispatch_async(dispatch_get_main_queue(), ^{
                     if (task != UIBackgroundTaskInvalid) [app endBackgroundTask:task];
@@ -154,6 +157,7 @@ void PipelineArchive::Remove(int n) {
 // ---- loading (the queue's first work)
 
 void PipelineArchive::Load() {
+  std::lock_guard<std::mutex> save_lock(save_mu_);
   @autoreleasepool {
     NSFileManager* fm = NSFileManager.defaultManager;
     [fm createDirectoryAtPath:@(o_.dir.c_str()) withIntermediateDirectories:YES attributes:nil error:nil];
@@ -165,8 +169,11 @@ void PipelineArchive::Load() {
       writer_ = true;
       if (FileSize(sidecar) == 0 && write(lock_fd_, o_.scope.data(), o_.scope.size()) < 0)
         Log("scope", std::string("cannot write ") + sidecar);
-    } else {
+    } else if (errno == EWOULDBLOCK || errno == EAGAIN) {
       std::fprintf(stderr, "gfx: pipeline archive: in use by another process: only looked in\n");
+    } else {
+      std::fprintf(stderr, "gfx: pipeline archive: cannot open %s (%s): only looked in\n", sidecar.c_str(),
+                   std::strerror(errno));
     }
     const bool writer = writer_.load();
 
@@ -224,7 +231,7 @@ void PipelineArchive::Load() {
     const uint64_t t0 = NowNs();
     NSMutableArray<id<MTLBinaryArchive>>* loaded = [NSMutableArray array];
     std::vector<int> numbers;
-    std::unordered_set<uint64_t> listed;
+    std::unordered_map<uint64_t, int> listed;
     uint64_t bytes = 0;
     for (const auto& [n, path] : mine) {
       MTLBinaryArchiveDescriptor* d = [MTLBinaryArchiveDescriptor new];
@@ -242,7 +249,7 @@ void PipelineArchive::Load() {
       bytes += FileSize(path);
       if (FILE* f = std::fopen(KeysPath(path).c_str(), "rb")) {
         uint64_t k;
-        while (std::fread(&k, 8, 1, f) == 1) listed.insert(k);
+        while (std::fread(&k, 8, 1, f) == 1) listed.emplace(k, n);
         std::fclose(f);
       }
     }
@@ -260,32 +267,55 @@ void PipelineArchive::Load() {
   }
 }
 
-// The oldest shards removed while the scope has more than max_bytes or
-// max_shards (counting one more, the run's shard to come, if `keep` is -1;
-// else not `keep`, the run's shard).
+// The shards used longest ago (by their keys file's time: touched when
+// one of their pipelines is found, written when they are saved) removed
+// while the scope has more than max_bytes or max_shards (counting one more,
+// the run's shard to come, if `keep` is -1; else never `keep`, the run's
+// shard).
 void PipelineArchive::Evict(int keep) {
   NSArray<NSString*>* names = [NSFileManager.defaultManager contentsOfDirectoryAtPath:@(o_.dir.c_str())
                                                                                 error:nil] ?: @[];
-  std::map<int, uint64_t> sizes;
+  struct Shard {
+    int n;
+    uint64_t bytes;
+    double used;
+  };
+  std::vector<Shard> shards;
   for (NSString* ns : names) {
     const std::string name = ns.UTF8String;
     if (name.size() < 22 || name.compare(0, 17, hex_ + "-") != 0 || name.compare(name.size() - 4, 4, ".bin") != 0)
       continue;
     const std::string digits = name.substr(17, name.size() - 21);
     if (digits.empty() || digits.find_first_not_of("0123456789") != std::string::npos) continue;
-    sizes[std::atoi(digits.c_str())] = FileSize(o_.dir + "/" + name);
+    const std::string path = o_.dir + "/" + name;
+    struct stat st {};
+    if (stat(KeysPath(path).c_str(), &st) != 0 && stat(path.c_str(), &st) != 0) continue;
+    shards.push_back({std::atoi(digits.c_str()), FileSize(path),
+                      double(st.st_mtimespec.tv_sec) + double(st.st_mtimespec.tv_nsec) / 1e9});
   }
+  std::sort(shards.begin(), shards.end(),
+            [](const Shard& a, const Shard& b) { return a.used != b.used ? a.used < b.used : a.n < b.n; });
   uint64_t total = 0;
-  for (const auto& [n, s] : sizes) total += s;
-  size_t count = sizes.size() + (keep < 0 ? 1 : 0);
-  for (auto it = sizes.begin(); it != sizes.end() && (total > o_.max_bytes || count > o_.max_shards); ++it) {
-    if (it->first == keep) continue;
-    std::fprintf(stderr, "gfx: pipeline archive: oldest shard %d (%.1f MB) removed\n", it->first,
-                 double(it->second) / 1048576.0);
-    Remove(it->first);
-    total -= it->second;
+  for (const Shard& sh : shards) total += sh.bytes;
+  size_t count = shards.size() + (keep < 0 ? 1 : 0);
+  for (const Shard& sh : shards) {
+    if (total <= o_.max_bytes && count <= o_.max_shards) break;
+    if (sh.n == keep) continue;
+    std::fprintf(stderr, "gfx: pipeline archive: shard %d (%.1f MB), used longest ago, removed\n", sh.n,
+                 double(sh.bytes) / 1048576.0);
+    Remove(sh.n);
+    total -= sh.bytes;
     count--;
   }
+}
+
+// Shard `n` marked used (its keys file touched), once a run.
+void PipelineArchive::Used(int n) {
+  {
+    std::lock_guard<std::mutex> l(mu_);
+    if (!used_.insert(n).second) return;
+  }
+  if (writer_.load()) utimes(KeysPath(ShardPath(n)).c_str(), nullptr);
 }
 
 void PipelineArchive::WaitLoaded() {
@@ -323,6 +353,13 @@ id<MTLRenderPipelineState> PipelineArchive::Build(MTLRenderPipelineDescriptor* p
       hits_.fetch_add(1, std::memory_order_relaxed);
       found_.fetch_add(1, std::memory_order_relaxed);
       if (found) *found = true;
+      int n = -1;
+      {
+        std::lock_guard<std::mutex> l(mu_);
+        auto it = listed_.find(key);
+        if (it != listed_.end()) n = it->second;
+      }
+      if (n >= 0) Used(n);
       return p;
     }
     misses_.fetch_add(1, std::memory_order_relaxed);
@@ -352,8 +389,9 @@ id<MTLRenderPipelineState> PipelineArchive::Build(MTLRenderPipelineDescriptor* p
     }
   }
   id<MTLRenderPipelineState> p = [dev_ newRenderPipelineStateWithDescriptor:pd error:error];
-  // Kept to be saved: not when closing, nor by a process that only looks.
-  if (!p || closing_.load() || (loaded && !writer_.load())) return p;
+  // Kept to be saved: not when closing or saving has stopped, nor by a
+  // process that only looks.
+  if (!p || closing_.load() || stopped_.load() || (loaded && !writer_.load())) return p;
   {
     std::lock_guard<std::mutex> l(mu_);
     if (pending_.load() >= o_.max_unsaved || !keys_.insert(key).second) return p;
@@ -364,11 +402,14 @@ id<MTLRenderPipelineState> PipelineArchive::Build(MTLRenderPipelineDescriptor* p
     pending_.store(run_.size() - saved_upto_);
   }
   last_new_ns_ = NowNs();
+  // One save queued at a time (a save takes a while; pipelines keep coming).
   if (pending_.load() >= o_.save_every) {
-    auto self = shared_from_this();
-    dispatch_async(q_, ^{
-      self->Save();
-    });
+    if (!save_queued_.exchange(true)) {
+      auto self = shared_from_this();
+      dispatch_async(q_, ^{
+        self->Save();
+      });
+    }
   } else {
     SaveLater();
   }
@@ -397,21 +438,34 @@ void PipelineArchive::SaveLater() {
 // (a run that exits while saving leaves the files as they were), then its
 // keys likewise.
 
-void PipelineArchive::Save() {
-  if (!writer_.load() || failures_ >= 2) return;
+void PipelineArchive::Save(bool final) {
+  std::lock_guard<std::mutex> save_lock(save_mu_);
+  save_queued_ = false;
+  if (!writer_.load() || (closing_.load() && !final)) return;
+  // Close's: every shard's worth (the others, one: the rest soon after).
+  while (SaveShard() && final) {
+  }
+}
+
+// One save of the run's shard; true if it filled up and more pipelines
+// are waiting for the next.
+bool PipelineArchive::SaveShard() {
+  if (stopped_.load()) return false;
   @autoreleasepool {
     std::vector<Entry> list;
     {
       std::lock_guard<std::mutex> l(mu_);
-      if (run_.size() == saved_upto_) return;
+      if (run_.size() == saved_upto_) return false;
       // Built before the shards loaded and in them after all: not saved again.
       std::vector<Entry> keep;
       for (size_t i = 0; i < run_.size(); i++)
         if (i < saved_upto_ || run_[i].looked || !listed_.count(run_[i].key)) keep.push_back(run_[i]);
       run_.swap(keep);
-      list = run_;
+      // The shard's: max_pipelines at most (the rest start the next).
+      list.assign(run_.begin(), run_.begin() + ptrdiff_t(std::min<size_t>(run_.size(), o_.max_pipelines)));
+      pending_.store(run_.size() - saved_upto_);
     }
-    if (list.size() == saved_upto_) return;
+    if (list.size() == saved_upto_) return false;
     const std::string path = ShardPath(run_n_);
     const std::string tmp = path + "." + std::to_string(getpid()) + ".tmp";
     const uint64_t t0 = NowNs();
@@ -420,73 +474,95 @@ void PipelineArchive::Save() {
     if (!a) {
       Log("new", std::string("cannot make an archive (") + Text(e) + "): pipelines not saved");
       failures_ = 2;
-      return;
     }
-    size_t bad = 0;
-    for (const Entry& en : list)
-      if (![a addRenderPipelineFunctionsWithDescriptor:en.pd error:&e]) {
-        if (!bad++) Log("add", std::string("adding a pipeline: ") + Text(e) + " (logged once)");
-      }
+    std::vector<uint64_t> keys;  // of the pipelines added
+    for (size_t i = 0; a && i < list.size(); i++) {
+      if ([a addRenderPipelineFunctionsWithDescriptor:list[i].pd error:&e])
+        keys.push_back(list[i].key);
+      else
+        Log("add", std::string("adding a pipeline: ") + Text(e) + " (logged once)");
+    }
     const uint64_t t1 = NowNs();
-    unlink(tmp.c_str());
-    bool ok = [a serializeToURL:Url(tmp) error:&e];
-    // Only a file put in place (something else in the temporary file's way,
-    // e.g. a folder, is reported saved).
+    bool ok = a != nil;
     struct stat st {};
-    if (ok && (stat(tmp.c_str(), &st) != 0 || !S_ISREG(st.st_mode))) {
-      e = [NSError errorWithDomain:NSPOSIXErrorDomain code:EEXIST userInfo:nil];
-      ok = false;
-    }
-    if (ok && rename(tmp.c_str(), path.c_str()) != 0) {
-      e = [NSError errorWithDomain:NSPOSIXErrorDomain code:errno userInfo:nil];
-      ok = false;
+    if (ok) {
+      unlink(tmp.c_str());
+      ok = [a serializeToURL:Url(tmp) error:&e];
+      // Only a file put in place (something else in the temporary file's
+      // way, e.g. a folder, is reported saved).
+      if (ok && (stat(tmp.c_str(), &st) != 0 || !S_ISREG(st.st_mode))) {
+        e = [NSError errorWithDomain:NSPOSIXErrorDomain code:EEXIST userInfo:nil];
+        ok = false;
+      }
+      if (ok && rename(tmp.c_str(), path.c_str()) != 0) {
+        e = [NSError errorWithDomain:NSPOSIXErrorDomain code:errno userInfo:nil];
+        ok = false;
+      }
     }
     if (!ok) {
-      if (stat(tmp.c_str(), &st) == 0 && S_ISREG(st.st_mode)) unlink(tmp.c_str());
-      // Never released: Metal has crashed releasing an archive whose save
-      // failed. The files are as they were; the next save tries again.
-      (void)CFBridgingRetain(a);
-      if (++failures_ >= 2)
+      if (a) {
+        if (stat(tmp.c_str(), &st) == 0 && S_ISREG(st.st_mode)) unlink(tmp.c_str());
+        // Never released: Metal has crashed releasing an archive whose save
+        // failed. The files are as they were; the next save tries again.
+        (void)CFBridgingRetain(a);
+        failures_++;
+      }
+      if (failures_ >= 2) {
         std::fprintf(stderr, "gfx: pipeline archive: saving %s failed again (%s): not saved any more this run\n",
                      path.c_str(), Text(e));
-      else
+        // Nothing more kept (the pipelines held their shaders' libraries).
+        stopped_ = true;
+        std::lock_guard<std::mutex> l(mu_);
+        run_.clear();
+        saved_upto_ = 0;
+        pending_.store(0);
+      } else {
         std::fprintf(stderr, "gfx: pipeline archive: saving %s failed (%s): tried again at the next save\n",
                      path.c_str(), Text(e));
-      return;
+      }
+      return false;
     }
     failures_ = 0;
-    // Its keys (the staleness test looks for these).
-    const std::string keys = KeysPath(path), keys_tmp = keys + "." + std::to_string(getpid()) + ".tmp";
+    // Its keys (for the staleness test and to mark it used), those added.
+    const std::string keys_path = KeysPath(path), keys_tmp = keys_path + "." + std::to_string(getpid()) + ".tmp";
     if (FILE* f = std::fopen(keys_tmp.c_str(), "wb")) {
-      for (const Entry& en : list) std::fwrite(&en.key, 8, 1, f);
+      if (!keys.empty()) std::fwrite(keys.data(), 8, keys.size(), f);
       const bool written = std::fclose(f) == 0;
-      if (!written || rename(keys_tmp.c_str(), keys.c_str()) != 0) unlink(keys_tmp.c_str());
+      if (!written || rename(keys_tmp.c_str(), keys_path.c_str()) != 0) unlink(keys_tmp.c_str());
     }
     const uint64_t bytes = FileSize(path);
     save_ms_.store(double(NowNs() - t0) / 1e6, std::memory_order_relaxed);
     add_ms_.store(double(t1 - t0) / 1e6, std::memory_order_relaxed);
     save_bytes_.store(bytes, std::memory_order_relaxed);
+    saves_.fetch_add(1, std::memory_order_relaxed);
+    const bool done = list.size() >= o_.max_pipelines || bytes >= o_.shard_cap;
+    bool more;
     {
       std::lock_guard<std::mutex> l(mu_);
       saved_.fetch_add(list.size() - saved_upto_, std::memory_order_relaxed);
       saved_upto_ = list.size();
-      // Past the cap: the shard is done, the next pipelines start another.
-      if (bytes >= o_.shard_cap) {
+      // Full: the shard is done (its pipelines no longer held), the next
+      // pipelines start another.
+      if (done) {
         run_.erase(run_.begin(), run_.begin() + ptrdiff_t(saved_upto_));
         saved_upto_ = 0;
       }
       pending_.store(run_.size() - saved_upto_);
+      more = run_.size() > saved_upto_;
     }
-    if (bytes >= o_.shard_cap) {
-      Evict(run_n_);
-      run_n_++;
-    }
+    if (!done) return false;
+    Evict(run_n_);
+    run_n_++;
+    // What came meanwhile: saved soon in the next shard.
+    if (more && !closing_.load()) SaveLater();
+    return more;
   }
 }
 
 // The loaded shards' pipelines all missed: their files removed (they are
 // no longer looked in). This run's shard is another file.
 void PipelineArchive::DropStale() {
+  std::lock_guard<std::mutex> save_lock(save_mu_);
   std::vector<int> numbers;
   {
     std::lock_guard<std::mutex> l(mu_);
@@ -501,6 +577,7 @@ void PipelineArchive::DropStale() {
 // ---- closing
 
 void PipelineArchive::Unlock() {
+  std::lock_guard<std::mutex> save_lock(save_mu_);
   if (lock_fd_ >= 0) close(lock_fd_);
   lock_fd_ = -1;
 }
@@ -509,7 +586,7 @@ void PipelineArchive::BeginClose() { closing_ = true; }
 
 void PipelineArchive::Flush() {
   dispatch_sync(q_, ^{
-    Save();
+    Save(closing_.load());
   });
 }
 
@@ -520,7 +597,7 @@ void PipelineArchive::Close(double cap_s) {
   auto self = shared_from_this();
   const uint64_t t0 = NowNs();
   dispatch_async(q_, ^{
-    self->Save();
+    self->Save(true);
     self->Unlock();
     dispatch_semaphore_signal(done);
   });
@@ -540,6 +617,7 @@ PipelineArchive::Stats PipelineArchive::TakeStats() {
   s.save_ms = save_ms_.load(std::memory_order_relaxed);
   s.add_ms = add_ms_.load(std::memory_order_relaxed);
   s.save_bytes = save_bytes_.load(std::memory_order_relaxed);
+  s.saves = saves_.load(std::memory_order_relaxed);
   std::lock_guard<std::mutex> l(mu_);
   s.shards = shards_ ? size_t(shards_.count) : 0;
   return s;

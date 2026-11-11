@@ -81,6 +81,14 @@ std::vector<std::string> Files(const std::string& dir, const char* suffix) {
   return out;
 }
 
+// A scope's files of `suffix` (the scope's by the name of a shard of it).
+size_t ScopeFiles(const std::string& dir, const std::string& shard, const char* suffix) {
+  const std::string stem = shard.substr(shard.rfind('/') + 1, 16);
+  size_t n = 0;
+  for (const std::string& f : Files(dir, suffix)) n += f.compare(0, 16, stem) == 0;
+  return n;
+}
+
 uint64_t FileBytes(const std::string& p) {
   struct stat st {};
   return stat(p.c_str(), &st) == 0 ? uint64_t(st.st_size) : 0;
@@ -266,6 +274,78 @@ int main() {
       c->Close(2.0);
     }
 
+    // ---- max_pipelines: a shard's pipelines at most, also at Close.
+    {
+      PipelineArchive::Options o = options(Scope("M3", "gpu0"));
+      o.max_pipelines = 10;
+      auto a = open(o);
+      for (int i = 0; i < 25; i++) {
+        build(*a, 1, i);
+        if (i % 5 == 4) a->Flush();
+      }
+      a->Close(2.0);
+      Check(ScopeFiles(dir, a->ShardPath(0), ".bin") == 3, "25 pipelines in shards of 10, 10 and 5");
+      o.save_every = 1000;  // no save before Close
+      auto b = open(o);
+      PipelineArchive::Stats s = build(*b, 25);
+      s = build(*b, 25, 25);
+      b->Close(2.0);
+      Check(ScopeFiles(dir, b->ShardPath(0), ".bin") == 6, "Close saves every shard's worth waiting");
+      auto c = open(o);
+      s = build(*c, 50);
+      Check(s.hits == 50 && s.shards == 6, "all 50 found");
+      c->Close(2.0);
+    }
+
+    // ---- one save queued at a time; none started once closing began
+    // but Close's.
+    {
+      PipelineArchive::Options o = options(Scope("N3", "gpu0"));
+      o.save_every = 2;
+      auto a = open(o);
+      dispatch_async(a->QueueForTests(), ^{
+        usleep(300 * 1000);
+      });
+      build(*a, 20);  // ten times past save_every while the queue is busy
+      dispatch_sync(a->QueueForTests(), ^{
+      });
+      PipelineArchive::Stats s = a->TakeStats();
+      Check(s.saves == 1 && s.saved == 20, "one save for the pipelines that came while it was queued");
+      dispatch_async(a->QueueForTests(), ^{
+        usleep(300 * 1000);
+      });
+      build(*a, 4, 20);
+      a->BeginClose();
+      dispatch_sync(a->QueueForTests(), ^{
+      });
+      Check(a->TakeStats().saves == 1, "a save queued before closing began does not run");
+      a->Close(2.0);
+      s = a->TakeStats();
+      Check(s.saves == 2 && s.saved == 24, "Close's save does");
+    }
+
+    // ---- shards used longest ago go first.
+    {
+      const std::string scope = Scope("L3", "gpu0");
+      for (int i = 0; i < 3; i++) {  // shards 0, 1, 2: one pipeline each
+        auto a = open(options(scope));
+        build(*a, 1, i);
+        a->Close(2.0);
+      }
+      {
+        auto a = open(options(scope));
+        Check(build(*a, 1, 0).hits == 1, "shard 0 found, marked used");
+        a->Close(2.0);
+      }
+      PipelineArchive::Options o = options(scope);
+      o.max_shards = 2;  // room for one more: two go
+      auto b = open(o);
+      PipelineArchive::Stats s = build(*b, 3);
+      Check(s.shards == 1 && s.hits == 1 && FileBytes(b->ShardPath(0)) > 0,
+            "the shard used last kept, the two used longest ago removed");
+      b->Close(2.0);
+    }
+
     // ---- saves that fail.
     {
       const std::string scope = Scope("F4", "gpu0");
@@ -294,8 +374,8 @@ int main() {
       build(*a, 1, 5);
       a->Flush();
       s = a->TakeStats();
-      Check(s.saved == 3 && s.pending == 3 && FileBytes(a->ShardPath(0)) == good,
-            "two failures in a row stop saving, the shard saved before kept");
+      Check(s.saved == 3 && s.pending == 0 && FileBytes(a->ShardPath(0)) == good,
+            "two failures in a row stop saving (nothing more kept), the shard saved before kept");
       a->Close(2.0);
       a.reset();  // the archives whose save failed are never released: no crash here
       auto b = open(options(scope));

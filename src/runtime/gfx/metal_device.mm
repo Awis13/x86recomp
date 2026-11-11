@@ -3969,6 +3969,7 @@ void main() {
     o.target = AheadQueue();
     // Each save writes the whole shard: smaller ones, and fewer saves.
     o.shard_cap = 32ull << 20;
+    o.max_pipelines = 256;
     o.max_bytes = 4 * o.shard_cap;
     o.save_idle_s = 15.0;
 #endif

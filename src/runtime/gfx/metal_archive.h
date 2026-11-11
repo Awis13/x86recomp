@@ -16,8 +16,10 @@
 // another OS build or GPU starts its own set. Files of a scope with the
 // same app and GPU but another OS build (or format, or translation) are
 // this app's and of no further use: removed when the archive is opened.
-// Others' (another app, another GPU) are left alone. The oldest shards go
-// when a scope has more than max_shards or max_bytes of them.
+// Others' (another app, another GPU) are left alone. The shards used
+// longest ago go when a scope has more than max_shards or max_bytes of
+// them (a shard is marked used, its keys file touched, when one of its
+// pipelines is found).
 //
 // What Metal allows: an archive saved once can be saved again only if
 // nothing was added to it since (adding to it, or to the same archive
@@ -27,12 +29,16 @@
 // only looked in, never added to; the pipelines new in a run are kept in a
 // list, and each save makes a new archive, adds the whole list (cheap: the
 // pipelines are compiled already, a fraction of a ms each) and saves it
-// once, as this run's own shard. Past the shard cap that shard is done and
-// the next pipelines start another.
+// once, as this run's own shard. Past max_pipelines (or the byte cap) that
+// shard is done and the next pipelines start another, so a save re-adds
+// and writes at most that many.
 //
 // Threads: Build may be called from any thread. Loading and saving run on
 // one serial queue of the archive's own (iOS and tvOS: on the device's
-// AheadQueue, as its target). Loading is its first work: pipelines built
+// AheadQueue, as its target), never at the same time (a save when the app
+// goes to the background, on iOS and tvOS, runs elsewhere so as not to
+// wait behind the compiles ahead, but takes the same lock). Loading is its
+// first work: pipelines built
 // before it is done are compiled as if there were no archive, and saved
 // only if the loaded shards do not have them. Two processes with the same
 // scope: the one that opens it second only looks things up.
@@ -53,6 +59,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -70,6 +77,9 @@ class PipelineArchive : public std::enable_shared_from_this<PipelineArchive> {
     std::string dir;    // made if missing
     std::string scope;  // lines of key=value; DefaultScope's by default
     uint64_t shard_cap = kShardCap;
+    // A shard's pipelines at most (each save of the run's shard adds them
+    // all again and writes them all).
+    unsigned max_pipelines = 384;
     // A scope's shards in all: the oldest removed past either.
     uint64_t max_bytes = 4 * kShardCap;
     unsigned max_shards = 32;
@@ -83,7 +93,7 @@ class PipelineArchive : public std::enable_shared_from_this<PipelineArchive> {
     double save_idle_s = 5.0;
     // New pipelines kept to be saved at most (more are not kept: saves
     // that keep failing must not hold every shader's library).
-    unsigned max_unsaved = 4096;
+    unsigned max_unsaved = 1024;
   };
 
   struct Stats {
@@ -93,6 +103,7 @@ class PipelineArchive : public std::enable_shared_from_this<PipelineArchive> {
     double save_ms = -1;   // the last save (-1: none yet), and adding to it
     double add_ms = 0;
     uint64_t save_bytes = 0;
+    uint64_t saves = 0;  // done (in all)
     size_t shards = 0;  // loaded and looked in
   };
 
@@ -146,13 +157,17 @@ class PipelineArchive : public std::enable_shared_from_this<PipelineArchive> {
     bool looked;  // looked up in the loaded shards (missed); else built before they were
   };
 
-  // All on the queue.
+  // On the queue (Save also from a background save), under save_mu_ (but
+  // Evict and Remove: their callers'). `final`: Close's save (else none
+  // once closing has begun).
   void Load();
-  void Save();
+  void Save(bool final = false);
+  bool SaveShard();
   void Evict(int keep);
   void DropStale();
   void Unlock();
   void Remove(int n);
+  void Used(int n);  // any thread
 
   void SaveLater();
   void Log(const char* kind, const std::string& msg);
@@ -165,8 +180,9 @@ class PipelineArchive : public std::enable_shared_from_this<PipelineArchive> {
   // Build's (any thread), under mu_.
   std::mutex mu_;
   NSArray<id<MTLBinaryArchive>>* shards_ = nil;
-  std::vector<int> loaded_n_;          // the loaded shards' numbers
-  std::unordered_set<uint64_t> listed_;  // the loaded shards' keys
+  std::vector<int> loaded_n_;                 // the loaded shards' numbers
+  std::unordered_map<uint64_t, int> listed_;  // the loaded shards' keys: their shard
+  std::unordered_set<int> used_;              // shards marked used this run
   bool loaded_ = false;
   std::condition_variable loaded_cv_;
   std::unordered_set<uint64_t> keys_;  // kept this run
@@ -177,14 +193,17 @@ class PipelineArchive : public std::enable_shared_from_this<PipelineArchive> {
   std::atomic<bool> stale_{false};
   std::atomic<bool> writer_{false};
   std::atomic<bool> timer_{false};
+  std::atomic<bool> save_queued_{false};
+  std::atomic<bool> stopped_{false};  // saving stopped (failures): nothing more kept
   std::atomic<uint64_t> last_new_ns_{0};
   std::atomic<uint64_t> hits_{0}, misses_{0}, miss_ns_{0};
   std::atomic<uint64_t> found_{0}, listed_missed_{0};  // in all, for the staleness test
   std::atomic<uint64_t> saved_{0}, pending_{0};
   std::atomic<double> save_ms_{-1}, add_ms_{0};
-  std::atomic<uint64_t> save_bytes_{0};
+  std::atomic<uint64_t> save_bytes_{0}, saves_{0};
 
-  // The queue's.
+  // The queue's, under save_mu_.
+  std::mutex save_mu_;
   int run_n_ = 0;  // this run's shard's number
   int failures_ = 0;  // saves failed in a row
   int lock_fd_ = -1;  // the sidecar, locked: this process saves
