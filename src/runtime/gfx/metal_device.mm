@@ -648,6 +648,10 @@ class MetalDevice final : public Device {
     // hundreds are queued).
     closing_ = true;
     shader_jobs_.Close();
+    // No more pipelines kept for the archive, its saves stopped but for the
+    // last one below (on iOS and tvOS they run on AheadQueue, drained
+    // below).
+    if (archive_) archive_->BeginClose();
     // Each step that takes long is told, to find what holds a quit up.
     uint64_t t = NowNs();
     auto step = [&t](const char* what) {
@@ -787,15 +791,15 @@ class MetalDevice final : public Device {
     std::string out(b, size_t(std::clamp(len, 0, int(sizeof b) - 1)));
     if (archive_) {
       // Lookups in the pipeline archive (found or not, and the time the
-      // misses cost), what was added in all and is still to be added, and
+      // misses cost), new pipelines saved in all and still to be saved, and
       // its last save.
       const PipelineArchive::Stats a = archive_->TakeStats();
       std::snprintf(b, sizeof b,
                     "; pipeline archive: %zu shards, %llu found, %llu missed (%.1f ms), %llu added, %llu to add, "
-                    "last saved in %.0f ms (%.1f MB)",
+                    "last saved in %.0f ms (%.1f MB), %.0f ms of it adding",
                     a.shards, (unsigned long long)a.hits, (unsigned long long)a.misses, double(a.miss_ns) / 1e6,
-                    (unsigned long long)a.added, (unsigned long long)a.pending, a.save_ms,
-                    double(a.save_bytes) / 1048576.0);
+                    (unsigned long long)a.saved, (unsigned long long)a.pending, a.save_ms,
+                    double(a.save_bytes) / 1048576.0, a.add_ms);
       out += b;
     }
     return out;
@@ -3741,12 +3745,19 @@ void main() {
       MTLRenderPipelineDescriptor* pd = Describe(k, enc_shaders_.at(k.vs), ps);
       NSError* err = nil;
       const auto t0 = std::chrono::steady_clock::now();
-      id<MTLRenderPipelineState> p = archive_ ? archive_->Build(pd, ArchiveKey(k), &err)
+      bool archived = false;
+      id<MTLRenderPipelineState> p = archive_ ? archive_->Build(pd, ArchiveKey(k), &err, &archived)
                                               : [dev_ newRenderPipelineStateWithDescriptor:pd error:&err];
       if (!p) FatalF("gfx: render pipeline: %s", err.localizedDescription.UTF8String);
-      // Compiling while drawing stalls the frame: the slow ones are named.
+      // Compiling while drawing stalls the frame: the slow ones are named
+      // (one found in the pipeline archive was not compiled: its own count).
       const double ms =
           std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+      if (archived) {
+        pipelines_[k] = p;
+        RecordRecipe(k);
+        return p;
+      }
       if (ms > 2)
         std::fprintf(stderr, "gfx: pipeline %zu compiled in %.1f ms (%zu built ahead so far)\n",
                      pipelines_.size() + 1, ms, prebuilt_used_);
@@ -3940,9 +3951,19 @@ void main() {
     o.dir = [[NSString stringWithUTF8String:RecipePath().c_str()].stringByDeletingLastPathComponent
                stringByAppendingPathComponent:@"metal-archives-v1"]
                 .fileSystemRepresentation;
+    // The scope with the shader translation's version (the MSL cache's and
+    // the preludes'): after a change of it, the old shards would only be
+    // looked in for nothing.
+    const std::string prelude = Prelude(hlsl::Stage::Vertex) + Prelude(hlsl::Stage::Pixel);
+    char msl[64];
+    std::snprintf(msl, sizeof msl, "msl=%u-%016llx\n", kMslCacheVersion,
+                  (unsigned long long)Fnv64(prelude.data(), prelude.size()));
+    o.scope = PipelineArchive::DefaultScope(dev_) + msl;
 #if TARGET_OS_IOS || TARGET_OS_TV
     o.target = AheadQueue();
-    // Each save writes the whole shard (tens of MB): fewer of them there.
+    // Each save writes the whole shard: smaller ones, and fewer saves.
+    o.shard_cap = 32ull << 20;
+    o.max_bytes = 4 * o.shard_cap;
     o.save_idle_s = 15.0;
 #endif
     archive_ = PipelineArchive::Open(dev_, std::move(o));
