@@ -1338,10 +1338,14 @@ class MetalDevice final : public Device {
 
   // CreateShader's: the shader registered and, unless it is compiled now,
   // compiled when first drawn (EnsureShader) or ahead on the shader lanes
-  // (`ahead`: once they have started, Prefetch). Compiled now: with
-  // RECOMP_LAZY_SHADERS=0, or when an earlier run's recipe names it (so
-  // its pipelines are built ahead, PrebuildFor, as soon as the shaders
-  // are both there).
+  // (`ahead`: once they have started, Prefetch). One an earlier run's
+  // recipe names goes to the lanes at once, before the first frame and
+  // ahead of the others (its pipelines are built ahead, PrebuildFor, once
+  // its shaders are both there: Finish). Compiled now: with
+  // RECOMP_LAZY_SHADERS=0, or a recipe's with no lanes
+  // (RECOMP_SHADER_LANES=0). (Compiled here, recipes' shaders held the
+  // game's thread for seconds while loading when only the OS's cache of
+  // compiled shaders was empty.)
   ShaderId MakeShader(const hlsl::Program& prog, bool ahead) {
     std::lock_guard<std::recursive_mutex> l(mu_);
     const uint64_t perf_t0 = perf_ ? NowNs() : 0;
@@ -1386,7 +1390,7 @@ class MetalDevice final : public Device {
         const Shader& t = shaders_.at(twin);
         Give(sid, t.fn, t.has_lean);
         PrebuildFor(sh.hash);
-      } else if (!lazy_ || recipe_by_shader_.count(hash)) {
+      } else if (!lazy_ || (recipe_by_shader_.count(hash) && lanes_.empty())) {
         Compiled c = CompileShader(dev_, glsl, vertex, msl, false);
         TakeOver(hash, c, true);
         Give(sid, c.fn, c.has_lean);
@@ -1397,7 +1401,7 @@ class MetalDevice final : public Device {
         shader_jobs_.Add(hash, [dev, glsl = std::move(glsl), vertex, msl = std::move(msl)](bool on_lane) {
           return CompileShader(dev, glsl, vertex, msl, on_lane);
         });
-        if (ahead && prefetching_) Prefetch(hash);
+        if ((ahead && prefetching_) || recipe_by_shader_.count(hash)) Prefetch(hash);
       }
       if (perf_t0) {
         pc_.shaders++;
@@ -1579,6 +1583,8 @@ class MetalDevice final : public Device {
     TakeOver(hash, c, here);
     for (ShaderId sid : waiters_.Take(hash)) Give(sid, c.fn, c.has_lean);
     shader_jobs_.Remove(hash);
+    // The recipes it completes (one an earlier run's recipe names).
+    PrebuildFor(hash);
   }
 
   // Before a draw with shader `sid` is recorded: it compiled, if it is
@@ -3979,8 +3985,8 @@ void main() {
     return Fnv64(&r, sizeof r);
   }
 
-  // A shader of `hash` was made: the recipes it completes, compiled in the
-  // background.
+  // A shader of `hash` was made or compiled: the recipes it completes,
+  // compiled in the background.
   // Work done ahead (pipelines from earlier runs' recipes, lean shader
   // variants): one at a time, at background priority. On the global queues
   // GCD ran one per core: on an iPad the first run with a Mac's 1,700
@@ -4053,7 +4059,8 @@ void main() {
         if (m == msl_cache_.end() || !shaders_.at(k.ps).has_lean) continue;
         src = @(m->second->c_str());
       }
-      // (Shaders a recipe names are compiled when made, MakeShader.)
+      // (Shaders a recipe names are compiled on the lanes as soon as they
+      // are made; this runs again when each is done, Finish.)
       if (!shaders_.at(k.vs).fn || !shaders_.at(k.ps).fn) continue;
       if (!prebuild_started_.insert(k).second) continue;
       MTLRenderPipelineDescriptor* pd = Describe(k, shaders_.at(k.vs).fn, shaders_.at(k.ps).fn);
