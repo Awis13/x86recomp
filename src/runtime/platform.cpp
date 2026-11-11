@@ -78,6 +78,8 @@ FaultContext ReadFaultContext(const void* uc) {
   f.write = (g[REG_ERR] & 2) != 0;  // page-fault error code: W/R bit
   f.pc = uintptr_t(g[REG_RIP]);
   f.caller = *reinterpret_cast<const uintptr_t*>(g[REG_RSP]);
+  f.fp = uintptr_t(g[REG_RBP]);
+  f.sp = uintptr_t(g[REG_RSP]);
 #elif defined(__APPLE__) && defined(__aarch64__)
   const auto& es = u->uc_mcontext->__es;
   const auto& ss = u->uc_mcontext->__ss;
@@ -86,6 +88,8 @@ FaultContext ReadFaultContext(const void* uc) {
   f.write = (es.__esr >> 6) & 1;
   f.pc = uintptr_t(ss.__pc);
   f.caller = uintptr_t(ss.__lr);
+  f.fp = uintptr_t(ss.__fp);
+  f.sp = uintptr_t(ss.__sp);
 #elif defined(__APPLE__) && defined(__x86_64__)
   const auto& es = u->uc_mcontext->__es;
   const auto& ss = u->uc_mcontext->__ss;
@@ -93,6 +97,8 @@ FaultContext ReadFaultContext(const void* uc) {
   f.write = (es.__err & 2) != 0;
   f.pc = uintptr_t(ss.__rip);
   f.caller = *reinterpret_cast<const uintptr_t*>(ss.__rsp);
+  f.fp = uintptr_t(ss.__rbp);
+  f.sp = uintptr_t(ss.__rsp);
 #else
   (void)u;
 #endif
