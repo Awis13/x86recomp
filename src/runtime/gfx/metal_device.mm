@@ -43,6 +43,9 @@
 #include <SDL3/SDL_metal.h>
 #include <TargetConditionals.h>
 #include <pthread.h>
+#include <sys/sysctl.h>
+#include <sys/time.h>
+#include <unistd.h>
 
 #include <algorithm>
 #include <array>
@@ -436,6 +439,7 @@ class MetalDevice final : public Device {
 
   bool Init() {
     @autoreleasepool {
+      device_made_s_ = ProcessSeconds();
       dev_ = MTLCreateSystemDefaultDevice();
       if (!dev_) {
         WarnF("gfx: no Metal device\n");
@@ -738,7 +742,9 @@ class MetalDevice final : public Device {
     const double busy = double(enc_busy_ns_.exchange(0));
     const uint64_t pipes = pipe_compiles_.exchange(0), pipe_ns = pipe_ns_.exchange(0),
                    pipe_max = pipe_max_ns_.exchange(0), prebuilt = pipe_prebuilt_.exchange(0);
-    char b[768];
+    const uint64_t ahead_done = ahead_done_.load(std::memory_order_relaxed);
+    const uint64_t ahead_queued = ahead_queued_.load(std::memory_order_relaxed);
+    char b[1024];
     std::snprintf(b, sizeof b,
                   "per frame %.0f draws (%.0f of them depth from w, %.0f not for another projection; %.2f ms "
                   "recording them, %.2f us each), "
@@ -747,7 +753,8 @@ class MetalDevice final : public Device {
                   "order); encoder busy %.0f%% (%.2f ms a frame); in %.0f frames: %llu textures + "
                   "%llu depth buffers created, %llu arena buffers (%.0f MB) + %llu made ahead, %llu shaders (%.1f ms, "
                   "%llu MSL compiles), %llu pipelines compiled while drawing (%.1f ms, max %.1f), "
-                  "%llu built ahead used",
+                  "%llu built ahead used; of the shaders' time %.1f ms translating, %.1f ms compiling MSL; "
+                  "%llu waiting to be built ahead",
                   double(c.draws) / f, double(c.w_draws) / f, double(c.w_other) / f, double(c.draw_ns) / f / 1e6,
                   c.draws ? double(c.draw_ns) / double(c.draws) / 1e3 : 0.0, double(c.ops) / f,
                   double(c.passes) / f, double(c.uploads_ahead) / f, double(c.uploads_in_order) / f,
@@ -758,7 +765,9 @@ class MetalDevice final : public Device {
                   (unsigned long long)c.arena_ahead,
                   (unsigned long long)c.shaders, double(c.shader_ns) / 1e6,
                   (unsigned long long)c.msl_compiles, (unsigned long long)pipes, double(pipe_ns) / 1e6,
-                  double(pipe_max) / 1e6, (unsigned long long)prebuilt);
+                  double(pipe_max) / 1e6, (unsigned long long)prebuilt, double(c.translate_ns) / 1e6,
+                  double(c.library_ns) / 1e6,
+                  (unsigned long long)(ahead_queued > ahead_done ? ahead_queued - ahead_done : 0));
     return b;
   }
 
@@ -1220,6 +1229,7 @@ class MetalDevice final : public Device {
   void Present() override {
     std::lock_guard<std::recursive_mutex> l(mu_);
     {
+      FirstScene();
       EndUpscalerFrame();
       Settle();
       EnsureFrame();
@@ -1324,10 +1334,19 @@ class MetalDevice final : public Device {
       std::string msl = CachedMsl(hash);
       NSError* err = nil;
       bool has_lean = MetalLeanMacros(&msl, vertex);
+      uint64_t t = perf_t0 ? NowNs() : 0;
+      // The time since `t` added to `*ns` (PERF only).
+      auto lap = [&t](uint64_t* ns) {
+        if (!t) return;
+        const uint64_t now = NowNs();
+        *ns += now - t;
+        t = now;
+      };
       id<MTLLibrary> lib = msl.empty() ? nil
                                        : [dev_ newLibraryWithSource:@(msl.c_str())
                                                             options:has_lean ? MslOptions(true) : nil
                                                               error:&err];
+      if (!msl.empty()) lap(&pc_.library_ns);
       if (!lib) {
         std::vector<uint32_t> spirv;
         std::string log;
@@ -1339,9 +1358,11 @@ class MetalDevice final : public Device {
         if (!SpirvToMsl(spirv, &msl, &log)) FatalF("gfx: SPIR-V to MSL: %s", log.c_str());
         if (perf_) pc_.msl_compiles++;
         has_lean = MetalLeanMacros(&msl, vertex);
+        lap(&pc_.translate_ns);
         lib = [dev_ newLibraryWithSource:@(msl.c_str())
                                  options:has_lean ? MslOptions(true) : nil
                                    error:&err];
+        lap(&pc_.library_ns);
         if (lib) CacheMsl(hash, msl);
       }
       if (!lib) {
@@ -1356,7 +1377,7 @@ class MetalDevice final : public Device {
       if (has_lean) {
         NSString* src = @(msl.c_str());
         std::atomic<bool>* closing = &closing_;
-        dispatch_async(AheadQueue(), ^{
+        Ahead(^{
           if (closing->load()) return;
           Lean(hash, src);
         });
@@ -1522,6 +1543,7 @@ class MetalDevice final : public Device {
     }
     depth_used_ = dk.test || dk.write;
     BindDepth(dk);
+    if (dk.write && tri && pass_.w == bb_w_ && pass_.h == bb_h_) frame_depth_draws_++;
 
     // Rasterizer: D3D culls by screen winding, CW (2) or CCW (3); front
     // faces are D3D's (clockwise) whatever is culled, for VFACE and
@@ -3645,6 +3667,51 @@ void main() {
     return q;
   }
 
+  // The first scene: the first frame presented with at least kSceneDraws
+  // depth-writing draws to targets of the back buffer's size (a 3D scene;
+  // loading screens and menus draw few or none), told once, in seconds
+  // since the process started.
+  static constexpr uint32_t kSceneDraws = 100;
+
+  void FirstScene() {
+    const uint32_t n = frame_depth_draws_;
+    frame_depth_draws_ = 0;
+    if (first_scene_ || n < kSceneDraws) return;
+    first_scene_ = true;
+    std::fprintf(stderr, "gfx: first scene at t=%.2f s (since the process started; the device made at t=%.2f s)\n",
+                 ProcessSeconds(), device_made_s_);
+  }
+
+  // Seconds since this process started (its start time from the kernel),
+  // or since the first call if that is not to be had.
+  static double ProcessSeconds() {
+    static const double start = [] {
+      struct kinfo_proc kp {};
+      size_t len = sizeof kp;
+      int mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_PID, getpid()};
+      timeval now{};
+      gettimeofday(&now, nullptr);
+      if (sysctl(mib, 4, &kp, &len, nullptr, 0) == 0 && len == sizeof kp && kp.kp_proc.p_starttime.tv_sec) {
+        const timeval st = kp.kp_proc.p_starttime;
+        // As a point on the steady clock: now less the time since the start.
+        const double ago = double(now.tv_sec - st.tv_sec) + double(now.tv_usec - st.tv_usec) / 1e6;
+        return double(NowNs()) / 1e9 - ago;
+      }
+      return double(NowNs()) / 1e9;
+    }();
+    return double(NowNs()) / 1e9 - start;
+  }
+
+  // `work` on AheadQueue, counted (ahead_queued_, ahead_done_).
+  void Ahead(dispatch_block_t work) {
+    ahead_queued_.fetch_add(1, std::memory_order_relaxed);
+    std::atomic<uint64_t>* done = &ahead_done_;
+    dispatch_async(AheadQueue(), ^{
+      work();
+      done->fetch_add(1, std::memory_order_relaxed);
+    });
+  }
+
   void PrebuildFor(uint64_t hash) {
     auto [lo, hi] = recipe_by_shader_.equal_range(hash);
     for (auto it = lo; it != hi; ++it) {
@@ -3667,7 +3734,7 @@ void main() {
       auto* done = &prebuilt_;
       const uint64_t ps_hash = r.ps;
       std::atomic<bool>* closing = &closing_;
-      dispatch_async(AheadQueue(), ^{
+      Ahead(^{
         if (closing->load()) return;
         if (src) {
           id<MTLFunction> ps = Lean(ps_hash, src);
@@ -4475,6 +4542,9 @@ void main() {
     // Arena buffers: made while drawing, and taken ready (made ahead).
     uint64_t textures = 0, depths = 0, arena_buffers = 0, arena_bytes = 0, arena_ahead = 0;
     uint64_t shaders = 0, shader_ns = 0, msl_compiles = 0;
+    // Of shader_ns: GLSL to SPIR-V to MSL, and Metal's compile of the MSL
+    // (newLibraryWithSource).
+    uint64_t translate_ns = 0, library_ns = 0;
   };
   std::atomic<bool> perf_{false};
   std::atomic<bool> closing_{false};  // the device is going: prebuild blocks do nothing
@@ -4482,6 +4552,14 @@ void main() {
   uint64_t perf_t0_ = 0;
   std::atomic<uint64_t> enc_busy_ns_{0}, pipe_compiles_{0}, pipe_ns_{0}, pipe_max_ns_{0},
       pipe_prebuilt_{0};
+  // Work handed to AheadQueue, and how much of it has run (Ahead): the
+  // difference is its backlog.
+  std::atomic<uint64_t> ahead_queued_{0}, ahead_done_{0};
+  // The first scene (FirstScene): the frame's depth-writing draws to
+  // targets of the back buffer's size, and whether it was reported.
+  uint32_t frame_depth_draws_ = 0;
+  bool first_scene_ = false;
+  double device_made_s_ = 0;  // ProcessSeconds() when Init ran
   static uint64_t NowNs() {
     return uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
                         std::chrono::steady_clock::now().time_since_epoch())
