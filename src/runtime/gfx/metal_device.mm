@@ -1268,6 +1268,7 @@ class MetalDevice final : public Device {
     std::lock_guard<std::recursive_mutex> l(mu_);
     {
       FirstScene();
+      EndBoostLate();
       AdoptFinished();
       EndUpscalerFrame();
       Settle();
@@ -1559,7 +1560,7 @@ class MetalDevice final : public Device {
     } else if (c.has_lean) {
       NSString* src = @(c.msl.c_str());
       std::atomic<bool>* closing = &closing_;
-      Ahead(^{
+      Ahead(hash, ^{
         if (closing->load()) return;
         Lean(hash, src);
       });
@@ -4011,11 +4012,12 @@ void main() {
   // pipeline archive run on it too): one Metal compile at a time. macOS: two
   // lanes, AheadQueue the first (RECOMP_AHEAD_LANES=1..4).
   //
-  // Until the first scene (FirstScene) the work is queued at user-initiated
-  // priority (RECOMP_AHEAD_BOOST=0: not): there is nothing to play yet,
-  // and what is built ahead by then is not compiled while drawing. Work
-  // still waiting when the scene comes is queued again at the lanes' own
-  // background priority (a block keeps the priority it was queued with).
+  // Until the first scene (FirstScene), or for kBoostSeconds at most, the
+  // work is queued at user-initiated priority (RECOMP_AHEAD_BOOST=0: not):
+  // there is nothing to play yet, and what is built ahead by then is not
+  // compiled while drawing. Work still waiting when the boost ends is
+  // queued again at the lanes' own background priority (a block keeps the
+  // priority it was queued with).
   static dispatch_queue_t AheadQueue() {
     static dispatch_queue_t q = dispatch_queue_create(
         "recomp.gfx.ahead",
@@ -4073,11 +4075,28 @@ void main() {
     if (b && *b == '0') ahead_boost_ = false;
   }
 
-  // `work` on the next lane, counted (ahead_queued_, ahead_done_).
-  void Ahead(dispatch_block_t work) {
+  // `work` on a lane, counted (ahead_queued_, ahead_done_): the lane of
+  // `shader` (a pixel shader's Shader::hash), so that the work for one
+  // shader (its lean variant, made once, and the pipelines that use it)
+  // is done in turn, not twice at once.
+  void Ahead(uint64_t shader, dispatch_block_t work) {
     ahead_queued_.fetch_add(1, std::memory_order_relaxed);
-    dispatch_queue_t q = ahead_lanes_.empty() ? AheadQueue() : ahead_lanes_[next_ahead_++ % ahead_lanes_.size()];
+    EndBoostLate();
+    dispatch_queue_t q = ahead_lanes_.empty() ? AheadQueue() : ahead_lanes_[shader % ahead_lanes_.size()];
     QueueAhead(q, work, ahead_boost_.load(), &ahead_boost_, &closing_, &ahead_done_);
+  }
+
+  // The boost ended after kBoostSeconds without a first scene (a game
+  // that draws its scene to targets of another size, or a session in its
+  // menus). Not after a number of presents: loading screens present
+  // thousands a second.
+  static constexpr double kBoostSeconds = 60.0;
+
+  void EndBoostLate() {
+    if (!ahead_boost_.load(std::memory_order_relaxed) || ProcessSeconds() - device_made_s_ < kBoostSeconds) return;
+    ahead_boost_ = false;
+    std::fprintf(stderr, "gfx: no first scene %.0f s after the device was made: work ahead at background priority\n",
+                 kBoostSeconds);
   }
 
   // `work` on lane `q`, `boosted`: at user-initiated priority, and queued
@@ -4124,7 +4143,7 @@ void main() {
       std::atomic<bool>* closing = &closing_;
       std::shared_ptr<PipelineArchive> archive = archive_;
       const uint64_t archive_key = Fnv64(&r, sizeof r);
-      Ahead(^{
+      Ahead(ps_hash, ^{
         if (closing->load()) return;
         if (src) {
           id<MTLFunction> ps = Lean(ps_hash, src);
@@ -4960,8 +4979,7 @@ void main() {
   // difference is its backlog.
   std::atomic<uint64_t> ahead_queued_{0}, ahead_done_{0};
   std::vector<dispatch_queue_t> ahead_lanes_;  // Ahead's (SetUpAheadLanes)
-  size_t next_ahead_ = 0;                      // the game's thread
-  std::atomic<bool> ahead_boost_{true};        // until the first scene
+  std::atomic<bool> ahead_boost_{true};        // until the first scene (EndBoostLate)
   // The first scene (FirstScene): the frame's depth-writing draws to
   // targets of the back buffer's size, and whether it was reported.
   uint32_t frame_depth_draws_ = 0;
