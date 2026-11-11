@@ -71,6 +71,7 @@
 #include "runtime/gfx/smaa/SearchTex.h"
 #include "smaa_hlsl.h"
 #include "runtime/gfx/metal_prelude.h"
+#include "runtime/gfx/rcas.h"
 #include "runtime/gfx/reversed_z.h"
 #include "runtime/gfx/shader_compile.h"
 #include "runtime/log.h"
@@ -424,26 +425,6 @@ kernel void taa_cs(texture2d<half, access::read> color [[texture(0)]],
   history_out.write(o, gid);
   if (p.direct != 0) out.write(o, gid);
 }
-
-// Sharpening after TAA, contrast-adaptive (after AMD's CAS): the cross of
-// neighbours pulled away from the centre, less where the local contrast
-// is already high (no halos on edges). sharpness 0..1.
-kernel void taa_sharpen_cs(texture2d<half, access::read> src [[texture(0)]],
-                           texture2d<half, access::write> out [[texture(1)]],
-                           constant float& sharpness [[buffer(0)]], uint2 gid [[thread_position_in_grid]]) {
-  const uint2 size = uint2(src.get_width(), src.get_height());
-  if (gid.x >= size.x || gid.y >= size.y) return;
-  const int2 last = int2(size) - 1, g = int2(gid);
-  const half3 e = src.read(gid).rgb;
-  const half3 b = src.read(uint2(clamp(g + int2(0, -1), 0, last))).rgb;
-  const half3 d = src.read(uint2(clamp(g + int2(-1, 0), 0, last))).rgb;
-  const half3 f = src.read(uint2(clamp(g + int2(1, 0), 0, last))).rgb;
-  const half3 h = src.read(uint2(clamp(g + int2(0, 1), 0, last))).rgb;
-  const half3 mn = min(e, min(min(b, d), min(f, h))), mx = max(e, max(max(b, d), max(f, h)));
-  const half3 amp = sqrt(saturate(min(mn, 2.0h - mx) / max(mx, 1.0e-4h)));
-  const half3 w = amp * half(-1.0f / mix(8.0f, 5.0f, sharpness));
-  out.write(half4(saturate((e + (b + d + f + h) * w) / (1.0h + 4.0h * w)), 1.0h), gid);
-}
 )";
 
 constexpr uint32_t kClearVs = 0x80000001, kClearPs = 0x80000002;
@@ -508,7 +489,9 @@ class MetalDevice final : public Device {
       MakeSpareChunks(kSlots);
 
       NSError* err = nil;
-      id<MTLLibrary> lib = [dev_ newLibraryWithSource:@(kInternalMsl) options:nil error:&err];
+      id<MTLLibrary> lib = [dev_ newLibraryWithSource:@((std::string(kInternalMsl) + kRcasMsl).c_str())
+                                                options:nil
+                                                  error:&err];
       if (!lib) FatalF("gfx: the device's own shaders: %s", err.localizedDescription.UTF8String);
       internal_lib_ = lib;
       LoadRecipes();
@@ -531,10 +514,13 @@ class MetalDevice final : public Device {
         else if (!std::strcmp(u, "bilinear")) upscaler_ = Upscaler::Bilinear;
         else if (!std::strcmp(u, "metalfx-spatial")) upscaler_ = Upscaler::MetalFXSpatial;
       }
-      // RECOMP_TAA_SHARPNESS=0..1 (default 0.5): sharpening after TAA (0:
-      // none).
-      if (const char* sh = std::getenv("RECOMP_TAA_SHARPNESS"))
-        taa_sharpness_ = std::clamp(float(std::atof(sh)), 0.0f, 1.0f);
+      // RECOMP_SHARPNESS=0..1 (default 0.5): sharpening (RCAS, rcas.h)
+      // after TAA and after either MetalFX upscale, before the HUD (0:
+      // none). RECOMP_TAA_SHARPNESS, its older name, if it is not set: its
+      // values (once for a different filter) read on the same scale.
+      const char* sh = std::getenv("RECOMP_SHARPNESS");
+      if (!sh) sh = std::getenv("RECOMP_TAA_SHARPNESS");
+      if (sh) sharpness_ = std::clamp(float(std::atof(sh)), 0.0f, 1.0f);
       // RECOMP_MFX_SIGNS=jx,jy,mv: the jitter's and motion's signs as given
       // to MetalFX (for checking conventions).
       if (const char* g = std::getenv("RECOMP_MFX_SIGNS"))
@@ -1983,15 +1969,13 @@ class MetalDevice final : public Device {
   // output.
   bool EnsureTaa() {
     if (!(backbuffer_.usage & MTLTextureUsageShaderWrite)) return false;
+    if (!EnsureSharpen()) return false;
     const NSUInteger w = NSUInteger(bb_w_), h = NSUInteger(bb_h_);
     if (taa_pipe_ && taa_src_.width == w && taa_src_.height == h) return true;
     if (!taa_pipe_) {
       NSError* err = nil;
       taa_pipe_ = [dev_ newComputePipelineStateWithFunction:[internal_lib_ newFunctionWithName:@"taa_cs"] error:&err];
       if (!taa_pipe_) FatalF("gfx: TAA pipeline: %s", err.localizedDescription.UTF8String);
-      taa_sharpen_pipe_ = [dev_ newComputePipelineStateWithFunction:[internal_lib_ newFunctionWithName:@"taa_sharpen_cs"]
-                                                              error:&err];
-      if (!taa_sharpen_pipe_) FatalF("gfx: TAA sharpening pipeline: %s", err.localizedDescription.UTF8String);
     }
     for (int i = 0; i < 2; i++) {
       if (taa_history_[i]) Keep(taa_history_[i]);
@@ -2013,16 +1997,41 @@ class MetalDevice final : public Device {
     taa_src_ = [dev_ newTextureWithDescriptor:td];
     fx_reset_ = true;
     std::fprintf(stderr, "gfx: TAA %lux%lu, sharpening %.2f, texture LOD bias %.1f\n", (unsigned long)w,
-                 (unsigned long)h, taa_sharpness_, kTaaLodBias);
+                 (unsigned long)h, sharpness_, kTaaLodBias);
     return true;
+  }
+
+  // RCAS's pipeline (rcas.h), made once; true without it when sharpening
+  // is off. Sharpening writes the back buffer from a compute pass: false
+  // if the back buffer cannot take that.
+  bool EnsureSharpen() {
+    if (!RcasActive(sharpness_) || rcas_pipe_) return true;
+    if (!(backbuffer_.usage & MTLTextureUsageShaderWrite)) return false;
+    NSError* err = nil;
+    rcas_pipe_ = [dev_ newComputePipelineStateWithFunction:[internal_lib_ newFunctionWithName:@"rcas_cs"] error:&err];
+    if (!rcas_pipe_) FatalF("gfx: sharpening pipeline: %s", err.localizedDescription.UTF8String);
+    return true;
+  }
+
+  // RCAS from src into the back buffer (the same size), in the frame's
+  // command buffer, before the HUD.
+  void EncodeSharpen(id<MTLTexture> src, id<MTLTexture> back, float con) {
+    id<MTLComputeCommandEncoder> e = [cmd_ computeCommandEncoder];
+    [e setComputePipelineState:rcas_pipe_];
+    [e setTexture:src atIndex:0];
+    [e setTexture:back atIndex:1];
+    [e setBytes:&con length:sizeof con atIndex:0];
+    [e dispatchThreads:MTLSizeMake(back.width, back.height, 1) threadsPerThreadgroup:MTLSizeMake(16, 8, 1)];
+    [e endEncoding];
   }
 
   // The upscaler for low_color_'s size to the back buffer's, and its
   // inputs' textures. False if MetalFX cannot (bilinear then). It writes
   // into the back buffer itself where that allows (made so for MetalFX),
-  // else into fx_out_, copied there.
+  // else into fx_out_, copied there; with sharpening, always into fx_out_,
+  // which RCAS reads into the back buffer.
   bool EnsureScaler() {
-    if (scaler_failed_) return false;
+    if (scaler_failed_ || !EnsureSharpen()) return false;
     const NSUInteger iw = low_color_.width, ih = low_color_.height;
     if (scaler_ && scaler_.inputWidth == iw && scaler_.inputHeight == ih &&
         scaler_.outputWidth == NSUInteger(bb_w_) && scaler_.outputHeight == NSUInteger(bb_h_))
@@ -2062,7 +2071,9 @@ class MetalDevice final : public Device {
                         MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead | sc.motionTextureUsage);
       fx_depth_ = tex(MTLPixelFormatDepth32Float, iw, ih,
                       MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead | sc.depthTextureUsage);
-      if ((backbuffer_.usage & sc.outputTextureUsage) != sc.outputTextureUsage)
+      // Sharpened, MetalFX writes fx_out_ and RCAS reads it into the back
+      // buffer.
+      if (RcasActive(sharpness_) || (backbuffer_.usage & sc.outputTextureUsage) != sc.outputTextureUsage)
         fx_out_ = tex(MTLPixelFormatBGRA8Unorm, NSUInteger(bb_w_), NSUInteger(bb_h_),
                       MTLTextureUsageShaderRead | sc.outputTextureUsage);
       if (!motion_pipe_) {
@@ -2077,7 +2088,8 @@ class MetalDevice final : public Device {
       }
       fx_reset_ = true;
       std::fprintf(stderr, "gfx: MetalFX temporal scaler %lux%lu -> %dx%d%s\n", (unsigned long)iw,
-                   (unsigned long)ih, bb_w_, bb_h_, fx_out_ ? " (then copied)" : "");
+                   (unsigned long)ih, bb_w_, bb_h_, fx_out_ && !RcasActive(sharpness_) ? " (then copied)" : "");
+      if (RcasActive(sharpness_)) std::fprintf(stderr, "gfx: sharpening %.2f after MetalFX (temporal)\n", sharpness_);
       return true;
     }
     scaler_failed_ = true;
@@ -2086,9 +2098,10 @@ class MetalDevice final : public Device {
 
   // MetalFX's spatial scaler for low_color_'s size to the back buffer's,
   // and the SMAA'd composite it reads (spatial_in_), its output into the
-  // back buffer. False if MetalFX cannot (bilinear then).
+  // back buffer (with sharpening, into spatial_out_, which RCAS reads
+  // into the back buffer). False if MetalFX cannot (bilinear then).
   bool EnsureSpatial() {
-    if (spatial_failed_) return false;
+    if (spatial_failed_ || !EnsureSharpen()) return false;
     const NSUInteger iw = low_color_.width, ih = low_color_.height;
     if (spatial_ && spatial_.inputWidth == iw && spatial_.inputHeight == ih &&
         spatial_.outputWidth == NSUInteger(bb_w_) && spatial_.outputHeight == NSUInteger(bb_h_))
@@ -2118,7 +2131,7 @@ class MetalDevice final : public Device {
       td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead | sc.colorTextureUsage;
       spatial_in_ = [dev_ newTextureWithDescriptor:td];
       spatial_out_ = nil;
-      if ((backbuffer_.usage & sc.outputTextureUsage) != sc.outputTextureUsage) {
+      if (RcasActive(sharpness_) || (backbuffer_.usage & sc.outputTextureUsage) != sc.outputTextureUsage) {
         td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
                                                                 width:NSUInteger(bb_w_)
                                                                height:NSUInteger(bb_h_)
@@ -2128,7 +2141,8 @@ class MetalDevice final : public Device {
         spatial_out_ = [dev_ newTextureWithDescriptor:td];
       }
       std::fprintf(stderr, "gfx: MetalFX spatial scaler %lux%lu -> %dx%d%s\n", (unsigned long)iw,
-                   (unsigned long)ih, bb_w_, bb_h_, spatial_out_ ? " (then copied)" : "");
+                   (unsigned long)ih, bb_w_, bb_h_, spatial_out_ && !RcasActive(sharpness_) ? " (then copied)" : "");
+      if (RcasActive(sharpness_)) std::fprintf(stderr, "gfx: sharpening %.2f after MetalFX (spatial)\n", sharpness_);
       return true;
     }
     spatial_failed_ = true;
@@ -2362,11 +2376,11 @@ void main() {
       tp.w_max = 0.2f;
       tp.w_per_px = 0.1f;
       tp.gamma = 1.0f;
-      const float sharp = taa_sharpness_;
-      tp.direct = sharp > 0.0f ? 0 : 1;
+      const float sharp = sharpness_, con = RcasConstant(sharp);
+      tp.direct = RcasActive(sharp) ? 0 : 1;
       __unsafe_unretained id<MTLTexture> depth = scene_depth_, h_in = taa_history_[taa_cur_],
                                          h_out = taa_history_[taa_cur_ ^ 1], src = taa_src_;
-      __unsafe_unretained id<MTLComputePipelineState> pipe = taa_pipe_, sharpen = taa_sharpen_pipe_;
+      __unsafe_unretained id<MTLComputePipelineState> pipe = taa_pipe_, sharpen = rcas_pipe_;
       taa_cur_ ^= 1;
       Rec([=, this] {
         // The composite, then resolved from that copy into the back buffer.
@@ -2382,11 +2396,11 @@ void main() {
         [e setTexture:back atIndex:4];
         [e setBytes:&tp length:sizeof tp atIndex:0];
         [e dispatchThreads:MTLSizeMake(NSUInteger(lw), NSUInteger(lh), 1) threadsPerThreadgroup:MTLSizeMake(16, 8, 1)];
-        if (sharp > 0.0f) {  // the same encoder: Metal orders the two dispatches' texture use
+        if (RcasActive(sharp)) {  // the same encoder: Metal orders the two dispatches' texture use
           [e setComputePipelineState:sharpen];
           [e setTexture:h_out atIndex:0];
           [e setTexture:back atIndex:1];
-          [e setBytes:&sharp length:sizeof sharp atIndex:0];
+          [e setBytes:&con length:sizeof con atIndex:0];
           [e dispatchThreads:MTLSizeMake(NSUInteger(lw), NSUInteger(lh), 1)
               threadsPerThreadgroup:MTLSizeMake(16, 8, 1)];
         }
@@ -2406,6 +2420,7 @@ void main() {
       __unsafe_unretained id<MTLFXTemporalScaler> sc = scaler_;
       const float jx = jitter_[0] * jitter_sign_[0], jy = jitter_[1] * jitter_sign_[1];
       const float mvs = mv_sign_;
+      const float con = RcasActive(sharpness_) ? RcasConstant(sharpness_) : 0.0f;
       Rec([=, this] {
         // Motion, and the depth MetalFX takes, in one pass.
         MTLRenderPassDescriptor* rp = [MTLRenderPassDescriptor renderPassDescriptor];
@@ -2434,6 +2449,7 @@ void main() {
         sc.reset = reset;
         [sc encodeToCommandBuffer:cmd_];
         if (out == back) return;
+        if (con > 0.0f) return EncodeSharpen(out, back, con);
         id<MTLBlitCommandEncoder> bl = [cmd_ blitCommandEncoder];
         [bl copyFromTexture:out toTexture:back];
         [bl endEncoding];
@@ -2443,11 +2459,13 @@ void main() {
       SmaaEncode(low, spatial_in_);
       __unsafe_unretained id<MTLTexture> in = spatial_in_, out = spatial_out_ ? spatial_out_ : back;
       __unsafe_unretained id<MTLFXSpatialScaler> sc = spatial_;
+      const float con = RcasActive(sharpness_) ? RcasConstant(sharpness_) : 0.0f;
       Rec([=, this] {
         sc.colorTexture = in;
         sc.outputTexture = out;
         [sc encodeToCommandBuffer:cmd_];
         if (out == back) return;
+        if (con > 0.0f) return EncodeSharpen(out, back, con);
         id<MTLBlitCommandEncoder> bl = [cmd_ blitCommandEncoder];
         [bl copyFromTexture:out toTexture:back];
         [bl endEncoding];
@@ -4390,8 +4408,8 @@ void main() {
   bool scaler_failed_ = false, fx_reset_ = true;
   id<MTLTexture> motion_tex_ = nil, fx_depth_ = nil, fx_out_ = nil;
   id<MTLRenderPipelineState> motion_pipe_ = nil;
-  id<MTLComputePipelineState> taa_pipe_ = nil, taa_sharpen_pipe_ = nil;
-  float taa_sharpness_ = 0.5f;  // RECOMP_TAA_SHARPNESS
+  id<MTLComputePipelineState> taa_pipe_ = nil, rcas_pipe_ = nil;  // EnsureTaa; EnsureSharpen
+  float sharpness_ = 0.5f;  // RECOMP_SHARPNESS
   // The scene's textures under TAA: a mip sharper, as FSR 2 and DLSS
   // advise for temporal antialiasing (log2(render / display) - 1; the
   // accumulated jittered samples keep it from aliasing).
