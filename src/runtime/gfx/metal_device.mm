@@ -500,6 +500,7 @@ class MetalDevice final : public Device {
                                                   error:&err];
       if (!lib) FatalF("gfx: the device's own shaders: %s", err.localizedDescription.UTF8String);
       internal_lib_ = lib;
+      SetUpAheadLanes();
       LoadRecipes();
       LoadMslCache();
       SetUpShaderLanes();
@@ -673,7 +674,10 @@ class MetalDevice final : public Device {
     step("the encoding thread");
     if (last_cb_) [last_cb_ waitUntilCompleted];
     step("the GPU");
-    dispatch_sync(AheadQueue(), ^{});
+    // Twice: work queued again at background priority while the first pass
+    // ran (QueueAhead) is done by the second.
+    for (int pass = 0; pass < 2; pass++)
+      for (dispatch_queue_t q : ahead_lanes_) dispatch_sync(q, ^{});
     step("the build ahead");
     // The shader lanes likewise: a compile running is waited for, those
     // queued do nothing (shader_jobs_ closed).
@@ -3998,13 +4002,20 @@ void main() {
     return Fnv64(&r, sizeof r);
   }
 
-  // A shader of `hash` was made or compiled: the recipes it completes,
-  // compiled in the background.
   // Work done ahead (pipelines from earlier runs' recipes, lean shader
-  // variants): one at a time, at background priority. On the global queues
-  // GCD ran one per core: on an iPad the first run with a Mac's 1,700
-  // recipes compiled on every core at once (and Metal's compiler service
-  // at their priority) and the game crawled for minutes.
+  // variants): on serial lanes at background priority (Ahead), never on
+  // the global queues: there GCD ran one per core, and on an iPad the first
+  // run with a Mac's 1,700 recipes compiled on every core at once (and
+  // Metal's compiler service at their priority) and the game crawled for
+  // minutes. iOS and tvOS: one lane, AheadQueue (the shader lanes and the
+  // pipeline archive run on it too): one Metal compile at a time. macOS: two
+  // lanes, AheadQueue the first (RECOMP_AHEAD_LANES=1..4).
+  //
+  // Until the first scene (FirstScene) the work is queued at user-initiated
+  // priority (RECOMP_AHEAD_BOOST=0: not): there is nothing to play yet,
+  // and what is built ahead by then is not compiled while drawing. Work
+  // still waiting when the scene comes is queued again at the lanes' own
+  // background priority (a block keeps the priority it was queued with).
   static dispatch_queue_t AheadQueue() {
     static dispatch_queue_t q = dispatch_queue_create(
         "recomp.gfx.ahead",
@@ -4023,6 +4034,7 @@ void main() {
     frame_depth_draws_ = 0;
     if (first_scene_ || n < kSceneDraws) return;
     first_scene_ = true;
+    ahead_boost_ = false;  // the work ahead back to background priority
     std::fprintf(stderr, "gfx: first scene at t=%.2f s (since the process started; the device made at t=%.2f s)\n",
                  ProcessSeconds(), device_made_s_);
   }
@@ -4047,14 +4059,42 @@ void main() {
     return double(NowNs()) / 1e9 - start;
   }
 
-  // `work` on AheadQueue, counted (ahead_queued_, ahead_done_).
+  void SetUpAheadLanes() {
+    ahead_lanes_.push_back(AheadQueue());
+#if TARGET_OS_OSX
+    int n = 2;
+    if (const char* e = std::getenv("RECOMP_AHEAD_LANES")) n = std::clamp(std::atoi(e), 1, 4);
+    for (int i = 1; i < n; i++)
+      ahead_lanes_.push_back(dispatch_queue_create(
+          "recomp.gfx.ahead",
+          dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_BACKGROUND, 0)));
+#endif
+    const char* b = std::getenv("RECOMP_AHEAD_BOOST");
+    if (b && *b == '0') ahead_boost_ = false;
+  }
+
+  // `work` on the next lane, counted (ahead_queued_, ahead_done_).
   void Ahead(dispatch_block_t work) {
     ahead_queued_.fetch_add(1, std::memory_order_relaxed);
-    std::atomic<uint64_t>* done = &ahead_done_;
-    dispatch_async(AheadQueue(), ^{
+    dispatch_queue_t q = ahead_lanes_.empty() ? AheadQueue() : ahead_lanes_[next_ahead_++ % ahead_lanes_.size()];
+    QueueAhead(q, work, ahead_boost_.load(), &ahead_boost_, &closing_, &ahead_done_);
+  }
+
+  // `work` on lane `q`, `boosted`: at user-initiated priority, and queued
+  // again without it if it is still waiting once `boost` is off (but not
+  // when closing: the device's drain of the lanes is to find it done).
+  static void QueueAhead(dispatch_queue_t q, dispatch_block_t work, bool boosted, std::atomic<bool>* boost,
+                         std::atomic<bool>* closing, std::atomic<uint64_t>* done) {
+    dispatch_block_t run = ^{
+      if (boosted && !boost->load() && !closing->load()) {
+        QueueAhead(q, work, false, boost, closing, done);
+        return;
+      }
       work();
       done->fetch_add(1, std::memory_order_relaxed);
-    });
+    };
+    if (boosted) run = dispatch_block_create_with_qos_class(DISPATCH_BLOCK_ENFORCE_QOS_CLASS, QOS_CLASS_USER_INITIATED, 0, run);
+    dispatch_async(q, run);
   }
 
   void PrebuildFor(uint64_t hash) {
@@ -4919,6 +4959,9 @@ void main() {
   // Work handed to AheadQueue, and how much of it has run (Ahead): the
   // difference is its backlog.
   std::atomic<uint64_t> ahead_queued_{0}, ahead_done_{0};
+  std::vector<dispatch_queue_t> ahead_lanes_;  // Ahead's (SetUpAheadLanes)
+  size_t next_ahead_ = 0;                      // the game's thread
+  std::atomic<bool> ahead_boost_{true};        // until the first scene
   // The first scene (FirstScene): the frame's depth-writing draws to
   // targets of the back buffer's size, and whether it was reported.
   uint32_t frame_depth_draws_ = 0;
