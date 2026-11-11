@@ -196,6 +196,39 @@ thread_local std::exception_ptr t_fault_exception;
   std::rethrow_exception(e);
 }
 
+// A pipe the fault report copies memory through: write() fails (EFAULT)
+// on memory that cannot be read, where a load would fault again.
+int g_probe_pipe[2] = {-1, -1};
+
+// `n` bytes at `p` copied to `out`, if they can be read; signal-safe.
+bool SafeRead(uintptr_t p, void* out, size_t n) {
+  if (g_probe_pipe[1] < 0 || !p) return false;
+  if (write(g_probe_pipe[1], reinterpret_cast<const void*>(p), n) != ssize_t(n)) return false;
+  return read(g_probe_pipe[0], out, n) == ssize_t(n);
+}
+
+// The interrupted thread's frames, from its frame pointer then (the
+// handler's own backtrace starts on the signal stack and can stop at the
+// faulting function): return addresses while the chain reads and climbs.
+void WriteInterruptedFrames(const platform::FaultContext& fc) {
+  uintptr_t fp = fc.fp;
+  void* rets[32];
+  int n = 0;
+  for (; n < 32; n++) {
+    uintptr_t rec[2];  // the saved frame pointer and return address
+    if (!SafeRead(fp, rec, sizeof rec) || !rec[1]) break;
+    rets[n] = reinterpret_cast<void*>(rec[1]);
+    if (rec[0] <= fp) {
+      n++;
+      break;
+    }
+    fp = rec[0];
+  }
+  const char head[] = "  the interrupted thread's frames (from its frame pointer):\n";
+  (void)!write(2, head, sizeof head - 1);
+  backtrace_symbols_fd(rets, n, 2);
+}
+
 void FaultHandler(int sig, siginfo_t* si, void* uc) {
   char buf[256];
   uintptr_t a = reinterpret_cast<uintptr_t>(si->si_addr);
@@ -246,6 +279,28 @@ void FaultHandler(int sig, siginfo_t* si, void* uc) {
   n = std::snprintf(buf, sizeof buf, "  thread '%s', pc %p, caller:\n", name,
                     reinterpret_cast<void*>(fc.pc));
   (void)!write(2, buf, size_t(n));
+  // Which thread: a guest one (its id), the main one, or another; where
+  // its stack pointer was, and the stack the system has for it.
+  {
+    const Thread* gt = CurrentThread();
+    char who[48];
+    if (gt) std::snprintf(who, sizeof who, "guest thread %04X", gt->tid);
+#if defined(__APPLE__)
+    else if (pthread_main_np()) std::snprintf(who, sizeof who, "the main thread");
+#endif
+    else std::snprintf(who, sizeof who, "not a guest thread");
+#if defined(__APPLE__)
+    const uintptr_t top = uintptr_t(pthread_get_stackaddr_np(pthread_self()));
+    const uintptr_t bottom = top - pthread_get_stacksize_np(pthread_self());
+    n = std::snprintf(buf, sizeof buf, "  %s, sp %p fp %p, its stack %p-%p\n", who,
+                      reinterpret_cast<void*>(fc.sp), reinterpret_cast<void*>(fc.fp),
+                      reinterpret_cast<void*>(bottom), reinterpret_cast<void*>(top));
+#else
+    n = std::snprintf(buf, sizeof buf, "  %s, sp %p fp %p\n", who, reinterpret_cast<void*>(fc.sp),
+                      reinterpret_cast<void*>(fc.fp));
+#endif
+    (void)!write(2, buf, size_t(n));
+  }
   // A call through a null pointer leaves pc 0: the caller (the return
   // address in [sp] or the link register) still shows where it was.
   if (fc.caller) {
@@ -255,6 +310,7 @@ void FaultHandler(int sig, siginfo_t* si, void* uc) {
   void* frames[48];
   int nf = backtrace(frames, 48);
   backtrace_symbols_fd(frames, nf, 2);
+  WriteInterruptedFrames(fc);
   _exit(4);
 }
 }  // namespace
@@ -282,6 +338,7 @@ void InstallSignalStack() {
 namespace {
 void InstallFaultHandler() {
   InstallSignalStack();
+  if (g_probe_pipe[0] < 0 && pipe(g_probe_pipe) != 0) g_probe_pipe[0] = g_probe_pipe[1] = -1;
   struct sigaction sa{};
   sa.sa_sigaction = FaultHandler;
   // SA_NODEFER: a fault inside a guest exception filter must be

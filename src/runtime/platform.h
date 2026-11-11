@@ -125,6 +125,9 @@ struct FaultContext {
   // registers show it: [sp] on x86-64 at a call through null, the link
   // register on arm64. 0 when unknown.
   uintptr_t caller = 0;
+  // The frame pointer and stack pointer then (0 when unknown): the fault
+  // report walks the interrupted thread's frames from them.
+  uintptr_t fp = 0, sp = 0;
 };
 FaultContext ReadFaultContext(const void* uc);
 
