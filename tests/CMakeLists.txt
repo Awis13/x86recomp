@@ -242,6 +242,20 @@ if(APPLE)
   set_tests_properties(metal_rcas PROPERTIES SKIP_RETURN_CODE 77)
 endif()
 
+# metal_archive_test: pipelines kept compiled between runs on the Metal
+# backend (gfx/metal_archive.h): found in a later archive, a damaged shard,
+# another scope, the shard cap (skipped without a Metal device); macOS.
+if(APPLE)
+  add_executable(metal_archive_test metal_archive_test.mm
+                 "${PROJECT_SOURCE_DIR}/src/runtime/gfx/metal_archive.mm")
+  set_source_files_properties(metal_archive_test.mm "${PROJECT_SOURCE_DIR}/src/runtime/gfx/metal_archive.mm"
+    PROPERTIES COMPILE_OPTIONS "-fobjc-arc;-std=c++20")
+  target_include_directories(metal_archive_test PRIVATE "${PROJECT_SOURCE_DIR}/src")
+  target_link_libraries(metal_archive_test PRIVATE "-framework Metal" "-framework Foundation")
+  add_test(NAME metal_archive COMMAND metal_archive_test)
+  set_tests_properties(metal_archive PROPERTIES SKIP_RETURN_CODE 77)
+endif()
+
 # lift_flags_test: programs whose flags cross calls, returns, tail calls
 # and indirect calls, lifted with the lifter's flag analysis and with
 # every flag spilled (recomp_lift --flags-test), must behave the same;

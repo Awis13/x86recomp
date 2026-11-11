@@ -69,6 +69,7 @@
 #include <vector>
 
 #include "runtime/gfx/device.h"
+#include "runtime/gfx/metal_archive.h"
 // kSmaaHlsl: SMAA.hlsl (smaa/, MIT), and its lookup textures.
 #include "runtime/gfx/smaa/AreaTex.h"
 #include "runtime/gfx/smaa/SearchTex.h"
@@ -502,6 +503,7 @@ class MetalDevice final : public Device {
       LoadRecipes();
       LoadMslCache();
       SetUpShaderLanes();
+      SetUpArchive();
       MTLDepthStencilDescriptor* dd = [MTLDepthStencilDescriptor new];
       dd.depthCompareFunction = MTLCompareFunctionAlways;
       dd.depthWriteEnabled = YES;
@@ -673,6 +675,9 @@ class MetalDevice final : public Device {
     // queued do nothing (shader_jobs_ closed).
     for (dispatch_queue_t q : lanes_) dispatch_sync(q, ^{});
     step("the shader lanes");
+    // What was added to the pipeline archive saved, waited for 2 s at most.
+    if (archive_) archive_->Close(2.0);
+    step("the pipeline archive");
     StopDisplayLink();
     if (view_) SDL_Metal_DestroyView(view_);
   }
@@ -753,7 +758,7 @@ class MetalDevice final : public Device {
     const uint64_t ahead_done = ahead_done_.load(std::memory_order_relaxed);
     const uint64_t ahead_queued = ahead_queued_.load(std::memory_order_relaxed);
     char b[1024];
-    std::snprintf(b, sizeof b,
+    int len = std::snprintf(b, sizeof b,
                   "per frame %.0f draws (%.0f of them depth from w, %.0f not for another projection; %.2f ms "
                   "recording them, %.2f us each), "
                   "%.0f recorded ops, "
@@ -779,7 +784,21 @@ class MetalDevice final : public Device {
                   (unsigned long long)(ahead_queued > ahead_done ? ahead_queued - ahead_done : 0),
                   (unsigned long long)c.first_drawn, (unsigned long long)c.joins, double(c.join_ns) / 1e6,
                   (unsigned long long)c.ahead_compiles, double(c.ahead_ns) / 1e6, shader_jobs_.Pending());
-    return b;
+    std::string out(b, size_t(std::clamp(len, 0, int(sizeof b) - 1)));
+    if (archive_) {
+      // Lookups in the pipeline archive (found or not, and the time the
+      // misses cost), what was added in all and is still to be added, and
+      // its last save.
+      const PipelineArchive::Stats a = archive_->TakeStats();
+      std::snprintf(b, sizeof b,
+                    "; pipeline archive: %zu shards, %llu found, %llu missed (%.1f ms), %llu added, %llu to add, "
+                    "last saved in %.0f ms (%.1f MB)",
+                    a.shards, (unsigned long long)a.hits, (unsigned long long)a.misses, double(a.miss_ns) / 1e6,
+                    (unsigned long long)a.added, (unsigned long long)a.pending, a.save_ms,
+                    double(a.save_bytes) / 1048576.0);
+      out += b;
+    }
+    return out;
   }
 
   double TakeGpuFrameMs() override {
@@ -3722,7 +3741,8 @@ void main() {
       MTLRenderPipelineDescriptor* pd = Describe(k, enc_shaders_.at(k.vs), ps);
       NSError* err = nil;
       const auto t0 = std::chrono::steady_clock::now();
-      id<MTLRenderPipelineState> p = [dev_ newRenderPipelineStateWithDescriptor:pd error:&err];
+      id<MTLRenderPipelineState> p = archive_ ? archive_->Build(pd, ArchiveKey(k), &err)
+                                              : [dev_ newRenderPipelineStateWithDescriptor:pd error:&err];
       if (!p) FatalF("gfx: render pipeline: %s", err.localizedDescription.UTF8String);
       // Compiling while drawing stalls the frame: the slow ones are named.
       const double ms =
@@ -3784,6 +3804,14 @@ void main() {
     uint64_t h = 0xCBF29CE484222325ull;
     for (size_t i = 0; i < n; i++) h = (h ^ static_cast<const uint8_t*>(p)[i]) * 0x100000001B3ull;
     return h;
+  }
+
+  // The recipe of a pipeline of key `k` whose shaders' translations are
+  // `vs` and `ps` (the key without the run's shader ids).
+  static Recipe RecipeOf(uint64_t vs, uint64_t ps, const PipeKey& k) {
+    Recipe r{vs, ps, k};
+    r.key.vs = r.key.ps = 0;
+    return r;
   }
 
   static std::string RecipePath() {
@@ -3888,12 +3916,46 @@ void main() {
   void RecordRecipe(const PipeKey& k) {
     auto vh = enc_shader_hash_.find(k.vs), ph = enc_shader_hash_.find(k.ps);
     if (vh == enc_shader_hash_.end() || ph == enc_shader_hash_.end() || !vh->second || !ph->second) return;
-    Recipe r{vh->second, ph->second, k};
-    r.key.vs = r.key.ps = 0;
+    Recipe r = RecipeOf(vh->second, ph->second, k);
     std::lock_guard<std::mutex> l(recipe_mu_);
     if (!recipe_file_ || !recipe_known_.insert(Fnv64(&r, sizeof r)).second) return;
     std::fwrite(&r, sizeof r, 1, recipe_file_);
     std::fflush(recipe_file_);
+  }
+
+  // ---- the pipeline archive (metal_archive.h): pipelines kept compiled
+  // between runs, in metal-archives-v1/ next to the recipes. Pipeline and
+  // PrebuildFor look there first and add what they had to compile.
+  // RECOMP_PIPELINE_ARCHIVE=0: none (pipelines compiled as before). On
+  // iOS and tvOS its work runs on AheadQueue, one thing at a time with the
+  // compiles ahead (as the shader lanes there); on macOS on a queue of its
+  // own at utility priority.
+  void SetUpArchive() {
+    const char* e = std::getenv("RECOMP_PIPELINE_ARCHIVE");
+    if (e && *e == '0') {
+      std::fprintf(stderr, "gfx: no pipeline archive (RECOMP_PIPELINE_ARCHIVE=0)\n");
+      return;
+    }
+    PipelineArchive::Options o;
+    o.dir = [[NSString stringWithUTF8String:RecipePath().c_str()].stringByDeletingLastPathComponent
+               stringByAppendingPathComponent:@"metal-archives-v1"]
+                .fileSystemRepresentation;
+#if TARGET_OS_IOS || TARGET_OS_TV
+    o.target = AheadQueue();
+    // Each save writes the whole shard (tens of MB): fewer of them there.
+    o.save_idle_s = 15.0;
+#endif
+    archive_ = PipelineArchive::Open(dev_, std::move(o));
+  }
+
+  // On the encoding thread: the archive's name for the pipeline of `k`,
+  // its recipe's (the device's own shaders, which have no translation, by
+  // their fixed ids).
+  uint64_t ArchiveKey(const PipeKey& k) const {
+    auto vh = enc_shader_hash_.find(k.vs), ph = enc_shader_hash_.find(k.ps);
+    const Recipe r = RecipeOf(vh != enc_shader_hash_.end() && vh->second ? vh->second : k.vs,
+                              ph != enc_shader_hash_.end() && ph->second ? ph->second : k.ps, k);
+    return Fnv64(&r, sizeof r);
   }
 
   // A shader of `hash` was made: the recipes it completes, compiled in the
@@ -3979,6 +4041,8 @@ void main() {
       auto* done = &prebuilt_;
       const uint64_t ps_hash = r.ps;
       std::atomic<bool>* closing = &closing_;
+      std::shared_ptr<PipelineArchive> archive = archive_;
+      const uint64_t archive_key = Fnv64(&r, sizeof r);
       Ahead(^{
         if (closing->load()) return;
         if (src) {
@@ -3987,7 +4051,8 @@ void main() {
           pd.fragmentFunction = ps;
         }
         NSError* err = nil;
-        id<MTLRenderPipelineState> p = [dev newRenderPipelineStateWithDescriptor:pd error:&err];
+        id<MTLRenderPipelineState> p = archive ? archive->Build(pd, archive_key, &err)
+                                               : [dev newRenderPipelineStateWithDescriptor:pd error:&err];
         if (!p) return;
         std::lock_guard<std::mutex> l(*mu);
         (*done)[k] = p;
@@ -4756,6 +4821,7 @@ void main() {
   std::mutex lean_mu_;
   std::unordered_map<uint64_t, id<MTLFunction>> lean_;  // by Shader::hash (Lean)
   std::string recipe_path_;
+  std::shared_ptr<PipelineArchive> archive_;  // set in Init; null: none
   FILE* recipe_file_ = nullptr;
   std::unordered_map<uint64_t, std::shared_ptr<const std::string>> msl_cache_;  // recording side (CreateShader)
   // Shaders compiled when first drawn (MakeShader): the jobs, by Shader::hash
