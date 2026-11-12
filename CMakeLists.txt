@@ -190,7 +190,9 @@ if(FFMPEG_FOUND)
   target_link_libraries(recomp_dsound PUBLIC recomp_runtime recomp_audio)
 
   # Bink video (binkw32) on ffmpeg; audio through the Miles mixer.
-  add_library(recomp_bink SHARED src/runtime/hle/binkw32.cpp)
+  add_library(recomp_bink SHARED src/runtime/hle/binkw32.cpp
+              src/runtime/hle/bink_play.cpp
+              src/runtime/hle/bink_source.cpp)
   target_link_libraries(recomp_bink PUBLIC recomp_mss32)
 
   # The Windows Media Format SDK's synchronous reader (wmvcore) on ffmpeg:

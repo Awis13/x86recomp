@@ -1,7 +1,18 @@
 // binkw32 (Bink video, RAD 1.x API, up to 1.8's) on ffmpeg's Bink demuxer
 // and decoders. Movies may be opened from memory (BINKFROMMEMORY, e.g. a
-// view of an archive file); games decode one frame per BinkWait /
-// BinkDoFrame and copy it into locked memory with BinkCopyToBuffer(Rect).
+// view of an archive file) or from a file handle of the game's
+// (BINKFILEHANDLE, a movie inside a resource file); games decode one frame
+// per BinkWait / BinkDoFrame and copy it into locked memory with
+// BinkCopyToBuffer(Rect).
+//
+// The demuxer opens a movie (its streams and frame index) and is not asked
+// for packets: it reads frames in order only, and seeks to the first one
+// alone. A frame's packets are taken from the movie's bytes at the frame's
+// place in the index (one per audio track, each a length and that many
+// bytes, then the video packet), so any frame is as near as the first:
+// BinkGoto starts at the key frame before its target (bink_play.h) and
+// BinkNextFrame goes round from the last frame to the first.
+//
 // Audio goes to the software mixer whichever sound system the game picks
 // (BinkOpenMiles or BinkOpenDirectSound route it there too).
 //
@@ -21,7 +32,7 @@
 // ID list (+0x250) directly.
 
 #include <algorithm>
-#include <chrono>
+#include <cmath>
 #include <cstring>
 #include <map>
 #include <memory>
@@ -36,6 +47,8 @@ extern "C" {
 }
 
 #include "runtime/audio/mixer.h"
+#include "runtime/hle/bink_play.h"
+#include "runtime/hle/bink_source.h"
 #include "runtime/hle/hle.h"
 #include "runtime/hle/kernel32_state.h"
 #include "runtime/hle/mss32.h"
@@ -44,9 +57,7 @@ extern "C" {
 namespace recomp::hle {
 namespace {
 
-using Clock = std::chrono::steady_clock;
-
-constexpr uint32_t kBinkFromMemory = 0x04000000, kBinkSndTrack = 0x00004000;
+constexpr uint32_t kBinkSndTrack = 0x00004000;
 constexpr uint32_t kBinkStructSize = 0x400;
 
 // BINK struct offsets (bink.h, 1.x; the track fields as 1.8 games read
@@ -61,16 +72,25 @@ enum : uint32_t {
 // An audio track of a movie: its stream, decoder and mixer voice.
 struct Track {
   uint32_t id = 0;
+  uint32_t index = 0;  // among the file's tracks: which packet of a frame
   int stream = -1;
   AVCodecContext* dec = nullptr;
   std::unique_ptr<audio::Voice> voice;
   audio::QueueSource* queue = nullptr;
   float volume = 1.0f;
+  // After a jump, in sample frames: silence to queue before the next sound,
+  // and how much of that sound to leave out first.
+  int64_t silence = 0, drop = 0;
+};
+
+// A frame's place in the movie's bytes.
+struct FrameAt {
+  uint32_t pos = 0, size = 0;
 };
 
 struct Movie {
   uint32_t guest = 0;
-  std::vector<uint8_t> data;
+  BinkBytes data;  // outlives the demuxer: ~Movie closes that first
   int64_t pos = 0;
   AVFormatContext* fmt = nullptr;
   AVIOContext* io = nullptr;
@@ -82,11 +102,24 @@ struct Movie {
   SwsContext* sws = nullptr;
   std::vector<uint8_t> bgra;  // the current frame, w*h*4
   int w = 0, h = 0;
-  uint32_t frames = 0, frame_num = 1, decoded = 0;
+  std::vector<FrameAt> index;  // of every frame
+  std::vector<uint8_t> keys;   // nonzero: a key frame
+  uint32_t audio_tracks = 0;   // in the file, playing or not
+  uint32_t lead = 0;           // frames of sound the first frame holds beyond its own
+  // The frames up to `decoded` have gone through the video decoder, which
+  // takes decoded + 1 next; `last_frame` is the last one decoded or jumped
+  // over (LastFrameNum); `played` counts the ones the game was given.
+  uint32_t frames = 0, frame_num = 1, decoded = 0, last_frame = 0, played = 0;
+  // The decoder holds the picture of frame `decoded`. Not after a frame it
+  // was not given the one before (BINKGOTOQUICK), refused or could not be
+  // given, until a key frame is decoded: the frames between copy from a
+  // picture that is not theirs.
+  bool picture_ok = false;
+  bool warned = false;  // of a frame without a picture, once a movie
   double fps = 15;
-  bool started = false, paused = false;
-  Clock::time_point start, paused_at;
-  bool video_eof = false;
+  BinkPace pace;
+  bool paused = false;
+  double paused_at = 0;
   uint32_t frame_buffers = 0;  // BINKFRAMEBUFFERS registered by the game
 
   ~Movie() {
@@ -178,7 +211,8 @@ AVCodecContext* OpenDecoder(AVStream* st) {
   return c;
 }
 
-void QueueAudio(Movie& m, Track& t, AVFrame* f) {
+// The sound decoded from a packet of frame `frame` into the track's queue.
+void QueueAudio(Movie& m, Track& t, AVFrame* f, uint32_t frame) {
   int out_ch = std::min(f->ch_layout.nb_channels, 2);
   if (!t.voice) {
     auto q = std::make_unique<audio::QueueSource>(out_ch, f->sample_rate);
@@ -207,7 +241,18 @@ void QueueAudio(Movie& m, Track& t, AVFrame* f) {
     }
     if (dump) std::fwrite(buf.data(), sizeof(float), buf.size(), dump);
   }
-  t.queue->Push(buf.data(), f->nb_samples);
+  if (t.silence > 0) {
+    const std::vector<float> quiet(size_t(t.silence) * out_ch);
+    t.queue->Push(quiet.data(), int(t.silence));
+    if (g_bink_play.audio) g_bink_play.audio(0, nullptr, int(t.silence));
+    t.silence = 0;
+  }
+  const int skip = int(std::min<int64_t>(t.drop, f->nb_samples));
+  t.drop -= skip;
+  if (skip == f->nb_samples) return;
+  const float* rest = buf.data() + size_t(skip) * out_ch;
+  t.queue->Push(rest, f->nb_samples - skip);
+  if (g_bink_play.audio) g_bink_play.audio(frame, rest, f->nb_samples - skip);
 }
 
 void ConvertVideo(Movie& m) {
@@ -222,8 +267,6 @@ void ConvertVideo(Movie& m) {
   sws_scale(m.sws, f->data, f->linesize, 0, f->height, dst, stride);
 }
 
-// Demuxes until the next video frame is decoded (queueing audio met on
-// the way). False at the end of the movie.
 // BINKFRAMEBUFFERS: TotalFrames, YABufferWidth, YABufferHeight,
 // cRcBBufferWidth, cRcBBufferHeight, FrameNum, then 2 sets of 4 BINKPLANEs
 // { Allocate, Buffer, BufferPitch } (Y, cR, cB, A).
@@ -253,40 +296,150 @@ void FillFrameBuffers(Movie& m) {
   Wr32(fb + kFbFrameNum, set_index);
 }
 
-bool DecodeNextFrame(Movie& m) {
-  for (;;) {
-    int r = avcodec_receive_frame(m.vdec, m.frame);
-    if (r == 0) {
+// The packets of the frame at `at` in the index: one per audio track of the
+// file (each a length and that many bytes, of which the first four are the
+// size of the sound decoded), then the video packet, which is the rest.
+// False for a frame the movie's bytes do not hold whole, or whose lengths
+// do not fit it.
+struct Packet {
+  const uint8_t* data = nullptr;
+  uint32_t size = 0;
+};
+struct FramePackets {
+  Packet audio[kMaxTracks];
+  Packet video;
+};
+bool ReadFrame(const Movie& m, uint32_t at, FramePackets* out) {
+  if (at >= m.index.size()) return false;
+  const FrameAt& f = m.index[at];
+  if (f.pos > m.data.size() || f.size > m.data.size() - f.pos) return false;
+  const uint8_t* p = m.data.data() + f.pos;
+  uint32_t left = f.size;
+  for (uint32_t i = 0; i < m.audio_tracks; i++) {
+    if (left < 4) return false;
+    const uint32_t size = Le32(p);
+    if (size > left - 4) return false;
+    out->audio[i] = {p + 4, size};
+    p += 4 + size;
+    left -= 4 + size;
+  }
+  out->video = {p, left};
+  return true;
+}
+
+// A copy of the packet's bytes to the decoder (it reads past the end of
+// what it is given, into padding the movie's bytes do not have).
+bool Send(Movie& m, AVCodecContext* dec, const Packet& p) {
+  if (av_new_packet(m.pkt, int(p.size)) < 0) return false;
+  std::memcpy(m.pkt->data, p.data, p.size);
+  const int r = avcodec_send_packet(dec, m.pkt);
+  av_packet_unref(m.pkt);
+  return r == 0;
+}
+
+// The sound of frame `frame`'s packets into the queues of the tracks that
+// play (a packet of under four bytes holds none).
+void QueueFrameAudio(Movie& m, const FramePackets& p, uint32_t frame) {
+  for (Track& t : m.tracks) {
+    const Packet& a = p.audio[t.index];
+    if (!t.dec || a.size < 4 || !Send(m, t.dec, a)) continue;
+    while (avcodec_receive_frame(t.dec, m.frame) == 0) {
+      QueueAudio(m, t, m.frame, frame);
+      av_frame_unref(m.frame);
+    }
+  }
+}
+
+// Decodes the frame after `decoded`: its picture goes to the game if
+// `show`, its sound to the mixer if `sound`. A frame the decoder refuses,
+// or one the movie's bytes do not hold (ReadFrame), leaves the picture as
+// it was and still counts, so frame numbers stay the file's and the movie
+// goes on behind it. False past the last frame of the index.
+bool DecodeNextFrame(Movie& m, bool show, bool sound) {
+  if (m.decoded >= m.index.size()) return false;
+  const uint32_t frame = m.decoded + 1;
+  FramePackets p;
+  BinkPicture got = BinkPicture::Unread;
+  if (ReadFrame(m, m.decoded, &p)) {
+    if (sound) QueueFrameAudio(m, p, frame);
+    // From the first frame the decoder starts over (its count of frames is
+    // what tells the oldest revision of the codec its first, intra, frame).
+    if (frame == 1) avcodec_flush_buffers(m.vdec);
+    got = p.video.size && Send(m, m.vdec, p.video) &&
+                  avcodec_receive_frame(m.vdec, m.frame) == 0
+              ? BinkPicture::Decoded
+              : BinkPicture::Refused;
+  }
+  if (got == BinkPicture::Decoded) {
+    if (show) {
       if (m.frame_buffers &&
           (m.frame->format == AV_PIX_FMT_YUV420P || m.frame->format == AV_PIX_FMT_YUVA420P))
         FillFrameBuffers(m);
       else
         ConvertVideo(m);
-      av_frame_unref(m.frame);
-      m.decoded++;
-      return true;
+      m.played++;
     }
-    if (r != AVERROR(EAGAIN) || m.video_eof) return false;
-    if (av_read_frame(m.fmt, m.pkt) < 0) {
-      avcodec_send_packet(m.vdec, nullptr);
-      m.video_eof = true;
-      continue;
-    }
-    if (m.pkt->stream_index == m.vs) {
-      avcodec_send_packet(m.vdec, m.pkt);
-    } else {
-      for (Track& t : m.tracks) {
-        if (m.pkt->stream_index != t.stream || !t.dec) continue;
-        if (avcodec_send_packet(t.dec, m.pkt) == 0) {
-          while (avcodec_receive_frame(t.dec, m.frame) == 0) {
-            QueueAudio(m, t, m.frame);
-            av_frame_unref(m.frame);
-          }
-        }
-      }
-    }
-    av_packet_unref(m.pkt);
+    av_frame_unref(m.frame);
+  } else if (!m.warned) {
+    m.warned = true;
+    const FrameAt& at = m.index[m.decoded];
+    WarnF("binkw32: frame %u of %u (%u bytes at %u of the movie's %zu) %s; its picture is the "
+          "one before it (said once a movie)\n",
+          frame, m.frames, at.size, at.pos, m.data.size(),
+          got == BinkPicture::Unread ? "is not whole in the movie's bytes"
+                                     : "was refused by the decoder");
   }
+  m.picture_ok = got == BinkPicture::Decoded && (m.picture_ok || m.keys[m.decoded] != 0);
+  m.decoded = frame;
+  if (g_bink_play.video) g_bink_play.video(frame, got, show && got == BinkPicture::Decoded);
+  return true;
+}
+
+// The sound of a movie that goes on at a frame, in place of what is queued
+// (a jump, or a movie that fell behind): the sound queued and what the
+// decoders hold of the block before are dropped, and the sound of frames
+// seek.audio_from to end - 1 is queued (bink_play.h: BinkSeek).
+void QueueSoundFrom(Movie& m, const BinkSeek& seek, uint32_t end) {
+  for (Track& t : m.tracks) {
+    avcodec_flush_buffers(t.dec);
+    if (t.queue) t.queue->Clear();
+    const double rate = t.dec->sample_rate / m.fps;  // sample frames per frame
+    t.silence = std::llround(seek.silence * rate);
+    t.drop = std::llround(seek.drop * rate);
+  }
+  FramePackets p;
+  for (uint32_t f = seek.audio_from; f < end; f++)
+    if (ReadFrame(m, f - 1, &p)) QueueFrameAudio(m, p, f);
+}
+
+// A movie that fell more than kBinkMaxLag behind goes on at FrameNum. The
+// mixer went on playing its queue meanwhile (and silence after it), so the
+// sound queued would be ahead of the picture by as long as the movie stood,
+// up to the sound's lead: it is queued again as a jump to this frame queues
+// it. Frames the game moved over without decoding are decoded for the
+// picture only: their sound is in what was just queued, or before it.
+void GoOnFromHere(Movie& m) {
+  const BinkSeek seek = PlanBinkSeek(m.keys, 0, m.frame_num, 0, m.lead);
+  QueueSoundFrom(m, seek, std::max(m.frame_num, m.decoded + 1));
+  while (m.decoded + 1 < m.frame_num && DecodeNextFrame(m, false, false)) {
+  }
+}
+
+// The frames of sound the first frame holds beyond its own (Bink: the first
+// 750 ms of the movie's), by the size its first track's packet gives, and
+// no more than two seconds.
+uint32_t AudioLead(const Movie& m) {
+  FramePackets p;
+  if (!m.audio_tracks || !ReadFrame(m, 0, &p) || p.audio[0].size < 4) return 0;
+  const AVCodecParameters* par = nullptr;
+  for (unsigned i = 0; i < m.fmt->nb_streams && !par; i++)
+    if (m.fmt->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO)
+      par = m.fmt->streams[i]->codecpar;
+  if (!par) return 0;
+  const int channels = par->ch_layout.nb_channels;
+  if (channels <= 0 || par->sample_rate <= 0) return 0;
+  const double held = double(Le32(p.audio[0].data)) / (2.0 * channels) / par->sample_rate * m.fps;
+  return uint32_t(std::clamp(std::lround(held) - 1, 0l, std::lround(2 * m.fps)));
 }
 
 Movie* Find(uint32_t b, const char* fn) {
@@ -300,7 +453,7 @@ Movie* Find(uint32_t b, const char* fn) {
 
 void SyncGuest(const Movie& m) {
   Wr32(m.guest + kFrameNum, m.frame_num);
-  Wr32(m.guest + kLastFrameNum, m.frame_num > 1 ? m.frame_num - 1 : 0);
+  Wr32(m.guest + kLastFrameNum, m.last_frame);
 }
 
 // BinkSetSoundSystem(open, param): `open` is the address of BinkOpenMiles
@@ -346,11 +499,11 @@ HLE_NAMED("binkw32.dll", "_BinkOpenDirectSound@4", BinkOpenDirectSound, 1) {
 // The audio track IDs of a Bink file (header: track count at 0x28, from
 // revision 'k' on 4 more bytes, then per track 4 bytes, 4 bytes of rate and
 // flags, then the IDs).
-std::vector<uint32_t> TrackIds(const std::vector<uint8_t>& d) {
+std::vector<uint32_t> TrackIds(const BinkBytes& d) {
   std::vector<uint32_t> ids;
   if (d.size() < 44) return ids;
   uint32_t n = std::min<uint32_t>(Le32(d.data() + 40), kMaxTracks);
-  size_t at = 44 + 8 * size_t(n) + (d[3] >= 'k' ? 4 : 0);
+  size_t at = 44 + 8 * size_t(n) + (d.data()[3] >= 'k' ? 4 : 0);
   for (uint32_t i = 0; i < n && at + 4 * (i + 1) <= d.size(); i++)
     ids.push_back(Le32(d.data() + at + 4 * i));
   return ids;
@@ -382,6 +535,7 @@ void ChooseTracks(Movie& m, uint32_t flags, const std::vector<uint32_t>& ids) {
       if ((k < ids.size() ? ids[k] : uint32_t(k)) != id) continue;
       Track t;
       t.id = id;
+      t.index = uint32_t(k);
       t.stream = streams[k];
       t.dec = OpenDecoder(m.fmt->streams[t.stream]);
       if (t.dec) m.tracks.push_back(std::move(t));
@@ -389,36 +543,19 @@ void ChooseTracks(Movie& m, uint32_t flags, const std::vector<uint32_t>& ids) {
   }
 }
 
-// BinkOpen(name_or_memory, flags) -> HBINK.
+// BinkOpen(name, flags) -> HBINK. The name is a pointer to the file in
+// memory with BINKFROMMEMORY and a file handle with BINKFILEHANDLE
+// (bink_source.h). A handle's movie is mapped, not read: opening reads its
+// header, frame index and first frames only. The handle is not used after
+// the call, and BinkClose has nothing of the game's to close: it releases
+// the mapping, as does every way out of here without a movie.
+// BINKNOFRAMEBUFFERS (0x400: the game registers its own frame buffers)
+// needs nothing: frames go to the buffers once they are registered.
 HLE_NAMED("binkw32.dll", "_BinkOpen@8", BinkOpen, 2) {
   uint32_t src = Arg(c, 0), flags = Arg(c, 1);
   auto m = std::make_unique<Movie>();
   std::string what;
-  if (flags & kBinkFromMemory) {
-    if (!EnsureReadable(c, src, 8) || std::memcmp(GPtr(src), "BIK", 3) != 0) {
-      WarnF("binkw32: BinkOpen: no Bink header at %08X\n", src);
-      return 0;
-    }
-    uint32_t size = Le32(GPtr(src) + 4) + 8;
-    if (!EnsureReadable(c, src, size)) {
-      WarnF("binkw32: BinkOpen: cannot page in %u bytes at %08X\n", size, src);
-      return 0;
-    }
-    m->data.assign(GPtr(src), GPtr(src) + size);
-    what = "memory";
-  } else {
-    what = GStr(src);
-    FILE* f = std::fopen(HostPath(what).c_str(), "rb");
-    if (!f) {
-      WarnF("binkw32: BinkOpen(%s): cannot open\n", what.c_str());
-      return 0;
-    }
-    uint8_t buf[65536];
-    size_t n;
-    while ((n = std::fread(buf, 1, sizeof buf, f)) > 0)
-      m->data.insert(m->data.end(), buf, buf + n);
-    std::fclose(f);
-  }
+  if (!OpenBinkSource(c, src, flags, &m->data, &what)) return 0;
   if (m->data.size() < 44) return 0;
   const uint8_t* h = m->data.data();
   m->frames = Le32(h + 8);
@@ -442,6 +579,21 @@ HLE_NAMED("binkw32.dll", "_BinkOpen@8", BinkOpen, 2) {
     WarnF("binkw32: BinkOpen(%s): no decodable video stream\n", what.c_str());
     return 0;
   }
+  // The demuxer's index: where each frame is, and which are key frames.
+  AVStream* video = m->fmt->streams[m->vs];
+  for (int i = 0; i < avformat_index_get_entries_count(video); i++) {
+    const AVIndexEntry* e = avformat_index_get_entry(video, i);
+    m->index.push_back({uint32_t(e->pos), uint32_t(e->size)});
+    m->keys.push_back(i == 0 || (e->flags & AVINDEX_KEYFRAME) ? 1 : 0);
+  }
+  m->frames = std::min(m->frames, uint32_t(m->index.size()));
+  for (unsigned i = 0; i < m->fmt->nb_streams; i++)
+    if (m->fmt->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_AUDIO) m->audio_tracks++;
+  if (m->audio_tracks > kMaxTracks) {
+    WarnF("binkw32: BinkOpen(%s): %u audio tracks\n", what.c_str(), m->audio_tracks);
+    return 0;
+  }
+  m->lead = AudioLead(*m);
   std::vector<uint32_t> ids = TrackIds(m->data);
   ChooseTracks(*m, flags, ids);
   m->w = int(width);
@@ -485,37 +637,59 @@ HLE_NAMED("binkw32.dll", "_BinkClose@4", BinkClose, 1) {
   return 0;  // the guest block is leaked: 512 bytes per movie
 }
 
-// BinkWait(HBINK) -> nonzero while it is too early for the next frame.
+// BinkWait(HBINK) -> nonzero while it is too early for the frame FrameNum.
+// The first frame of a movie and the one BinkGoto went to are due when
+// first asked about, the ones after them a frame's time apart from then
+// (bink_play.h). A movie that fell far behind is not caught up: it goes on
+// from this frame, with the sound of this frame's time.
 HLE_NAMED("binkw32.dll", "_BinkWait@4", BinkWait, 1) {
   std::lock_guard<std::mutex> l(g_mu);
   Movie* m = Find(Arg(c, 0), "BinkWait");
   if (!m) return 0;
   if (m->paused) return 1;
-  auto now = Clock::now();
-  if (!m->started) {
-    m->started = true;
-    m->start = now;
-  }
-  auto due = m->start + std::chrono::duration_cast<Clock::duration>(
-                            std::chrono::duration<double>((m->frame_num - 1) / m->fps));
-  return now < due ? 1 : 0;
+  bool fell_behind = false;
+  const bool early =
+      BinkTooEarly(&m->pace, m->frame_num, m->fps, g_bink_play.now(), &fell_behind);
+  if (fell_behind) GoOnFromHere(*m);
+  return early ? 1 : 0;
 }
 
-// BinkDoFrame(HBINK): decodes the frame FrameNum.
+// BinkDoFrame(HBINK): decodes the frame FrameNum. If the game moved on by
+// more than one frame since the last, the ones between are decoded for it
+// (their sound plays, their pictures are not given to the game).
+// LastFrameNum is then this frame (bink.h: "last frame decompressed or
+// skipped"), and stays it when BinkNextFrame moves on, round the end too.
 HLE_NAMED("binkw32.dll", "_BinkDoFrame@4", BinkDoFrame, 1) {
   std::lock_guard<std::mutex> l(g_mu);
   Movie* m = Find(Arg(c, 0), "BinkDoFrame");
   if (!m) return 0;
   while (m->decoded < m->frame_num)
-    if (!DecodeNextFrame(*m)) break;
+    if (!DecodeNextFrame(*m, m->decoded + 1 == m->frame_num, true)) break;
+  m->last_frame = m->frame_num;
+  SyncGuest(*m);
   return 0;
 }
 
+// BinkNextFrame(HBINK): on the last frame "Bink will loop around back to
+// the first frame" (a game that plays a movie once does not call this on
+// its last frame). The first frame's sound starts with the movie: nothing
+// of the last block's end is blended into it, and what a jump left to
+// leave out or to fill with silence is forgotten.
 HLE_NAMED("binkw32.dll", "_BinkNextFrame@4", BinkNextFrame, 1) {
   std::lock_guard<std::mutex> l(g_mu);
   Movie* m = Find(Arg(c, 0), "BinkNextFrame");
   if (!m) return 0;
-  if (m->frame_num < m->frames) m->frame_num++;
+  if (m->frame_num < m->frames) {
+    m->frame_num++;
+  } else {
+    BinkWrapped(&m->pace, m->frame_num, m->fps);
+    m->frame_num = 1;
+    m->decoded = 0;
+    for (Track& t : m->tracks) {
+      avcodec_flush_buffers(t.dec);
+      t.silence = t.drop = 0;
+    }
+  }
   SyncGuest(*m);
   return 0;
 }
@@ -527,11 +701,11 @@ HLE_NAMED("binkw32.dll", "_BinkPause@8", BinkPause, 2) {
   if (!m) return 0;
   bool p = Arg(c, 1) != 0;
   if (p != m->paused) {
-    auto now = Clock::now();
+    const double now = g_bink_play.now();
     if (p)
       m->paused_at = now;
-    else if (m->started)
-      m->start += now - m->paused_at;
+    else if (m->pace.synced)
+      m->pace.at += now - m->paused_at;
     m->paused = p;
     std::lock_guard<std::mutex> ml(audio::GetMixer().mu());
     for (Track& t : m->tracks)
@@ -641,30 +815,36 @@ HLE_NAMED("binkw32.dll", "_BinkGetRealtime@12", BinkGetRealtime, 3) {
   return 0;
 }
 
-// BinkGoto(HBINK, frame, flags): back to the start by seeking, forward by
-// decoding; playback time continues from the new frame.
+// BinkGoto(HBINK, frame, flags): the next BinkDoFrame decodes `frame`, and
+// BinkWait finds it due at once. The picture is built from the key frame
+// before it, the frames between decoded here and not shown; the sound
+// queued is dropped, and what plays from the frame's time on is queued in
+// its place (bink_play.h, with what BINKGOTOQUICK and BINKGOTOQUICKSOUND
+// leave out). The cost is the frames from the key frame on, wherever in the
+// movie the frame is (in a movie with one key frame: from its first).
 HLE_NAMED("binkw32.dll", "_BinkGoto@12", BinkGoto, 3) {
   std::lock_guard<std::mutex> l(g_mu);
   Movie* m = Find(Arg(c, 0), "BinkGoto");
   if (!m) return 0;
-  uint32_t target = std::clamp<uint32_t>(Arg(c, 1), 1, std::max(m->frames, 1u));
-  if (target < m->decoded) {
-    if (av_seek_frame(m->fmt, m->vs, 0, AVSEEK_FLAG_BACKWARD) < 0)
-      FatalF("binkw32: BinkGoto(%u): cannot rewind the movie", target);
-    avcodec_flush_buffers(m->vdec);
-    for (Track& t : m->tracks) {
-      avcodec_flush_buffers(t.dec);
-      if (t.queue) t.queue->Clear();
-    }
-    m->decoded = 0;
-    m->video_eof = false;
-  }
-  while (m->decoded < target)
-    if (!DecodeNextFrame(*m)) break;
+  const uint32_t frame = uint32_t(Arg(c, 1)), flags = uint32_t(Arg(c, 2));
+  const uint32_t target = std::clamp<uint32_t>(frame, 1, std::max(m->frames, 1u));
+  const BinkSeek seek =
+      PlanBinkSeek(m->keys, m->picture_ok ? m->decoded : 0, target, flags, m->lead);
+  QueueSoundFrom(*m, seek, target);
+  // On from where the decoder is, or from a frame it was not given the one
+  // before: a key frame, or with BINKGOTOQUICK any, and then its picture
+  // is no frame's until the next key frame.
+  if (seek.first != m->decoded + 1) m->picture_ok = false;
+  m->decoded = seek.first - 1;
+  uint32_t decoded = 0;
+  while (m->decoded + 1 < target && DecodeNextFrame(*m, false, false)) decoded++;
   m->frame_num = target;
-  m->start = Clock::now() - std::chrono::duration_cast<Clock::duration>(
-                                std::chrono::duration<double>((target - 1) / m->fps));
+  m->last_frame = target - 1;
+  m->pace.synced = false;
   SyncGuest(*m);
+  WarnF("binkw32: BinkGoto(%u, %X): frame %u from key frame %u, %u frames decoded, sound from "
+        "frame %u\n",
+        frame, flags, target, seek.key, decoded, seek.audio_from);
   return 0;
 }
 
@@ -673,9 +853,14 @@ HLE_NAMED("binkw32.dll", "_BinkSetMemory@8", BinkSetMemory, 2) { return 0; }
 
 HLE_NAMED("binkw32.dll", "_BinkShouldSkip@4", BinkShouldSkip, 1) { return 0; }
 
-// BinkGetKeyFrame(HBINK, frame, flags): every frame is treated as a key
-// frame (seeking decodes from the stream's start anyway).
-HLE_NAMED("binkw32.dll", "_BinkGetKeyFrame@12", BinkGetKeyFrame, 3) { return Arg(c, 1); }
+// BinkGetKeyFrame(HBINK, frame, flags): the key frame before, after or
+// closest to `frame` by the BINKGETKEY flags, from the movie's frame index;
+// 0 if there is none.
+HLE_NAMED("binkw32.dll", "_BinkGetKeyFrame@12", BinkGetKeyFrame, 3) {
+  std::lock_guard<std::mutex> l(g_mu);
+  Movie* m = Find(Arg(c, 0), "BinkGetKeyFrame");
+  return m ? BinkKeyFrame(m->keys, uint32_t(Arg(c, 1)), uint32_t(Arg(c, 2))) : 0;
+}
 
 // BinkGetFrameBuffersInfo(HBINK, BINKFRAMEBUFFERS*): two plane sets of the
 // movie's size (chroma at half), alpha only for movies that have it.
@@ -726,7 +911,7 @@ HLE_NAMED("binkw32.dll", "_BinkGetSummary@8", BinkGetSummary, 2) {
   Wr32(out + 0x14, rate);                                    // FrameRate
   Wr32(out + 0x18, div);                                     // FrameRateDiv
   Wr32(out + 0x20, m->frames);                               // TotalFrames
-  Wr32(out + 0x24, m->decoded);                              // TotalPlayedFrames
+  Wr32(out + 0x24, m->played);                               // TotalPlayedFrames
   return 0;
 }
 
