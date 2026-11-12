@@ -1043,7 +1043,13 @@ late-frame rule; on an idle host wake-ups land 15-30 us (Linux) or
   callbacks, or SetEvent / PulseEvent on the given event).
 - binkw32: ffmpeg (Bink demuxer from memory, binkvideo/binkaudio,
   swscale), audio into the software mixer whichever sound system the
-  game picks (BinkOpenMiles or BinkOpenDirectSound). The 1.x API up to
+  game picks (BinkOpenMiles or BinkOpenDirectSound). A movie opened by
+  name or from memory (BINKFROMMEMORY) is copied when opened. One at
+  the position of a file handle of the game's (BINKFILEHANDLE: movies
+  of up to a gigabyte inside a resource file) is mapped read-only
+  until BinkClose, so opening reads its header, frame index and first
+  frames only; the handle is neither moved nor closed, and a file that
+  cannot be mapped gives no movie. The 1.x API up to
   Bink 1.8's: sound tracks by ID (BINKSNDTRACK, the track list in the
   BINK struct), per-track volume, BinkCopyToBufferRect, BinkGoto,
   BinkGetRealtime.

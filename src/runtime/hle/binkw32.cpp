@@ -1,7 +1,9 @@
 // binkw32 (Bink video, RAD 1.x API, up to 1.8's) on ffmpeg's Bink demuxer
 // and decoders. Movies may be opened from memory (BINKFROMMEMORY, e.g. a
-// view of an archive file); games decode one frame per BinkWait /
-// BinkDoFrame and copy it into locked memory with BinkCopyToBuffer(Rect).
+// view of an archive file) or from a file handle of the game's
+// (BINKFILEHANDLE, a movie inside a resource file); games decode one frame
+// per BinkWait / BinkDoFrame and copy it into locked memory with
+// BinkCopyToBuffer(Rect).
 // Audio goes to the software mixer whichever sound system the game picks
 // (BinkOpenMiles or BinkOpenDirectSound route it there too).
 //
@@ -36,6 +38,7 @@ extern "C" {
 }
 
 #include "runtime/audio/mixer.h"
+#include "runtime/hle/bink_source.h"
 #include "runtime/hle/hle.h"
 #include "runtime/hle/kernel32_state.h"
 #include "runtime/hle/mss32.h"
@@ -46,7 +49,7 @@ namespace {
 
 using Clock = std::chrono::steady_clock;
 
-constexpr uint32_t kBinkFromMemory = 0x04000000, kBinkSndTrack = 0x00004000;
+constexpr uint32_t kBinkSndTrack = 0x00004000;
 constexpr uint32_t kBinkStructSize = 0x400;
 
 // BINK struct offsets (bink.h, 1.x; the track fields as 1.8 games read
@@ -70,7 +73,7 @@ struct Track {
 
 struct Movie {
   uint32_t guest = 0;
-  std::vector<uint8_t> data;
+  BinkBytes data;  // outlives the demuxer: ~Movie closes that first
   int64_t pos = 0;
   AVFormatContext* fmt = nullptr;
   AVIOContext* io = nullptr;
@@ -346,11 +349,11 @@ HLE_NAMED("binkw32.dll", "_BinkOpenDirectSound@4", BinkOpenDirectSound, 1) {
 // The audio track IDs of a Bink file (header: track count at 0x28, from
 // revision 'k' on 4 more bytes, then per track 4 bytes, 4 bytes of rate and
 // flags, then the IDs).
-std::vector<uint32_t> TrackIds(const std::vector<uint8_t>& d) {
+std::vector<uint32_t> TrackIds(const BinkBytes& d) {
   std::vector<uint32_t> ids;
   if (d.size() < 44) return ids;
   uint32_t n = std::min<uint32_t>(Le32(d.data() + 40), kMaxTracks);
-  size_t at = 44 + 8 * size_t(n) + (d[3] >= 'k' ? 4 : 0);
+  size_t at = 44 + 8 * size_t(n) + (d.data()[3] >= 'k' ? 4 : 0);
   for (uint32_t i = 0; i < n && at + 4 * (i + 1) <= d.size(); i++)
     ids.push_back(Le32(d.data() + at + 4 * i));
   return ids;
@@ -389,36 +392,19 @@ void ChooseTracks(Movie& m, uint32_t flags, const std::vector<uint32_t>& ids) {
   }
 }
 
-// BinkOpen(name_or_memory, flags) -> HBINK.
+// BinkOpen(name, flags) -> HBINK. The name is a pointer to the file in
+// memory with BINKFROMMEMORY and a file handle with BINKFILEHANDLE
+// (bink_source.h). A handle's movie is mapped, not read: opening reads its
+// header, frame index and first frames only. The handle is not used after
+// the call, and BinkClose has nothing of the game's to close: it releases
+// the mapping, as does every way out of here without a movie.
+// BINKNOFRAMEBUFFERS (0x400: the game registers its own frame buffers)
+// needs nothing: frames go to the buffers once they are registered.
 HLE_NAMED("binkw32.dll", "_BinkOpen@8", BinkOpen, 2) {
   uint32_t src = Arg(c, 0), flags = Arg(c, 1);
   auto m = std::make_unique<Movie>();
   std::string what;
-  if (flags & kBinkFromMemory) {
-    if (!EnsureReadable(c, src, 8) || std::memcmp(GPtr(src), "BIK", 3) != 0) {
-      WarnF("binkw32: BinkOpen: no Bink header at %08X\n", src);
-      return 0;
-    }
-    uint32_t size = Le32(GPtr(src) + 4) + 8;
-    if (!EnsureReadable(c, src, size)) {
-      WarnF("binkw32: BinkOpen: cannot page in %u bytes at %08X\n", size, src);
-      return 0;
-    }
-    m->data.assign(GPtr(src), GPtr(src) + size);
-    what = "memory";
-  } else {
-    what = GStr(src);
-    FILE* f = std::fopen(HostPath(what).c_str(), "rb");
-    if (!f) {
-      WarnF("binkw32: BinkOpen(%s): cannot open\n", what.c_str());
-      return 0;
-    }
-    uint8_t buf[65536];
-    size_t n;
-    while ((n = std::fread(buf, 1, sizeof buf, f)) > 0)
-      m->data.insert(m->data.end(), buf, buf + n);
-    std::fclose(f);
-  }
+  if (!OpenBinkSource(c, src, flags, &m->data, &what)) return 0;
   if (m->data.size() < 44) return 0;
   const uint8_t* h = m->data.data();
   m->frames = Le32(h + 8);

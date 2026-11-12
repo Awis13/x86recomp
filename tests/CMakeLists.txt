@@ -164,6 +164,18 @@ if(TARGET recomp_wmvcore)
   add_test(NAME wmvcore COMMAND wmvcore_test ${CMAKE_CURRENT_SOURCE_DIR}/wmvcore)
 endif()
 
+# bink_source_test: where BinkOpen's movie comes from (hle/bink_source.h): a
+# file name, the file in memory, and a file handle of the guest's, whose
+# movie is mapped from its position on while the handle is left open where
+# it was; BinkOpen itself, through its import thunk, on a handle at a movie,
+# at a 512 MB one (a sparse file: no room taken) and on handles that give no
+# movie. Its files go into the build tree; portable.
+if(TARGET recomp_bink)
+  add_executable(bink_source_test bink_source_test.cpp)
+  target_link_libraries(bink_source_test PRIVATE recomp_runtime recomp_bink Threads::Threads)
+  add_test(NAME bink_source COMMAND bink_source_test ${CMAKE_CURRENT_BINARY_DIR})
+endif()
+
 # shared_heap_test: the heap a graphics device reads in place (retired
 # blocks freed as its frames finish, runtime/hle/shared_heap.h) and the
 # address-space and heap statistics behind <ID>_MEM_REPORT; portable.
