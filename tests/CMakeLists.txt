@@ -228,6 +228,11 @@ if(APPLE)
                         "-framework Foundation")
   add_test(NAME metal_depth COMMAND metal_depth_test)
   set_tests_properties(metal_depth PROPERTIES SKIP_RETURN_CODE 77)
+  add_executable(metal_sampled_depth_test metal_sampled_depth_test.mm)
+  set_source_files_properties(metal_sampled_depth_test.mm PROPERTIES COMPILE_OPTIONS "-fobjc-arc;-std=c++20")
+  target_link_libraries(metal_sampled_depth_test PRIVATE recomp_gfx "-framework Metal" "-framework Foundation")
+  add_test(NAME metal_sampled_depth COMMAND metal_sampled_depth_test)
+  set_tests_properties(metal_sampled_depth PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 90)
 endif()
 
 # metal_rcas_test: sharpening on the Metal backend (gfx/rcas.h), rcas_cs on
