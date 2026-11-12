@@ -1041,9 +1041,38 @@ late-frame rule; on an idle host wake-ups land 15-30 us (Linux) or
   DirectX SDK's IsXInputDevice) expect.
 - winmm: multimedia timers on one timer thread, as on Windows (TimeProc
   callbacks, or SetEvent / PulseEvent on the given event).
-- binkw32: ffmpeg (Bink demuxer from memory, binkvideo/binkaudio,
-  swscale), audio into the software mixer whichever sound system the
-  game picks (BinkOpenMiles or BinkOpenDirectSound). A movie opened by
+- binkw32: ffmpeg (binkvideo/binkaudio, swscale; its Bink demuxer, from
+  memory, to open a movie), audio into the software mixer whichever
+  sound system the game picks (BinkOpenMiles or BinkOpenDirectSound).
+  The demuxer gives a movie's streams and frame index and is not asked
+  for packets (it reads frames in order and seeks to the first one
+  only): a frame's packets are taken from the movie's bytes at its
+  place in the index, so any frame costs what the first does.
+  BinkGetKeyFrame answers from the index by its BINKGETKEY flags.
+  BinkGoto decodes from the key frame before its target (not at all
+  with BINKGOTOQUICK) and shows none of those frames; the next
+  BinkDoFrame decodes the target. Its cost is the distance between
+  two key frames, so a movie whose only key frame is its first
+  decodes from frame 1. Bink keeps a movie's first 750 ms of sound in
+  its first frame, so the sound of the target's time on is in the
+  frames that long before it: what was queued is dropped and the
+  sound from that many frames before the target is queued (silence
+  with BINKGOTOQUICKSOUND), none of the sound of frames decoded only
+  for the picture. A frame the decoder refuses, or one the movie's
+  bytes do not hold whole, keeps the picture before it and counts as
+  a frame; after it, as after BINKGOTOQUICK, a jump starts from the
+  key frame again. BinkNextFrame on the last frame goes to the first.
+  BinkWait finds a movie's first frame and a jump's target due when
+  first asked, the frames after them a frame's time apart. When the
+  caller falls behind: Bink's documentation says only that BinkDoFrame
+  may skip decompressing a frame if the audio is falling behind the
+  video (never with BINKNOSKIP); what it does after a long stop is not
+  documented. The choice here: up to half a second behind, frames stay
+  due when they were (BinkWait says so until the movie has caught up);
+  further behind (a game that stopped), the movie goes on from the
+  frame it is at, paced from then, and its sound, which the mixer
+  played on meanwhile, is queued again for that frame as after a jump
+  (hle/bink_play.h). A movie opened by
   name or from memory (BINKFROMMEMORY) is copied when opened. One at
   the position of a file handle of the game's (BINKFILEHANDLE: movies
   of up to a gigabyte inside a resource file) is mapped read-only
@@ -1051,8 +1080,9 @@ late-frame rule; on an idle host wake-ups land 15-30 us (Linux) or
   frames only; the handle is neither moved nor closed, and a file that
   cannot be mapped gives no movie. The 1.x API up to
   Bink 1.8's: sound tracks by ID (BINKSNDTRACK, the track list in the
-  BINK struct), per-track volume, BinkCopyToBufferRect, BinkGoto,
-  BinkGetRealtime.
+  BINK struct), per-track volume, BinkCopyToBufferRect,
+  BinkGetRealtime; of 1.9's, the game's own frame buffers
+  (BinkRegisterFrameBuffers) and BinkShouldSkip.
 - wmvcore: the Windows Media Format SDK's synchronous reader
   (WMCreateSyncReader) on ffmpeg, for games that play the player's own
   music files: one audio stream decoded to 16-bit stereo PCM at the

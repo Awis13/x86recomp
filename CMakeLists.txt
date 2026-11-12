@@ -191,6 +191,7 @@ if(FFMPEG_FOUND)
 
   # Bink video (binkw32) on ffmpeg; audio through the Miles mixer.
   add_library(recomp_bink SHARED src/runtime/hle/binkw32.cpp
+              src/runtime/hle/bink_play.cpp
               src/runtime/hle/bink_source.cpp)
   target_link_libraries(recomp_bink PUBLIC recomp_mss32)
 
