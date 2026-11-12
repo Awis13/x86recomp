@@ -780,6 +780,8 @@ class MetalDevice final : public Device {
                   (unsigned long long)c.first_drawn, (unsigned long long)c.joins, double(c.join_ns) / 1e6,
                   (unsigned long long)c.ahead_compiles, double(c.ahead_ns) / 1e6, shader_jobs_.Pending());
     std::string out(b, size_t(std::clamp(len, 0, int(sizeof b) - 1)));
+    std::snprintf(b, sizeof b, "; %.1f sampled-depth specialized draws per frame", double(c.sampled_depth_draws) / f);
+    out += b;
     if (archive_) {
       // Lookups in the pipeline archive (found or not, and the time the
       // misses cost), new pipelines saved in all and still to be saved, and
@@ -1338,7 +1340,7 @@ class MetalDevice final : public Device {
   // (RECOMP_SHADER_LANES=0). (Compiled here, recipes' shaders held the
   // game's thread for seconds while loading when only the OS's cache of
   // compiled shaders was empty.)
-  ShaderId MakeShader(const hlsl::Program& prog, bool ahead) {
+  ShaderId MakeShader(const hlsl::Program& prog, bool ahead, bool sampled_depth = false) {
     std::lock_guard<std::recursive_mutex> l(mu_);
     TakeOverFinished();
     const uint64_t perf_t0 = perf_ ? NowNs() : 0;
@@ -1350,6 +1352,19 @@ class MetalDevice final : public Device {
       sh.position_matrix = prog.position_matrix;
       sh.position_note = prog.position_note;
       sh.float_reads = prog.float_reads;
+      sh.alive = std::make_shared<std::atomic<bool>>(true);
+      // Extra variants pay off on shaders with many texture reads. Count
+      // the translator's sampling macro, once, rather than specializing
+      // simple copies or every material drawn in the scene.
+      if (prog.stage == hlsl::Stage::Pixel && !sampled_depth) {
+        size_t at = 0;
+        for (int n = 0; n < 8; n++) {
+          at = prog.glsl.find("R_DEPTH_TEX(", at);
+          if (at == std::string::npos) break;
+          at++;
+          if (n == 7) sh.depth_sample_candidate = true;
+        }
+      }
       sh.sampler_type.fill(hlsl::ParamType::Void);
       for (const hlsl::Sampler& smp : prog.samplers) {
         if (smp.reg >= 16) FatalF("gfx: shader sampler register %u", smp.reg);
@@ -1644,6 +1659,7 @@ class MetalDevice final : public Device {
   // compile at a time there, at background priority (an iPad's GPU
   // compiler and cores busy with several slowed the game for minutes).
   void SetUpShaderLanes() {
+    if (const char* e = std::getenv("RECOMP_SAMPLED_DEPTH")) sampled_depth_ = *e != '0';
     const char* lz = std::getenv("RECOMP_LAZY_SHADERS");
     lazy_ = !(lz && *lz == '0');
     if (!lazy_) {
@@ -1672,8 +1688,11 @@ class MetalDevice final : public Device {
     std::lock_guard<std::recursive_mutex> l(mu_);
     auto it = shaders_.find(sid);
     if (it == shaders_.end() || sid >= kClearVs) return;
+    if (it->second.alive) it->second.alive->store(false);
     const auto variants = std::move(it->second.variants);
     for (const auto& [mask, vid] : variants) DestroyShader(vid);  // `it` stays valid
+    const auto depth_variants = std::move(it->second.depth_variants);
+    for (const auto& [mask, vid] : depth_variants) DestroyShader(vid);
     Keep(it->second.fn);
     // Not compiled yet: the last waiting for its translation drops its job.
     if (!it->second.fn && waiters_.Remove(it->second.hash, sid)) shader_jobs_.Remove(it->second.hash);
@@ -1685,6 +1704,7 @@ class MetalDevice final : public Device {
       std::lock_guard<std::mutex> pl(prebuilt_mu_);
       for (auto p = prebuilt_.begin(); p != prebuilt_.end();)
         p = p->first.vs == sid || p->first.ps == sid ? prebuilt_.erase(p) : std::next(p);
+      std::erase_if(prebuilt_ready_, [sid](const PipeKey& k) { return k.vs == sid || k.ps == sid; });
     }
     Rec([this, sid] {
       last_pipe_ = nil;
@@ -1738,7 +1758,7 @@ class MetalDevice final : public Device {
     WarnUnsupportedShaderState();
     MTLScissorRect sc;
     if (!DrawScissor(&sc)) return;
-    if (!BeginDraw()) return;
+    if (!BeginDraw(gp_on_ ? shaders_.find(ps_id)->second.hash : 0)) return;
     if (pass_.scene && !pass_.low) frame_scene_ = true;
     // Jittered for the temporal upscaler: the scene's geometry (depth
     // tested and written), not full-target quads.
@@ -1782,6 +1802,22 @@ class MetalDevice final : public Device {
     if (!drawn_ps.fn) EnsureShader(ps_id);
     const bool ps_lean = drawn_ps.has_lean;
     if (ps_lean && (!rs_[15] || rs_[25] == 8)) pk.lean |= kLeanPs;
+    // Small full-screen draws with many samples: remove the uniform
+    // per-sample depth-type branches. Neither shaders nor pipelines are
+    // compiled on this draw's path: keep drawing the original until both
+    // are ready. The actual texture types are checked again every draw.
+    if (sampled_depth_ && tri && count <= 2 && pass_.w >= 512 && pass_.h >= 512 && drawn_ps.depth_sample_candidate &&
+        lazy_ && !lanes_.empty()) {
+      const ShaderId variant = SampledDepthVariant(ps_id, SampledDepthMask(d, drawn_ps));
+      if (variant != ps_id && shaders_.at(variant).fn) {
+        PipeKey specialized = pk;
+        specialized.ps = variant;
+        if (PrebuildPipeline(specialized)) {
+          pk = specialized;
+          if (perf_) pc_.sampled_depth_draws++;
+        }
+      }
+    }
     BindPipeline(pk);
 
     // Depth and stencil.
@@ -2852,8 +2888,36 @@ void main() {
     // (PixelShaderFor).
     std::shared_ptr<const hlsl::Program> program;
     std::unordered_map<uint32_t, ShaderId> variants;
+    std::unordered_map<uint16_t, ShaderId> depth_variants;
+    bool depth_sample_candidate = false;
+    std::shared_ptr<std::atomic<bool>> alive;
     bool has_lean = false;  // also made lean (MslOptions(false)): kLeanPs
   };
+
+  uint16_t SampledDepthMask(const ShaderDraw& d, const Shader& ps) {
+    uint16_t mask = 0;
+    for (uint32_t r = 0; r < ps.samplers; r++)
+      if (ps.sampler_type[r] != hlsl::ParamType::Void)
+        if (const Tex* t = FindTex(d.textures[r]); t && t->depth && ReversedDepth(t->tex.pixelFormat))
+          mask |= uint16_t(1u << r);
+    return mask;
+  }
+
+  ShaderId SampledDepthVariant(ShaderId sid, uint16_t mask) {
+    Shader& ps = shaders_.at(sid);
+    if (auto it = ps.depth_variants.find(mask); it != ps.depth_variants.end()) return it->second;
+    // Bound the extra functions and pipelines even if an application
+    // repeatedly rebinds a shader's samplers to different texture types.
+    if (!ps.program || ps.depth_variants.size() >= 4) return sid;
+    hlsl::Program p = *ps.program;
+    p.glsl = MetalSampledDepthGlsl(p, mask);
+    const ShaderId variant = MakeShader(p, true, true);
+    ps.depth_variants.emplace(mask, variant);
+    if (perf_)
+      std::fprintf(stderr, "gfx: sampled-depth shader %016llx mask %04x -> %016llx\n",
+                   (unsigned long long)ps.hash, unsigned(mask), (unsigned long long)shaders_.at(variant).hash);
+    return variant;
+  }
 
   // The pixel shader `sid` (ps) as drawn after a vertex shader writing
   // the varying locations `written`: itself if that covers its inputs,
@@ -3631,9 +3695,10 @@ void main() {
     MTLClearColor clear_color;
     double clear_depth;
     uint8_t clear_stencil;
+    uint64_t pixel_hash;  // the draw that opened the encoder (0 for a clear)
   };
 
-  void BeginPassEncoder() {
+  void BeginPassEncoder(uint64_t pixel_hash = 0) {
     if (perf_) pc_.passes++;
     if (blit_open_) Rec([this] {
       [blit_ endEncoding];
@@ -3642,6 +3707,7 @@ void main() {
     blit_open_ = false;
     EnsureFrame();
     PassDesc pd{};
+    pd.pixel_hash = pixel_hash;
     for (int i = 0; i < pass_.targets; i++) {
       pd.color[i] = pass_.color[i];
       pd.level[i] = pass_.level[i];
@@ -3705,9 +3771,9 @@ void main() {
   }
 
   // An encoder for the D3D targets; false if there is no colour target.
-  bool BeginDraw() {
+  bool BeginDraw(uint64_t pixel_hash = 0) {
     if (!pass_.color[0]) return false;
-    if (!enc_open_) BeginPassEncoder();
+    if (!enc_open_) BeginPassEncoder(pixel_hash);
     return true;
   }
 
@@ -4059,39 +4125,57 @@ void main() {
       PipeKey k = r.key;
       k.vs = vs->second;
       k.ps = ps->second;
-      NSString* src = nil;  // the pixel shader's MSL, for its lean variant
-      if (k.lean & kLeanPs) {
-        auto m = msl_cache_.find(r.ps);
-        if (m == msl_cache_.end() || !shaders_.at(k.ps).has_lean) continue;
-        src = @(m->second->c_str());
-      }
-      // (Shaders a recipe names are compiled on the lanes as soon as they
-      // are made; this runs again when each is done, Finish.)
-      if (!shaders_.at(k.vs).fn || !shaders_.at(k.ps).fn) continue;
-      if (!prebuild_started_.insert(k).second) continue;
-      MTLRenderPipelineDescriptor* pd = Describe(k, shaders_.at(k.vs).fn, shaders_.at(k.ps).fn);
-      id<MTLDevice> dev = dev_;
-      std::mutex* mu = &prebuilt_mu_;
-      auto* done = &prebuilt_;
-      const uint64_t ps_hash = r.ps;
-      std::atomic<bool>* closing = &closing_;
-      std::shared_ptr<PipelineArchive> archive = archive_;
-      const uint64_t archive_key = Fnv64(&r, sizeof r);
-      Ahead(ps_hash, ^{
-        if (closing->load()) return;
-        if (src) {
-          id<MTLFunction> ps = Lean(ps_hash, src);
-          if (!ps || closing->load()) return;
-          pd.fragmentFunction = ps;
-        }
-        NSError* err = nil;
-        id<MTLRenderPipelineState> p = archive ? archive->Build(pd, archive_key, &err)
-                                               : [dev newRenderPipelineStateWithDescriptor:pd error:&err];
-        if (!p) return;
-        std::lock_guard<std::mutex> l(*mu);
-        (*done)[k] = p;
-      });
+      PrebuildPipeline(k);
     }
+  }
+
+  // Queue a pipeline when its functions are ready; true only after the
+  // background build finished. Ready keys survive the encoding thread's
+  // move from prebuilt_ into pipelines_, so a draw never oscillates back
+  // to the generic shader after that move.
+  bool PrebuildPipeline(PipeKey k) {  // captured by value by the asynchronous block
+    {
+      std::lock_guard<std::mutex> l(prebuilt_mu_);
+      if (prebuilt_ready_.count(k)) return true;
+    }
+    const Shader& vs = shaders_.at(k.vs);
+    const Shader& ps = shaders_.at(k.ps);
+    if (!vs.fn || !ps.fn) return false;
+    NSString* src = nil;
+    if (k.lean & kLeanPs) {
+      auto m = msl_cache_.find(ps.hash);
+      if (m == msl_cache_.end() || !ps.has_lean) return false;
+      src = @(m->second->c_str());
+    }
+    if (!prebuild_started_.insert(k).second) return false;
+    MTLRenderPipelineDescriptor* pd = Describe(k, vs.fn, ps.fn);
+    id<MTLDevice> dev = dev_;
+    const uint64_t ps_hash = ps.hash;
+    const Recipe recipe = RecipeOf(vs.hash, ps_hash, k);
+    const uint64_t archive_key = Fnv64(&recipe, sizeof recipe);
+    const auto vs_alive = vs.alive, ps_alive = ps.alive;
+    std::shared_ptr<PipelineArchive> archive = archive_;
+    Ahead(ps_hash, ^{
+      if (closing_.load()) return;
+      if (src) {
+        id<MTLFunction> fn = Lean(ps_hash, src);
+        if (!fn || closing_.load()) return;
+        pd.fragmentFunction = fn;
+      }
+      NSError* err = nil;
+      id<MTLRenderPipelineState> p = archive ? archive->Build(pd, archive_key, &err)
+                                             : [dev newRenderPipelineStateWithDescriptor:pd error:&err];
+      if (!p) {
+        std::fprintf(stderr, "gfx: background pipeline failed: %s\n", err.localizedDescription.UTF8String);
+        return;
+      }
+      std::lock_guard<std::mutex> l(prebuilt_mu_);
+      // A shader can have been destroyed while the build was running.
+      if ((vs_alive && !vs_alive->load()) || (ps_alive && !ps_alive->load())) return;
+      prebuilt_[k] = p;
+      prebuilt_ready_.insert(k);
+    });
+    return false;
   }
 
   void BindPipeline(const PipeKey& k) {
@@ -4717,11 +4801,12 @@ void main() {
     const size_t n = p.names.size();
     if (n >= kTimedPasses) return;
     id<MTLTexture> t = pd.color[0];
-    char name[96];
-    std::snprintf(name, sizeof name, "%lux%lu x%d fmt %lu %c%c",
+    char name[128];
+    std::snprintf(name, sizeof name, "%lux%lu x%d fmt %lu %c%c ps:%016llx",
                   (unsigned long)(t.width >> pd.level[0]), (unsigned long)(t.height >> pd.level[0]),
                   pd.targets, (unsigned long)t.pixelFormat, (pd.clear & 1) ? 'C' : 'L',
-                  pd.depth ? ((pd.clear & 2) ? 'C' : 'L') : '-');
+                  pd.depth ? ((pd.clear & 2) ? 'C' : 'L') : '-',
+                  (unsigned long long)pd.pixel_hash);
     p.names.push_back(name);
     MTLRenderPassSampleBufferAttachmentDescriptor* a = rp.sampleBufferAttachments[0];
     a.sampleBuffer = p.buf;
@@ -4847,6 +4932,7 @@ void main() {
   std::vector<Recipe> recipes_;
   std::unordered_multimap<uint64_t, size_t> recipe_by_shader_;
   std::unordered_set<PipeKey, BytesHash<PipeKey>> prebuild_started_;
+  std::unordered_set<PipeKey, BytesHash<PipeKey>> prebuilt_ready_;  // prebuilt_mu_
   std::mutex prebuilt_mu_;
   std::unordered_map<PipeKey, id<MTLRenderPipelineState>, BytesHash<PipeKey>> prebuilt_;
   size_t prebuilt_used_ = 0;  // encoding thread
@@ -4863,6 +4949,7 @@ void main() {
   // waiting for each; the rest under mu_.
   ShaderJobs shader_jobs_;
   Waiters<uint64_t, ShaderId> waiters_;
+  bool sampled_depth_ = true;  // RECOMP_SAMPLED_DEPTH=0 disables shader specialization
   bool lazy_ = true;          // RECOMP_LAZY_SHADERS
   bool prefetching_ = false;  // the lanes have started (AdoptFinished)
   std::vector<dispatch_queue_t> lanes_;  // RECOMP_SHADER_LANES
@@ -4890,6 +4977,7 @@ void main() {
   // the encoding thread's atomic.
   struct PerfCounts {
     uint64_t frames = 0, draws = 0, draw_ns = 0, ops = 0, passes = 0;
+    uint64_t sampled_depth_draws = 0;  // with a specialized sampled-depth shader
     uint64_t w_draws = 0;  // with depth from w
     uint64_t w_other = 0;  // that would be, but have another projection than the buffer content's
     uint64_t uploads_ahead = 0, uploads_in_order = 0, upload_bytes = 0, in_order_bytes = 0;

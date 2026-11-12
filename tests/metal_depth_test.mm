@@ -180,11 +180,11 @@ Tokens BlitVs() {
 }
 
 // ps_3_0: s0 read at TEXCOORD0 as the colour.
-Tokens SamplePs() {
+Tokens SamplePs(uint32_t sampler = 0) {
   Asm a(true);
   a.Dcl(5, 0, Dst(V, 0));
-  a.DclSampler(2, 0);
-  a.I(TEX, {Dst(R, 0), Src(V, 0), Src(S, 0)});
+  a.DclSampler(2, sampler);
+  a.I(TEX, {Dst(R, 0), Src(V, 0), Src(S, sampler)});
   a.I(MOV, {Dst(OC, 0), Src(R, 0)});
   return a.End();
 }
@@ -216,7 +216,7 @@ struct Gpu {
   id<MTLCommandQueue> queue = [dev newCommandQueue];
   std::vector<hlsl::Semantic> vs_inputs;
 
-  id<MTLFunction> Compile(const Tokens& tokens) {
+  id<MTLFunction> Compile(const Tokens& tokens, int sampled_depth_mask = -1) {
     hlsl::Program p;
     std::string err;
     if (!hlsl::TranslateBytecode(tokens.data(), tokens.size(), &p, &err)) {
@@ -224,6 +224,7 @@ struct Gpu {
       return nil;
     }
     const bool vertex = p.stage == hlsl::Stage::Vertex;
+    if (sampled_depth_mask >= 0) p.glsl = gfx::MetalSampledDepthGlsl(p, uint16_t(sampled_depth_mask));
     if (vertex) vs_inputs = p.inputs;
     const std::string glsl = "#version 450\n" + gfx::MetalShaderPrelude(p.stage) + p.glsl;
     std::vector<uint32_t> spirv;
@@ -296,6 +297,7 @@ struct Gpu {
     int border = -1;           // s0 clamped to this MTLSamplerBorderColor (-1: the default sampler)
     id<MTLTexture> vtex = nil;  // vertex s0
     uint32_t vertex_depth_samplers = 0;
+    uint32_t texture_slot = 0;
   };
 
   id<MTLSamplerState> SamplerFor(int border) {
@@ -348,8 +350,8 @@ struct Gpu {
     [e setFragmentBytes:d.c length:sizeof d.c atIndex:0];
     [e setFragmentBytes:&pst length:sizeof pst atIndex:2];
     if (d.tex) {
-      [e setFragmentTexture:d.tex atIndex:0];
-      [e setFragmentSamplerState:SamplerFor(d.border) atIndex:0];
+      [e setFragmentTexture:d.tex atIndex:d.texture_slot];
+      [e setFragmentSamplerState:SamplerFor(d.border) atIndex:d.texture_slot];
     }
     if (d.vtex) {
       [e setVertexTexture:d.vtex atIndex:0];
@@ -591,6 +593,51 @@ int SampleChecks(Fixture& f) {
                   a[0], a[1], a[2], a[3], b[0], b[1], b[2], b[3], z_d3d[i]);
   }
   std::printf("%s depth texture read (R_DEPTH_TEX)\n", failures ? "FAIL" : "ok");
+  return failures;
+}
+
+// Specializing the sampled-depth mask must preserve every colour channel,
+// including alpha, for mixed depth/colour bindings and high sampler slots.
+int SampledDepthVariantChecks(Fixture& f) {
+  Gpu& g = f.g;
+  const float one[3] = {1, 1, 1};
+  id<MTLTexture> source = g.Texture(MTLPixelFormatRGBA32Float);
+  id<MTLRenderPipelineState> fill = g.Pipeline(f.vs, f.ps, MTLPixelFormatRGBA32Float, MTLPixelFormatInvalid);
+  if (!fill) return 1;
+  Gpu::Draw write{fill, g.DepthState(MTLCompareFunctionAlways, false), Cover(one, one),
+                  {{0.125f, 0.375f, 0.75f, 0.875f}, {}}, false};
+  g.Run(source, nil, 0, {write}, nullptr, nullptr);
+  int failures = 0;
+  for (uint32_t slot : {0u, 1u, 4u, 12u, 15u}) {
+    const Tokens tokens = SamplePs(slot);
+    id<MTLFunction> generic = g.Compile(tokens);
+    if (!generic) return 1;
+    for (uint32_t mask : {0u, 1u << slot, 0x1010u, 0xFFFFu}) {
+      id<MTLFunction> specialized = g.Compile(tokens, int(mask));
+      if (!specialized) return 1;
+      std::vector<float> pixels[2];
+      for (int variant = 0; variant < 2; variant++) {
+        id<MTLRenderPipelineState> pipe = g.Pipeline(f.vs, variant ? specialized : generic,
+                                                     MTLPixelFormatRGBA32Float, MTLPixelFormatInvalid);
+        if (!pipe) return 1;
+        Gpu::Draw read{pipe, g.DepthState(MTLCompareFunctionAlways, false), Cover(one, one), {}, false};
+        read.tex = source;
+        read.texture_slot = slot;
+        read.depth_samplers = mask;
+        g.Run(f.color, nil, 0, {read}, &pixels[variant], nullptr);
+      }
+      const float* p = &pixels[1][(kSize / 2 * kSize + kSize / 2) * 4];
+      const bool reversed = mask & (1u << slot);
+      const bool expected = p[0] == (reversed ? 0.875f : 0.125f) &&
+                            p[1] == (reversed ? 0.625f : 0.375f) &&
+                            p[2] == (reversed ? 0.25f : 0.75f) && p[3] == 0.875f;
+      if (pixels[0] != pixels[1] || !expected) {
+        std::printf("FAIL sampled-depth variant: sampler %u mask %04x\n", slot, mask);
+        failures++;
+      }
+    }
+  }
+  std::printf("%s sampled-depth shader variants (20 masks/slots, exact pixels)\n", failures ? "FAIL" : "ok");
   return failures;
 }
 
@@ -1081,6 +1128,7 @@ int main() {
     std::vector<float> z_d3d, z_rev;
     failures += PositionChecks(f, &z_d3d, &z_rev);
     failures += SampleChecks(f);
+    failures += SampledDepthVariantChecks(f);
     failures += CompareChecks(f);
     failures += DepthOutChecks(f);
     failures += BiasChecks(f);
