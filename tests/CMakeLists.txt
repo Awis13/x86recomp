@@ -75,6 +75,12 @@ target_include_directories(win32_text_test PRIVATE ${PROJECT_SOURCE_DIR}/src)
 target_compile_features(win32_text_test PRIVATE cxx_std_20)
 add_test(NAME win32_text COMMAND win32_text_test)
 
+# file_paths_test: drive-relative names must reach the installed file,
+# including the Windows-style benchmark recording path.
+add_executable(file_paths_test file_paths_test.cpp)
+target_link_libraries(file_paths_test PRIVATE recomp_runtime)
+add_test(NAME file_paths COMMAND file_paths_test)
+
 # lazy_mem_test: lazily read-back images (DirectDraw Lock of GPU
 # surfaces) through real page faults; portable.
 add_executable(lazy_mem_test lazy_mem_test.cpp
