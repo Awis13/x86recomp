@@ -131,6 +131,14 @@ target_compile_features(target_size_test PRIVATE cxx_std_20)
 target_link_libraries(target_size_test PRIVATE Threads::Threads)
 add_test(NAME target_size COMMAND target_size_test)
 
+# pad_effects_test: a pad's trigger effects (hle/pad_effects.h): the ranges
+# they are brought into, the blocks and the effects state a DualSense takes,
+# and the decision what a pad is sent next; portable.
+add_executable(pad_effects_test pad_effects_test.cpp)
+target_include_directories(pad_effects_test PRIVATE ${PROJECT_SOURCE_DIR}/src)
+target_compile_features(pad_effects_test PRIVATE cxx_std_20)
+add_test(NAME pad_effects COMMAND pad_effects_test)
+
 # locale_test: the user's language (GameConfig::user_lang_id,
 # <ID>_LANG_ID) as kernel32 answers it to a guest, one run per case: the
 # default, a port's language, the switch over the port's, a malformed
