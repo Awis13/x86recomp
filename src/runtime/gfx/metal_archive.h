@@ -139,6 +139,9 @@ class PipelineArchive : public std::enable_shared_from_this<PipelineArchive> {
   // if the process exits first: its temporary file is then removed by a
   // later run).
   void Close(double cap_s, const std::atomic<bool>* cancel = nullptr);
+  // A launcher sharing the game's process must finish queued work and
+  // release the writer lease before the game's own archive opens.
+  void CloseAndWait();
 
   Stats TakeStats();
 
