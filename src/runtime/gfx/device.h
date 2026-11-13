@@ -216,6 +216,10 @@ class Device {
   virtual void SetBackBufferAlpha(bool) {}
 
   // ---- resources
+  // A render target or depth buffer may be made at another size than
+  // asked for, the game none the wiser (the Metal backend's internal
+  // resolution and RECOMP_RT_BOOST); gfx/target_size.h has a port's way to
+  // keep the ones it names exact (BeginExactTargets).
   virtual TextureId CreateTexture(int w, int h, int levels, Format fmt,
                                   bool render_target) = 0;
   virtual void DestroyTexture(TextureId t) = 0;
