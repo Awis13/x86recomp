@@ -80,6 +80,7 @@
 #include "runtime/gfx/reversed_z.h"
 #include "runtime/gfx/shader_compile.h"
 #include "runtime/gfx/shader_jobs.h"
+#include "runtime/gfx/target_size.h"
 #include "runtime/log.h"
 
 // RECOMP_DISPLAY_LINK=1 (macOS 14+): the display hands out each drawable
@@ -522,7 +523,8 @@ class MetalDevice final : public Device {
       if (const char* g = std::getenv("RECOMP_MFX_SIGNS"))
         std::sscanf(g, "%f,%f,%f", &jitter_sign_[0], &jitter_sign_[1], &mv_sign_);
       // RECOMP_RT_BOOST=WxH:k,...: render targets (and depth buffers) of
-      // those sizes made k times larger in each direction.
+      // those sizes made k times larger in each direction, but for those a
+      // port creates as exact (gfx::BeginExactTargets, target_size.h).
       if (const char* b = std::getenv("RECOMP_RT_BOOST")) {
         for (const char* q = b; *q;) {
           RtBoost rb{};
@@ -1946,36 +1948,23 @@ class MetalDevice final : public Device {
     return reversed_z_ && (pf == MTLPixelFormatDepth32Float || pf == MTLPixelFormatDepth32Float_Stencil8);
   }
 
-  // The size a game's render target or depth buffer of w x h is made at:
-  // the back buffer's and its halves and quarters (the scene's buffers and
-  // their downsamples) at the internal resolution. False for the others.
+  // The size a game's render target or depth buffer of w x h is made at
+  // (target_size.h): the back buffer's and its halves and quarters (the
+  // scene's buffers and their downsamples) at the internal resolution,
+  // RECOMP_RT_BOOST's sizes larger unless the port wants this one exact.
+  // False for the others. It is called on the thread that creates the
+  // target, whose scope decides.
   bool ScaledSize(int w, int h, int* rw, int* rh, bool* scene = nullptr) const {
-    if (scene) *scene = false;
+    TargetSizing s;
     // SMAA works on the finished frame (Present): the scene is drawn as
     // with no upscaler.
-    if (upscaler_ != Upscaler::Off && upscaler_ != Upscaler::Smaa && bb_w_ > 0)
-      for (int k = 0; k < 3; k++)
-        if (w == bb_w_ >> k && h == bb_h_ >> k) {
-          // TAA: the scene's buffers (jittered) at their own size; the scene
-          // goes to the back buffer itself, as with no upscaler.
-          if (upscaler_ == Upscaler::Taa) {
-            if (scene) *scene = true;
-            return false;
-          }
-          *rw = std::max(1, int(std::lround(w * render_scale_)));
-          *rh = std::max(1, int(std::lround(h * render_scale_)));
-          if (scene) *scene = true;
-          return true;
-        }
-    // RECOMP_RT_BOOST: targets of these sizes made larger (shadow maps,
-    // reflections), the game none the wiser.
-    for (const RtBoost& b : rt_boost_)
-      if (w == b.w && h == b.h && (bb_w_ <= 0 || w != bb_w_ || h != bb_h_)) {
-        *rw = std::min(16384, w * b.k);
-        *rh = std::min(16384, h * b.k);
-        return true;
-      }
-    return false;
+    s.internal = upscaler_ != Upscaler::Off && upscaler_ != Upscaler::Smaa;
+    s.taa = upscaler_ == Upscaler::Taa;
+    s.bb_w = bb_w_;
+    s.bb_h = bb_h_;
+    s.render_scale = render_scale_;
+    s.boost = rt_boost_;
+    return TargetSize(s, w, h, rw, rh, scene);
   }
 
   // The composite's target: the back buffer at the internal resolution.
@@ -4785,10 +4774,7 @@ void main() {
   float clip_planes_[6][4] = {};  // SetClipPlane
   // The upscaler (RECOMP_UPSCALER): recording side, except as noted.
   Upscaler upscaler_ = Upscaler::Off;
-  struct RtBoost {
-    int w, h, k;
-  };
-  std::vector<RtBoost> rt_boost_;  // RECOMP_RT_BOOST
+  std::vector<RtBoost> rt_boost_;  // RECOMP_RT_BOOST (target_size.h)
   float render_scale_ = 1.0f;
   id<MTLLibrary> internal_lib_ = nil;
   id<MTLDepthStencilState> depth_copy_ds_ = nil;

@@ -120,6 +120,17 @@ target_include_directories(display_modes_test PRIVATE ${PROJECT_SOURCE_DIR}/src)
 target_compile_features(display_modes_test PRIVATE cxx_std_20)
 add_test(NAME display_modes COMMAND display_modes_test)
 
+# target_size_test: the size render targets and depth buffers are made at
+# (gfx/target_size.h): RECOMP_RT_BOOST's sizes and cap, the scene's buffers
+# at the internal resolution, and a port's scope of exact targets, on its
+# thread only; portable.
+add_executable(target_size_test target_size_test.cpp
+               ${PROJECT_SOURCE_DIR}/src/runtime/gfx/target_size.cpp)
+target_include_directories(target_size_test PRIVATE ${PROJECT_SOURCE_DIR}/src)
+target_compile_features(target_size_test PRIVATE cxx_std_20)
+target_link_libraries(target_size_test PRIVATE Threads::Threads)
+add_test(NAME target_size COMMAND target_size_test)
+
 # locale_test: the user's language (GameConfig::user_lang_id,
 # <ID>_LANG_ID) as kernel32 answers it to a guest, one run per case: the
 # default, a port's language, the switch over the port's, a malformed
