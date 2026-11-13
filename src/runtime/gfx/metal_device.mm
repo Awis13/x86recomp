@@ -75,6 +75,7 @@
 #include "runtime/gfx/smaa/AreaTex.h"
 #include "runtime/gfx/smaa/SearchTex.h"
 #include "smaa_hlsl.h"
+#include "runtime/gfx/metal_new_target.h"
 #include "runtime/gfx/metal_prelude.h"
 #include "runtime/gfx/rcas.h"
 #include "runtime/gfx/reversed_z.h"
@@ -870,6 +871,22 @@ class MetalDevice final : public Device {
     if (fmt == Format::P8) WarnF("gfx: P8 texture (no palette support)\n");
     TextureId tid = NewTexId();
     AddTex(tid, t);
+    if (rt) {
+      // Zeros before anything can touch it (metal_new_target.h): cleared
+      // in the frame's upload command buffer, which the GPU runs before
+      // the frame's own (BeginFrame), so before every draw into it, every
+      // read of it and every upload made in order; an upload made ahead of
+      // the frame goes into the same buffer, later in it, as recorded.
+      // The frame's render pass stays open. These passes are not the
+      // frame's: neither counted nor timed with them.
+      EnsureFrame();
+      __unsafe_unretained id<MTLTexture> fresh = t.tex;  // kept by textures_, then by Keep
+      Rec([this, fresh] {
+        if (upload_blit_) [upload_blit_ endEncoding];
+        upload_blit_ = nil;
+        ClearNewTarget(upload_cb_, fresh);
+      });
+    }
     return tid;
   }
 

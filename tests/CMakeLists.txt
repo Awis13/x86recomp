@@ -293,6 +293,34 @@ if(APPLE)
   set_tests_properties(metal_archive PROPERTIES SKIP_RETURN_CODE 77)
 endif()
 
+# metal_new_target_test: a new render target on the Metal backend
+# (gfx/metal_new_target.h) holds zeros in every level, whatever the
+# texture held before (skipped without a Metal device); macOS.
+if(APPLE)
+  add_executable(metal_new_target_test metal_new_target_test.mm)
+  set_source_files_properties(metal_new_target_test.mm PROPERTIES COMPILE_OPTIONS "-fobjc-arc;-std=c++20")
+  target_include_directories(metal_new_target_test PRIVATE "${PROJECT_SOURCE_DIR}/src")
+  target_link_libraries(metal_new_target_test PRIVATE "-framework Metal" "-framework Foundation")
+  add_test(NAME metal_new_target COMMAND metal_new_target_test)
+  set_tests_properties(metal_new_target PROPERTIES SKIP_RETURN_CODE 77)
+endif()
+
+# metal_target_device_test: the same through the Metal device itself
+# (CreateTexture, with a hidden window): a new render target never drawn
+# reads back zeros, and what is filled or uploaded into one in the frame it
+# was made in, or a frame later, is what reads back (skipped without a
+# Metal device or a window). The device's caches go to a home folder in
+# the build tree; macOS.
+if(APPLE AND NOT RECOMP_IOS)
+  add_executable(metal_target_device_test metal_target_device_test.cpp)
+  target_compile_features(metal_target_device_test PRIVATE cxx_std_20)
+  target_include_directories(metal_target_device_test PRIVATE "${PROJECT_SOURCE_DIR}/src")
+  target_link_libraries(metal_target_device_test PRIVATE recomp_gfx SDL3::SDL3)
+  add_test(NAME metal_target_device COMMAND metal_target_device_test)
+  set_tests_properties(metal_target_device PROPERTIES SKIP_RETURN_CODE 77
+    ENVIRONMENT "CFFIXED_USER_HOME=${CMAKE_CURRENT_BINARY_DIR}/metal_target_device_home")
+endif()
+
 # metal_prewarm_test: PrewarmCaches (gfx/prewarm.h) on a cache folder of
 # its own: everything a game's recipes list built into the pipeline
 # archive, and stopped soon when cancelled (skipped without a Metal
