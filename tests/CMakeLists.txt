@@ -162,6 +162,12 @@ set_tests_properties(locale_switch_malformed PROPERTIES
 set_tests_properties(locale_port_invalid PROPERTIES
                      PASS_REGULAR_EXPRESSION "FATAL: GameConfig::user_lang_id 0019: not a language id")
 
+# file_paths_test: drive-relative names must reach the installed file,
+# including the Windows-style benchmark recording path.
+add_executable(file_paths_test file_paths_test.cpp)
+target_link_libraries(file_paths_test PRIVATE recomp_runtime)
+add_test(NAME file_paths COMMAND file_paths_test)
+
 # lazy_mem_test: lazily read-back images (DirectDraw Lock of GPU
 # surfaces) through real page faults; portable.
 add_executable(lazy_mem_test lazy_mem_test.cpp
