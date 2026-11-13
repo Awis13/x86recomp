@@ -478,6 +478,22 @@ int main() {
       Check(a->TakeStats().saved == 2 && FileBytes(a->ShardPath(0)) > 0, "the last save finished after the cap");
     }
 
+    // ---- same-process launcher: queued saves and the writer lease must
+    // be gone before the gameplay archive opens, even behind slow work.
+    {
+      auto opts = options(Scope("launcher-handoff", "gpu0"));
+      auto launcher = open(opts);
+      build(*launcher,2);
+      dispatch_async(launcher->QueueForTests(), ^{ usleep(250000); });
+      const auto t0 = std::chrono::steady_clock::now();
+      launcher->CloseAndWait();
+      Check(Seconds(t0) >= 0.2,"CloseAndWait drains queued work");
+      auto game = open(opts);
+      Check(game->Saves(),"game acquires writer after CloseAndWait");
+      Check(launcher->TakeStats().pending == 0,"no unsaved launcher pipelines remain");
+      game->CloseAndWait();
+    }
+
     // ---- built before the shards loaded and in them: not saved again;
     // a run that only finds what it looks for writes nothing.
     {
