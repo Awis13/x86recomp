@@ -225,7 +225,8 @@ add_library(recomp_gfx SHARED
   src/runtime/gfx/format.cpp
   src/runtime/gfx/device.cpp
   src/runtime/gfx/gpu_device.cpp
-  src/runtime/gfx/shader_compile.cpp)
+  src/runtime/gfx/shader_compile.cpp
+  src/runtime/gfx/target_size.cpp)
 target_include_directories(recomp_gfx PUBLIC src)
 target_compile_features(recomp_gfx PUBLIC cxx_std_20)
 # Shaders translated at run time (Direct3D 9) are compiled then: glslang
