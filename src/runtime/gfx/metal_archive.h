@@ -72,16 +72,22 @@ class PipelineArchive : public std::enable_shared_from_this<PipelineArchive> {
   // A shard is not grown past this (checked after each save): Metal has
   // failed saving archives of about 110 MB on iOS, which uses half of it.
   static constexpr uint64_t kShardCap = 64ull << 20;
+  // Preparation and gameplay must use the same retention budget. Otherwise
+  // opening the game's smaller archive immediately evicts prepared shards.
+  static constexpr bool kMobile = TARGET_OS_IOS || TARGET_OS_TV;
+  static constexpr uint64_t kPlatformShardCap = kMobile ? 32ull << 20 : kShardCap;
+  static constexpr unsigned kPlatformMaxPipelines = kMobile ? 256 : 384;
+  static constexpr uint64_t kPlatformMaxBytes = 4 * kPlatformShardCap;
 
   struct Options {
     std::string dir;    // made if missing
     std::string scope;  // lines of key=value; DefaultScope's by default
-    uint64_t shard_cap = kShardCap;
+    uint64_t shard_cap = kPlatformShardCap;
     // A shard's pipelines at most (each save of the run's shard adds them
     // all again and writes them all).
-    unsigned max_pipelines = 384;
+    unsigned max_pipelines = kPlatformMaxPipelines;
     // A scope's shards in all: the oldest removed past either.
-    uint64_t max_bytes = 4 * kShardCap;
+    uint64_t max_bytes = kPlatformMaxBytes;
     unsigned max_shards = 32;
     // The queue's: its target queue (iOS and tvOS: the device's AheadQueue,
     // so saves and the compiles ahead take turns), or nil: a queue of its

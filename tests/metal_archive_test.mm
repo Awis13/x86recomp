@@ -100,8 +100,22 @@ double Seconds(std::chrono::steady_clock::time_point t0) {
 
 }  // namespace
 
+#if TARGET_OS_IOS || TARGET_OS_TV
+static_assert(PipelineArchive::kPlatformShardCap == 32ull << 20);
+static_assert(PipelineArchive::kPlatformMaxPipelines == 256);
+static_assert(PipelineArchive::kPlatformMaxBytes == 128ull << 20);
+#else
+static_assert(PipelineArchive::kPlatformShardCap == 64ull << 20);
+static_assert(PipelineArchive::kPlatformMaxPipelines == 384);
+static_assert(PipelineArchive::kPlatformMaxBytes == 256ull << 20);
+#endif
+
 int main() {
   @autoreleasepool {
+    const PipelineArchive::Options defaults;
+    Check(defaults.shard_cap == PipelineArchive::kPlatformShardCap, "prewarm and game share shard budget");
+    Check(defaults.max_pipelines == PipelineArchive::kPlatformMaxPipelines, "prewarm and game share pipeline budget");
+    Check(defaults.max_bytes == PipelineArchive::kPlatformMaxBytes, "prewarm and game share archive retention budget");
     id<MTLDevice> dev = MTLCreateSystemDefaultDevice();
     if (!dev) {
       std::fprintf(stderr, "metal_archive_test: no Metal device, skipped\n");
