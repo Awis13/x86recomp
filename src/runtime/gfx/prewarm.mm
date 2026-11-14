@@ -4,7 +4,7 @@
 
 #include <TargetConditionals.h>
 
-#if TARGET_OS_OSX
+#if TARGET_OS_OSX || TARGET_OS_TV || TARGET_OS_IOS
 
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
@@ -57,11 +57,21 @@ std::string Stamp(const std::string& path) {
 std::shared_ptr<const Sources> LoadSources(const std::string& dir) {
   static std::mutex mu;
   static std::string last_stamp;
+#if TARGET_OS_TV || TARGET_OS_IOS
+  // Do not retain the source cache during gameplay on memory-limited TVs.
+  static std::weak_ptr<const Sources> last;
+#else
   static std::shared_ptr<const Sources> last;
+#endif
   const std::string msl_path = MslCacheFile(dir), recipe_path = RecipeFile(dir);
   const std::string stamp = dir + "|" + Stamp(msl_path) + "|" + Stamp(recipe_path);
   std::lock_guard<std::mutex> l(mu);
-  if (last && stamp == last_stamp) return last;
+#if TARGET_OS_TV || TARGET_OS_IOS
+  auto cached = last.lock();
+#else
+  auto cached = last;
+#endif
+  if (cached && stamp == last_stamp) return cached;
   auto src = std::make_shared<Sources>();
   if (FILE* f = std::fopen(msl_path.c_str(), "rb")) {
     uint64_t h;
@@ -91,6 +101,7 @@ struct Plan {
   std::shared_ptr<const Sources> src;
   std::vector<PipelineRecipe> recipes;
   std::vector<FunctionSpec> functions;
+  size_t cached = 0;
 };
 
 Plan MakePlan(const std::string& dir, id<MTLDevice> dev) {
@@ -100,7 +111,7 @@ Plan MakePlan(const std::string& dir, id<MTLDevice> dev) {
   const std::unordered_set<uint64_t> saved = PipelineArchive::SavedKeys(ArchiveFolder(dir), ArchiveScope(dev));
   std::unordered_set<uint64_t> fns;
   for (const PipelineRecipe& r : p.src->recipes) {
-    if (saved.count(ArchiveKey(r))) continue;
+    if (saved.count(ArchiveKey(r))) { p.cached++; continue; }
     auto vs = msl.find(r.vs), ps = msl.find(r.ps);
     if (vs == msl.end() || ps == msl.end()) continue;
     const bool lean = r.key.lean & kLeanPs;
@@ -135,20 +146,33 @@ void Parallel(size_t n, unsigned threads, const std::atomic<bool>& cancel, F fn)
 }  // namespace
 
 bool PrewarmNeeded(const std::string& cache_dir) {
+  return InspectPrewarmCache(cache_dir) == PrewarmCacheState::Needed;
+}
+
+PrewarmCacheState InspectPrewarmCache(const std::string& cache_dir) {
   @autoreleasepool {
     id<MTLDevice> dev = MTLCreateSystemDefaultDevice();
-    if (!dev) return false;
-    return !MakePlan(cache_dir.empty() ? MetalCacheDir() : cache_dir, dev).recipes.empty();
+    if (!dev) return PrewarmCacheState::Unavailable;
+    Plan plan = MakePlan(cache_dir.empty() ? MetalCacheDir() : cache_dir, dev);
+    if (plan.src->msl.empty() || plan.src->recipes.empty()) return PrewarmCacheState::Empty;
+    return plan.recipes.empty() ? PrewarmCacheState::Ready : PrewarmCacheState::Needed;
   }
 }
 
 PrewarmResult PrewarmCaches(const PrewarmProgress& progress, const std::atomic<bool>& cancel,
                             const std::string& cache_dir) {
-  return PrewarmCaches(progress, cancel, cache_dir, PrewarmArchiveLimits());
+  PrewarmArchiveLimits limits;
+#if TARGET_OS_TV || TARGET_OS_IOS
+  limits.workers = 1;
+  limits.max_unsaved = 64;
+  limits.drain_on_close = true;
+#endif
+  return PrewarmCaches(progress, cancel, cache_dir, limits);
 }
 
 PrewarmResult PrewarmCaches(const PrewarmProgress& progress, const std::atomic<bool>& cancel,
-                            const std::string& cache_dir, const PrewarmArchiveLimits& limits) {
+                            const std::string& cache_dir, const PrewarmArchiveLimits& limits,
+                            const PrewarmStatusProgress& status) {
   @autoreleasepool {
     id<MTLDevice> dev = MTLCreateSystemDefaultDevice();
     if (!dev) return PrewarmResult::Unavailable;
@@ -174,15 +198,27 @@ PrewarmResult PrewarmCaches(const PrewarmProgress& progress, const std::atomic<b
     const size_t total = plan.functions.size() + plan.recipes.size();
     std::atomic<size_t> done{0};
     std::mutex report_mu;
+    PrewarmStatus current;
+    current.functions_total = plan.functions.size();
+    current.pipelines_ready = plan.cached;
+    current.pipelines_total = plan.cached + plan.recipes.size();
     // In order: the count taken under the lock the call is made under.
-    auto report = [&](const char* phase) {
+    auto report = [&](const char* phase, bool succeeded = true) {
       std::lock_guard<std::mutex> l(report_mu);
       const size_t n = ++done;
+      if (std::strcmp(phase, "shaders") == 0) current.functions_done++;
+      else {
+        current.phase = PrewarmStatus::Phase::Pipelines;
+        if (succeeded) current.pipelines_ready++;
+      }
+      if (status) status(current);
       if (progress) progress(n, total, phase);
     };
+    if (status) status(current);
     if (progress) progress(0, total, "shaders");
     // Half the cores, at most 4: the launcher's window stays responsive.
-    const unsigned threads = std::clamp<unsigned>(unsigned(NSProcessInfo.processInfo.activeProcessorCount / 2), 1, 4);
+    const unsigned threads = std::clamp<unsigned>(limits.workers ? limits.workers :
+        unsigned(NSProcessInfo.processInfo.activeProcessorCount / 2), 1, 4);
     std::fprintf(stderr, "gfx: prewarm: %zu shaders, %zu pipelines, %u threads\n", plan.functions.size(),
                  plan.recipes.size(), threads);
 
@@ -199,6 +235,10 @@ PrewarmResult PrewarmCaches(const PrewarmProgress& progress, const std::atomic<b
                                              options:has_lean ? LeanMslOptions(f.full) : nil
                                                error:&err];
       id<MTLFunction> fn = [lib newFunctionWithName:@"main0"];
+      if (!fn)
+        std::fprintf(stderr, "gfx: prewarm: shader %016llx (%s, %s) failed: %s\n",
+                     (unsigned long long)f.hash, f.vertex ? "vertex" : "pixel", f.full ? "full" : "lean",
+                     err ? err.localizedDescription.UTF8String : "main0 function unavailable");
       {
         std::lock_guard<std::mutex> l(fn_mu);
         fns[FunctionKey(f.hash, f.full)] = fn;
@@ -216,6 +256,7 @@ PrewarmResult PrewarmCaches(const PrewarmProgress& progress, const std::atomic<b
         vs = fns[FunctionKey(r.vs, true)];
         ps = fns[FunctionKey(r.ps, !(r.key.lean & kLeanPs))];
       }
+      bool built = false;
       if (vs && ps) {
         // Room in the archive's list (it keeps no more): else this one
         // would not be saved, and would be needed again next time. A save
@@ -227,34 +268,47 @@ PrewarmResult PrewarmCaches(const PrewarmProgress& progress, const std::atomic<b
           usleep(10000);
         }
         NSError* err = nil;
-        archive->Build(DescribePipeline(r.key, vs, ps), ArchiveKey(r), &err);
+        built = archive->Build(DescribePipeline(r.key, vs, ps), ArchiveKey(r), &err) != nil;
+        if (!built)
+          std::fprintf(stderr, "gfx: prewarm: pipeline %016llx (vs %016llx, ps %016llx) failed: %s\n",
+                       (unsigned long long)ArchiveKey(r), (unsigned long long)r.vs, (unsigned long long)r.ps,
+                       err ? err.localizedDescription.UTF8String : "no reason given");
       }
-      report("pipelines");
+      report("pipelines", built);
     });
 
     const bool cancelled = cancel.load();
+    current.phase = PrewarmStatus::Phase::Saving;
+    if (status) status(current);
     // What was built saved (cut short by `cancel`: then left to finish).
-    archive->Close(cancelled ? 0.1 : 30.0, &cancel);
-    std::fprintf(stderr, "gfx: prewarm: %s, %zu of %zu done\n", cancelled ? "cancelled" : "done", done.load(),
-                 total);
-    return cancelled ? PrewarmResult::Cancelled : PrewarmResult::Done;
+    if (limits.drain_on_close) archive->CloseAndWait();
+    else archive->Close(cancelled ? 0.1 : 30.0, &cancel);
+    const size_t remaining = MakePlan(dir, dev).recipes.size();
+    current.phase = PrewarmStatus::Phase::Complete;
+    current.pipelines_ready = current.pipelines_total - std::min(remaining, current.pipelines_total);
+    if (status) status(current);
+    std::fprintf(stderr, "gfx: prewarm: %s, %zu of %zu tasks attempted; %zu of %zu pipelines saved\n",
+                 cancelled ? "cancelled" : remaining ? "incomplete" : "done", done.load(), total,
+                 current.pipelines_ready, current.pipelines_total);
+    return cancelled ? PrewarmResult::Cancelled : remaining ? PrewarmResult::Incomplete : PrewarmResult::Done;
   }
 }
 
 }  // namespace recomp::gfx
 
-#else  // iOS, tvOS: the launcher runs in the game's process
+#else  // Other unsupported Apple platforms
 
 namespace recomp::gfx {
 
 bool PrewarmNeeded(const std::string&) { return false; }
+PrewarmCacheState InspectPrewarmCache(const std::string&) { return PrewarmCacheState::Unavailable; }
 
 PrewarmResult PrewarmCaches(const PrewarmProgress&, const std::atomic<bool>&, const std::string&) {
   return PrewarmResult::Unavailable;
 }
 
 PrewarmResult PrewarmCaches(const PrewarmProgress&, const std::atomic<bool>&, const std::string&,
-                            const PrewarmArchiveLimits&) {
+                            const PrewarmArchiveLimits&, const PrewarmStatusProgress&) {
   return PrewarmResult::Unavailable;
 }
 

@@ -455,6 +455,15 @@ class MetalDevice final : public Device {
       layer_.device = dev_;
       layer_.pixelFormat = MTLPixelFormatBGRA8Unorm;
       layer_.framebufferOnly = YES;
+#if TARGET_OS_IOS || TARGET_OS_TV
+      // The launcher may have initialized Metal for cache inspection
+      // before its final options were applied. Use the documented layer
+      // control so the overlay follows the choice made before Play.
+      if (const char* hud = std::getenv("RECOMP_METAL_HUD")) {
+        layer_.developerHUDProperties = @{@"mode": *hud == '1' ? @"main" : @"disabled"};
+        WarnF("gfx: Metal HUD %s for the game layer\n", *hud == '1' ? "on" : "off");
+      }
+#endif
       // RECOMP_DRAWABLES=2|3: the layer's queue of drawables (3 by
       // default). With vsync, every queued drawable is a refresh of input
       // lag; 2 keeps it short.
@@ -3941,10 +3950,7 @@ void main() {
     o.scope = ArchiveScope(dev_);  // with the translation's version (metal_cache.h)
 #if TARGET_OS_IOS || TARGET_OS_TV
     o.target = AheadQueue();
-    // Each save writes the whole shard: smaller ones, and fewer saves.
-    o.shard_cap = 32ull << 20;
-    o.max_pipelines = 256;
-    o.max_bytes = 4 * o.shard_cap;
+    // The platform budget is shared with prewarm in Options' defaults.
     o.save_idle_s = 15.0;
 #endif
     archive_ = PipelineArchive::Open(dev_, std::move(o));
