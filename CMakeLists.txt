@@ -167,6 +167,16 @@ if(FFMPEG_FOUND)
     src/runtime/audio/digital_reverb.cpp
     src/runtime/audio/miles65.cpp
     src/runtime/audio/eax.cpp)
+  # The 5.1 mix through the host's spatial renderer (spatial_output.h):
+  # macOS's spatial mixer; elsewhere none, and the mix stays stereo.
+  if(APPLE AND NOT RECOMP_IOS)
+    target_sources(recomp_audio PRIVATE src/runtime/audio/spatial_output_mac.cpp
+                   src/runtime/audio/spatial_chain_mac.cpp)
+    target_link_libraries(recomp_audio PRIVATE "-framework AudioToolbox" "-framework CoreAudio"
+                          "-framework CoreFoundation")
+  else()
+    target_sources(recomp_audio PRIVATE src/runtime/audio/spatial_output_none.cpp)
+  endif()
   target_include_directories(recomp_audio PUBLIC src)
   target_compile_features(recomp_audio PUBLIC cxx_std_20)
   target_link_libraries(recomp_audio PUBLIC SDL3::SDL3 PkgConfig::FFMPEG

@@ -81,6 +81,22 @@ target_include_directories(surround_test PRIVATE ${PROJECT_SOURCE_DIR}/src)
 target_compile_features(surround_test PRIVATE cxx_std_20)
 add_test(NAME surround COMMAND surround_test)
 
+if(APPLE AND NOT RECOMP_IOS)
+  # spatial_chain_test: what the spatial output runs between the mix and
+  # the device (spatial_chain_mac.h), rendered offline without a device, for
+  # each kind of output: where each channel is heard, the LFE fold, the
+  # limiter, head tracking asked for on headphones only, the 5.1 as it is,
+  # the folded stereo, a change of kind as it renders; and the speaker
+  # layouts a device may have. Skipped where the host has no spatial mixer.
+  add_executable(spatial_chain_test spatial_chain_test.cpp
+                 ${PROJECT_SOURCE_DIR}/src/runtime/audio/spatial_chain_mac.cpp)
+  target_include_directories(spatial_chain_test PRIVATE ${PROJECT_SOURCE_DIR}/src)
+  target_compile_features(spatial_chain_test PRIVATE cxx_std_20)
+  target_link_libraries(spatial_chain_test PRIVATE "-framework AudioToolbox" "-framework CoreFoundation")
+  add_test(NAME spatial_chain COMMAND spatial_chain_test)
+  set_tests_properties(spatial_chain PROPERTIES SKIP_RETURN_CODE 77)
+endif()
+
 # gl_draw_test: the GL context's vertex arrays and immediate mode against
 # a reference model of GL's conversions, through a recording device;
 # portable.
