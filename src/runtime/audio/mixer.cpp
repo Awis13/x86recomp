@@ -10,6 +10,7 @@
 #include <cstring>
 #include <string>
 
+#include "runtime/audio/dump.h"
 #include "runtime/audio/spatial_output.h"
 #include "runtime/log.h"
 #include "runtime/platform.h"
@@ -159,12 +160,13 @@ bool OwnThread() {
 }
 
 
-// RECOMP_AUDIO_DUMP=dir: what the device is given, as raw float stereo
-// at the mixer's rate, to dir/out.f32 (finding clicks).
-FILE* DumpFile(const char* name) {
-  const char* dir = std::getenv("RECOMP_AUDIO_DUMP");
-  if (!dir || !*dir) return nullptr;
-  return std::fopen((std::string(dir) + "/" + name).c_str(), "wb");
+// RECOMP_AUDIO_DUMP=dir: dir/name, written off the audio thread
+// (dump.h); null without the variable. Kept for the process's life.
+AudioDump* OpenDump(const char* name, int channels) {
+  auto* d = new AudioDump;
+  if (d->Open(name, channels)) return d;
+  delete d;
+  return nullptr;
 }
 
 // The mixer thread's period: 10 ms, the length of DirectSound's fragment,
@@ -247,7 +249,9 @@ void LogMixer(bool mixed, double wait_ms, double mix_ms, double period_ms, int f
 }
 
 void SDLCALL AudioCallback(void* ud, SDL_AudioStream* s, int additional, int) {
-  static FILE* dump = DumpFile("out.f32");
+  // RECOMP_AUDIO_DUMP=dir: what the device is given, as raw float stereo
+  // at the mixer's rate, to dir/out.f32 (finding clicks).
+  static AudioDump* dump = OpenDump("out.f32", 2);
   // RECOMP_AUDIO_MUTE=1: the device plays silence (tests on the real
   // device path, quietly).
   static const bool mute = [] {
@@ -274,7 +278,7 @@ void SDLCALL AudioCallback(void* ud, SDL_AudioStream* s, int additional, int) {
   // The n frames now in buf as the device is given them, at the mixer's
   // rate (the dump, the mute and the tone test all see that).
   auto shape = [&](int n) {
-    if (dump) std::fwrite(buf, sizeof(float), size_t(n) * 2, dump);
+    if (dump) dump->Write(buf, n);
     if (mute) std::memset(buf, 0, sizeof(float) * 2 * size_t(n));
     if (tone) {
       static double phase = 0;
@@ -499,7 +503,7 @@ void Mixer::SetRequest(int device_frames) {
 // device's callback, the ring's frames (or a mix made here, without the
 // mixer thread) converted to the device's rate.
 void Mixer::PullBed(float* out, int n) {
-  static FILE* dump = DumpFile("bed.f32");
+  static AudioDump* dump = OpenDump("bed.f32", kBedChannels);
   constexpr int ch = kBedChannels;
   constexpr int bpf = int(ch * sizeof(float));
   float buf[kChunk * ch];
@@ -518,7 +522,7 @@ void Mixer::PullBed(float* out, int n) {
     } else {
       Mix(dst, k);
     }
-    if (dump) std::fwrite(dst, sizeof(float), size_t(k) * ch, dump);
+    if (dump) dump->Write(dst, k);
   };
   if (conv_) {
     const int want = n * bpf;

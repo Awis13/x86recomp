@@ -81,6 +81,15 @@ target_include_directories(surround_test PRIVATE ${PROJECT_SOURCE_DIR}/src)
 target_compile_features(surround_test PRIVATE cxx_std_20)
 add_test(NAME surround COMMAND surround_test)
 
+# audio_dump_test: RECOMP_AUDIO_DUMP's files written off the audio threads
+# (runtime/audio/dump.h): Write does not wait for a stalled disk, frames
+# arrive in order, a full ring drops and counts; portable.
+add_executable(audio_dump_test audio_dump_test.cpp)
+target_include_directories(audio_dump_test PRIVATE ${PROJECT_SOURCE_DIR}/src)
+target_compile_features(audio_dump_test PRIVATE cxx_std_20)
+target_link_libraries(audio_dump_test PRIVATE Threads::Threads)
+add_test(NAME audio_dump COMMAND audio_dump_test)
+
 if(TARGET recomp_audio)
   # mixer_bed_test: the mixer's 5.1 mix rendered offline (5.1, 7.1 and
   # stereo voices, DirectSound's pan) and its stereo mix's frames.

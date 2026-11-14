@@ -32,6 +32,7 @@
 #include <set>
 #include <vector>
 
+#include "runtime/audio/dump.h"
 #include "runtime/audio/mixer.h"
 #include "runtime/hle/com.h"
 #include "runtime/hle/hle.h"
@@ -206,13 +207,14 @@ class RingSource : public audio::Source {
       if (!dump_checked_) {
         dump_checked_ = true;
         if (const char* dir = std::getenv("RECOMP_AUDIO_DUMP"); dir && *dir) {
-          char path[1024];
-          std::snprintf(path, sizeof path, "%s/ring%lld_%u_%d.f32", dir, (long long)frames,
-                        unsigned(f.rate), channels_);
-          dump_ = std::fopen(path, "wb");
+          char name[128];
+          std::snprintf(name, sizeof name, "ring%lld_%u_%d.f32", (long long)frames, unsigned(f.rate),
+                        channels_);
+          dump_ = std::make_unique<audio::AudioDump>();
+          if (!dump_->Open(name, channels_)) dump_.reset();
         }
       }
-      if (dump_) std::fwrite(first, sizeof(float), size_t(got) * channels_, dump_);
+      if (dump_) dump_->Write(first, got);  // off this thread (dump.h)
     }
     return got;
   }
@@ -227,7 +229,7 @@ class RingSource : public audio::Source {
   std::shared_ptr<Data> d_;
   int64_t next_ = 0;
   bool dump_checked_ = false;
-  FILE* dump_ = nullptr;
+  std::unique_ptr<audio::AudioDump> dump_;
 };
 
 // ---- objects

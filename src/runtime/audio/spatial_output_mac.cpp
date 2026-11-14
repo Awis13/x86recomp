@@ -28,6 +28,7 @@
 #include <string>
 #include <vector>
 
+#include "runtime/audio/dump.h"
 #include "runtime/audio/spatial_chain_mac.h"
 #include "runtime/audio/surround.h"
 #include "runtime/log.h"
@@ -142,12 +143,6 @@ DeviceInfo Describe(AudioDeviceID dev) {
   return info;
 }
 
-FILE* DumpFile(const char* name) {
-  const char* dir = std::getenv("RECOMP_AUDIO_DUMP");
-  if (!dir || !*dir) return nullptr;
-  return std::fopen((std::string(dir) + "/" + name).c_str(), "wb");
-}
-
 // The device's properties whose change re-chooses the output.
 constexpr AudioObjectPropertySelector kDeviceWatched[] = {
     kAudioDevicePropertyDataSource, kAudioDevicePropertyNominalSampleRate, kAudioDevicePropertyStreamConfiguration,
@@ -189,7 +184,7 @@ class MacSpatialOutput final : public SpatialOutput {
       const char* e = std::getenv("RECOMP_AUDIO_MUTE");
       return e && *e == '1';
     }();
-    dump_ = DumpFile("spatial.f32");
+    dump_.Open("spatial.f32", 2);
     const OutputChoice choice = ChooseOutput(info_.desc);
     // Refused twice, the mixer opens the plain stereo device instead.
     if (!Configure(choice.kind) && !Configure(choice.kind)) return false;
@@ -236,8 +231,7 @@ class MacSpatialOutput final : public SpatialOutput {
     }
     std::lock_guard<std::mutex> l(mu_);
     Teardown();
-    if (dump_) std::fclose(dump_);
-    dump_ = nullptr;
+    dump_.Close();
   }
 
  private:
@@ -373,14 +367,14 @@ class MacSpatialOutput final : public SpatialOutput {
                                UInt32 n, AudioBufferList* io) {
     auto* o = static_cast<MacSpatialOutput*>(self);
     o->chain_.Render(flags, ts, n, io);
-    if (o->dump_ && io->mNumberBuffers == 2) {
+    if (o->dump_.is_open() && io->mNumberBuffers == 2) {
       const auto* l = static_cast<const float*>(io->mBuffers[0].mData);
       const auto* r = static_cast<const float*>(io->mBuffers[1].mData);
       float buf[2 * 512];
       for (UInt32 done = 0; done < n;) {
         const UInt32 k = std::min<UInt32>(n - done, 512);
         for (UInt32 i = 0; i < k; i++) buf[2 * i] = l[done + i], buf[2 * i + 1] = r[done + i];
-        std::fwrite(buf, sizeof(float), size_t(2) * k, o->dump_);
+        o->dump_.Write(buf, int(k));  // off this thread (dump.h)
         done += k;
       }
     }
@@ -405,7 +399,7 @@ class MacSpatialOutput final : public SpatialOutput {
   dispatch_queue_t queue_ = nullptr;
   AudioObjectPropertyListenerBlock listener_ = nullptr;
   std::shared_ptr<std::atomic<bool>> alive_;
-  FILE* dump_ = nullptr;
+  AudioDump dump_;
   std::atomic<uint64_t> rendered_{0};
 };
 
