@@ -73,6 +73,31 @@ void Wrap() {
   for (int i = 0; i < 8; i++) Check(Got(out, i, 4 + i), "frames across the wrap keep their order");
 }
 
+// Six-float frames (a 5.1 mix): every channel of every frame comes back
+// in its place, across the slot wrap, and a frame's six floats count as
+// one frame of capacity.
+void SixChannels() {
+  recomp::audio::FrameRing r;
+  r.Reset(8, 6);
+  Check(r.Capacity() == 8 && r.channels() == 6, "a 5.1 ring holds frames, not floats");
+  std::vector<float> in(6 * 8), out(6 * 8);
+  auto put = [&](int64_t k, int n) {
+    for (int i = 0; i < n; i++)
+      for (int c = 0; c < 6; c++) in[6 * size_t(i) + size_t(c)] = float(10 * (k + i) + c);
+  };
+  put(0, 5);
+  r.Write(in.data(), 5);
+  Check(r.Read(out.data(), 3) == 3, "three 5.1 frames read");
+  put(5, 6);
+  r.Write(in.data(), 6);  // slots 5..7 and 0..2 (wrapped)
+  Check(r.Filled() == 8 && r.Free() == 0, "eight 5.1 frames fill an eight-frame ring");
+  Check(r.Read(out.data(), 8) == 8, "all eight back across the wrap");
+  bool ok = true;
+  for (int i = 0; i < 8; i++)
+    for (int c = 0; c < 6; c++) ok &= out[6 * size_t(i) + size_t(c)] == float(10 * (3 + i) + c);
+  Check(ok, "each channel of each frame in its place across the wrap");
+}
+
 // One producer, one consumer: frames 1..63 and the mixer's own sizes, with
 // the consumer's reads landing on the producer's boundaries.
 void Threads(int capacity, int period, int request, int64_t total) {
@@ -128,6 +153,7 @@ void Threads(int capacity, int period, int request, int64_t total) {
 int main() {
   Basics();
   Wrap();
+  SixChannels();
   Threads(256, 8, 8, 1 << 20);      // slots wrapped many times
   Threads(2048, 441, 941, 1 << 21);  // 44.1 kHz: a 10 ms period, a device request
   Threads(2048, 480, 1024, 1 << 21);  // 48 kHz without conversion
