@@ -96,4 +96,19 @@ inline int FrameRing::Read(float* dst, int n) {
   return n;
 }
 
+// The fill the mixer thread keeps a ring at: two device requests (of
+// `request` frames) and a period ahead of what the device has taken, so
+// that a stall of up to that is caught up without silence; within a ring
+// of `capacity` frames, a period to spare.
+inline int FillTarget(int request, int period, int capacity) {
+  return std::min(2 * request + period, capacity - period);
+}
+
+// The room a ring needs before it is rounded up to a power of two: its
+// fill and a period; where the device may change as it runs, the fill for
+// the largest request a device may make (0: none) and a period.
+inline int RingRoom(int request, int period, int largest_request) {
+  return std::max(2 * request, 2 * largest_request) + 2 * period;
+}
+
 }  // namespace recomp::audio

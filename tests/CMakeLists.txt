@@ -81,6 +81,14 @@ target_include_directories(surround_test PRIVATE ${PROJECT_SOURCE_DIR}/src)
 target_compile_features(surround_test PRIVATE cxx_std_20)
 add_test(NAME surround COMMAND surround_test)
 
+if(TARGET recomp_audio)
+  # mixer_bed_test: the mixer's 5.1 mix rendered offline (5.1, 7.1 and
+  # stereo voices, DirectSound's pan) and its stereo mix's frames.
+  add_executable(mixer_bed_test mixer_bed_test.cpp)
+  target_link_libraries(mixer_bed_test PRIVATE recomp_audio)
+  add_test(NAME mixer_bed COMMAND mixer_bed_test)
+endif()
+
 if(APPLE AND NOT RECOMP_IOS)
   # spatial_chain_test: what the spatial output runs between the mix and
   # the device (spatial_chain_mac.h), rendered offline without a device, for
