@@ -131,6 +131,14 @@ target_compile_features(target_size_test PRIVATE cxx_std_20)
 target_link_libraries(target_size_test PRIVATE Threads::Threads)
 add_test(NAME target_size COMMAND target_size_test)
 
+# pad_effects_test: a pad's trigger effects (hle/pad_effects.h): the ranges
+# they are brought into, the blocks and the effects state a DualSense takes,
+# and the decision what a pad is sent next; portable.
+add_executable(pad_effects_test pad_effects_test.cpp)
+target_include_directories(pad_effects_test PRIVATE ${PROJECT_SOURCE_DIR}/src)
+target_compile_features(pad_effects_test PRIVATE cxx_std_20)
+add_test(NAME pad_effects COMMAND pad_effects_test)
+
 # locale_test: the user's language (GameConfig::user_lang_id,
 # <ID>_LANG_ID) as kernel32 answers it to a guest, one run per case: the
 # default, a port's language, the switch over the port's, a malformed
@@ -153,6 +161,12 @@ set_tests_properties(locale_switch_malformed PROPERTIES
                      PASS_REGULAR_EXPRESSION "FATAL: LANG_ID=1049: expected 0x and a language id")
 set_tests_properties(locale_port_invalid PROPERTIES
                      PASS_REGULAR_EXPRESSION "FATAL: GameConfig::user_lang_id 0019: not a language id")
+
+# file_paths_test: drive-relative names must reach the installed file,
+# including the Windows-style benchmark recording path.
+add_executable(file_paths_test file_paths_test.cpp)
+target_link_libraries(file_paths_test PRIVATE recomp_runtime)
+add_test(NAME file_paths COMMAND file_paths_test)
 
 # lazy_mem_test: lazily read-back images (DirectDraw Lock of GPU
 # surfaces) through real page faults; portable.
@@ -279,6 +293,19 @@ if(APPLE)
   set_tests_properties(metal_rcas PROPERTIES SKIP_RETURN_CODE 77)
 endif()
 
+# metal_output_curve_test: the curve the Metal backend puts the frame
+# through on its way to the window (gfx/output_curve.h), its setting and
+# output_curve on the GPU against the curves written out (the GPU part
+# skipped without a Metal device); macOS.
+if(APPLE)
+  add_executable(metal_output_curve_test metal_output_curve_test.mm)
+  set_source_files_properties(metal_output_curve_test.mm PROPERTIES COMPILE_OPTIONS "-fobjc-arc;-std=c++20")
+  target_include_directories(metal_output_curve_test PRIVATE "${PROJECT_SOURCE_DIR}/src")
+  target_link_libraries(metal_output_curve_test PRIVATE "-framework Metal" "-framework Foundation")
+  add_test(NAME metal_output_curve COMMAND metal_output_curve_test)
+  set_tests_properties(metal_output_curve PROPERTIES SKIP_RETURN_CODE 77)
+endif()
+
 # metal_archive_test: pipelines kept compiled between runs on the Metal
 # backend (gfx/metal_archive.h): found in a later archive, a damaged shard,
 # another scope, the shard cap (skipped without a Metal device); macOS.
@@ -291,6 +318,34 @@ if(APPLE)
   target_link_libraries(metal_archive_test PRIVATE "-framework Metal" "-framework Foundation")
   add_test(NAME metal_archive COMMAND metal_archive_test)
   set_tests_properties(metal_archive PROPERTIES SKIP_RETURN_CODE 77)
+endif()
+
+# metal_new_target_test: a new render target on the Metal backend
+# (gfx/metal_new_target.h) holds zeros in every level, whatever the
+# texture held before (skipped without a Metal device); macOS.
+if(APPLE)
+  add_executable(metal_new_target_test metal_new_target_test.mm)
+  set_source_files_properties(metal_new_target_test.mm PROPERTIES COMPILE_OPTIONS "-fobjc-arc;-std=c++20")
+  target_include_directories(metal_new_target_test PRIVATE "${PROJECT_SOURCE_DIR}/src")
+  target_link_libraries(metal_new_target_test PRIVATE "-framework Metal" "-framework Foundation")
+  add_test(NAME metal_new_target COMMAND metal_new_target_test)
+  set_tests_properties(metal_new_target PROPERTIES SKIP_RETURN_CODE 77)
+endif()
+
+# metal_target_device_test: the same through the Metal device itself
+# (CreateTexture, with a hidden window): a new render target never drawn
+# reads back zeros, and what is filled or uploaded into one in the frame it
+# was made in, or a frame later, is what reads back (skipped without a
+# Metal device or a window). The device's caches go to a home folder in
+# the build tree; macOS.
+if(APPLE AND NOT RECOMP_IOS)
+  add_executable(metal_target_device_test metal_target_device_test.cpp)
+  target_compile_features(metal_target_device_test PRIVATE cxx_std_20)
+  target_include_directories(metal_target_device_test PRIVATE "${PROJECT_SOURCE_DIR}/src")
+  target_link_libraries(metal_target_device_test PRIVATE recomp_gfx SDL3::SDL3)
+  add_test(NAME metal_target_device COMMAND metal_target_device_test)
+  set_tests_properties(metal_target_device PROPERTIES SKIP_RETURN_CODE 77
+    ENVIRONMENT "CFFIXED_USER_HOME=${CMAKE_CURRENT_BINARY_DIR}/metal_target_device_home")
 endif()
 
 # metal_prewarm_test: PrewarmCaches (gfx/prewarm.h) on a cache folder of

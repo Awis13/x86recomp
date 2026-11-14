@@ -75,7 +75,9 @@
 #include "runtime/gfx/smaa/AreaTex.h"
 #include "runtime/gfx/smaa/SearchTex.h"
 #include "smaa_hlsl.h"
+#include "runtime/gfx/metal_new_target.h"
 #include "runtime/gfx/metal_prelude.h"
+#include "runtime/gfx/output_curve.h"
 #include "runtime/gfx/rcas.h"
 #include "runtime/gfx/reversed_z.h"
 #include "runtime/gfx/shader_compile.h"
@@ -292,6 +294,13 @@ fragment float4 quad_fs(QuadOut in [[stage_in]], texture2d<float> tex [[texture(
                         sampler s [[sampler(0)]], constant float4* r [[buffer(0)]]) {
   return tex.sample(s, in.uv, level(r[2].x));
 }
+// quad_fs through output_curve (output_curve.h): r[2].y its mode, r[2].z
+// its exponent.
+fragment float4 quad_curve_fs(QuadOut in [[stage_in]], texture2d<float> tex [[texture(0)]],
+                              sampler s [[sampler(0)]], constant float4* r [[buffer(0)]]) {
+  const float4 c = tex.sample(s, in.uv, level(r[2].x));
+  return float4(output_curve(c.rgb, r[2].y, r[2].z), c.a);
+}
 // A triangle over the whole target; uv 0..1 from the top left.
 struct TriOut { float4 pos [[position]]; float2 uv; };
 vertex TriOut tri_vs(uint vid [[vertex_id]]) {
@@ -422,6 +431,7 @@ kernel void taa_cs(texture2d<half, access::read> color [[texture(0)]],
 
 constexpr uint32_t kClearVs = 0x80000001, kClearPs = 0x80000002;
 constexpr uint32_t kQuadVs = 0x80000003, kQuadPs = 0x80000004;
+constexpr uint32_t kQuadCurvePs = 0x80000005;
 
 class MetalDevice final : public Device {
  public:
@@ -492,7 +502,7 @@ class MetalDevice final : public Device {
       MakeSpareChunks(kSlots);
 
       NSError* err = nil;
-      id<MTLLibrary> lib = [dev_ newLibraryWithSource:@((std::string(kInternalMsl) + kRcasMsl).c_str())
+      id<MTLLibrary> lib = [dev_ newLibraryWithSource:@((std::string(kOutputCurveMsl) + kInternalMsl + kRcasMsl).c_str())
                                                 options:nil
                                                   error:&err];
       if (!lib) FatalF("gfx: the device's own shaders: %s", err.localizedDescription.UTF8String);
@@ -527,6 +537,13 @@ class MetalDevice final : public Device {
       const char* sh = std::getenv("RECOMP_SHARPNESS");
       if (!sh) sh = std::getenv("RECOMP_TAA_SHARPNESS");
       if (sh) sharpness_ = std::clamp(float(std::atof(sh)), 0.0f, 1.0f);
+      // RECOMP_OUTPUT_CURVE=bt709|<power>: the curve the finished frame,
+      // the HUD with it, goes through to the window (output_curve.h).
+      output_curve_ = ParseOutputCurve(std::getenv("RECOMP_OUTPUT_CURVE"));
+      if (output_curve_.kind == OutputCurve::kBt709)
+        std::fprintf(stderr, "gfx: output curve: sRGB decoded, BT.709 encoded\n");
+      else if (output_curve_.kind == OutputCurve::kPower)
+        std::fprintf(stderr, "gfx: output curve: power %.2f\n", output_curve_.exponent);
       // RECOMP_MFX_SIGNS=jx,jy,mv: the jitter's and motion's signs as given
       // to MetalFX (for checking conventions).
       if (const char* g = std::getenv("RECOMP_MFX_SIGNS"))
@@ -557,7 +574,8 @@ class MetalDevice final : public Device {
                      : upscaler_ == Upscaler::Smaa  ? "SMAA 1x"
                                                     : "bilinear filtering");
       for (auto [sid, name] : {std::pair{kClearVs, "clear_vs"}, {kClearPs, "clear_fs"},
-                               {kQuadVs, "quad_vs"}, {kQuadPs, "quad_fs"}}) {
+                               {kQuadVs, "quad_vs"}, {kQuadPs, "quad_fs"},
+                               {kQuadCurvePs, "quad_curve_fs"}}) {
         Shader s;
         s.fn = [lib newFunctionWithName:@(name)];
         shaders_[sid] = s;
@@ -879,6 +897,22 @@ class MetalDevice final : public Device {
     if (fmt == Format::P8) WarnF("gfx: P8 texture (no palette support)\n");
     TextureId tid = NewTexId();
     AddTex(tid, t);
+    if (rt) {
+      // Zeros before anything can touch it (metal_new_target.h): cleared
+      // in the frame's upload command buffer, which the GPU runs before
+      // the frame's own (BeginFrame), so before every draw into it, every
+      // read of it and every upload made in order; an upload made ahead of
+      // the frame goes into the same buffer, later in it, as recorded.
+      // The frame's render pass stays open. These passes are not the
+      // frame's: neither counted nor timed with them.
+      EnsureFrame();
+      __unsafe_unretained id<MTLTexture> fresh = t.tex;  // kept by textures_, then by Keep
+      Rec([this, fresh] {
+        if (upload_blit_) [upload_blit_ endEncoding];
+        upload_blit_ = nil;
+        ClearNewTarget(upload_cb_, fresh);
+      });
+    }
     return tid;
   }
 
@@ -4448,13 +4482,15 @@ void main() {
   // ---- quads: StretchRect and the window
 
   // On the encoding thread: draws `sr` of level `level` of `src` (sw x
-  // sh) over `dr` of a dw x dh target of format `pf`.
+  // sh) over `dr` of a dw x dh target of format `pf`, through `curve` if
+  // it is one.
   void DrawQuad(id<MTLRenderCommandEncoder> e, MTLPixelFormat pf, id<MTLTexture> src, int level,
-                float sw, float sh, const Rect& sr, float dw, float dh, const Rect& dr, bool linear) {
+                float sw, float sh, const Rect& sr, float dw, float dh, const Rect& dr, bool linear,
+                const OutputCurve& curve = {}) {
     PipeKey k;
     std::memset(&k, 0, sizeof k);
     k.vs = kQuadVs;
-    k.ps = kQuadPs;
+    k.ps = curve.Active() ? kQuadCurvePs : kQuadPs;
     k.color[0] = uint16_t(pf);
     k.src = k.src_a = uint8_t(MTLBlendFactorOne);
     k.dst = k.dst_a = uint8_t(MTLBlendFactorZero);
@@ -4464,8 +4500,8 @@ void main() {
                          float(dr.right) / dw * 2 - 1, 1 - float(dr.bottom) / dh * 2,
                          float(sr.left) / sw,          float(sr.top) / sh,
                          float(sr.right) / sw,         float(sr.bottom) / sh,
-                         float(level),                 0,
-                         0,                            0};
+                         float(level),                 curve.ShaderMode(),
+                         curve.exponent,               0};
     [e setVertexBytes:r length:sizeof r atIndex:0];
     [e setFragmentBytes:r length:sizeof r atIndex:0];
     [e setFragmentTexture:src atIndex:0];
@@ -4508,7 +4544,7 @@ void main() {
     const Rect r = FitRect(bw, bh, pw, ph);
     const bool same = r.right - r.left == bw && r.bottom - r.top == bh;
     DrawQuad(e, MTLPixelFormatBGRA8Unorm, front, 0, float(bw), float(bh), {0, 0, bw, bh},
-             float(pw), float(ph), r, !same);
+             float(pw), float(ph), r, !same, output_curve_);
     [e endEncoding];
     // When the display really showed it (what Metal's HUD graphs).
     std::mutex* mu = &shown_mu_;
@@ -4816,6 +4852,7 @@ void main() {
   id<MTLRenderPipelineState> motion_pipe_ = nil;
   id<MTLComputePipelineState> taa_pipe_ = nil, rcas_pipe_ = nil;  // EnsureTaa; EnsureSharpen
   float sharpness_ = 0.5f;  // RECOMP_SHARPNESS
+  OutputCurve output_curve_;  // RECOMP_OUTPUT_CURVE
   // The scene's textures under TAA: a mip sharper, as FSR 2 and DLSS
   // advise for temporal antialiasing (log2(render / display) - 1; the
   // accumulated jittered samples keep it from aliasing).

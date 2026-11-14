@@ -333,6 +333,13 @@ target_link_libraries(recomp_d3d7 PUBLIC recomp_runtime recomp_gfx)
 # DirectInput game controllers are XInput pads.
 add_library(recomp_xinput SHARED src/runtime/hle/xinput.cpp src/runtime/hle/wbem.cpp)
 target_link_libraries(recomp_xinput PUBLIC recomp_runtime)
+if(RECOMP_IOS)
+  # A DualSense's triggers through GameController (Objective-C++, ARC).
+  target_sources(recomp_xinput PRIVATE src/runtime/hle/pad_effects_ios.mm)
+  set_source_files_properties(src/runtime/hle/pad_effects_ios.mm
+    TARGET_DIRECTORY recomp_xinput PROPERTIES COMPILE_OPTIONS "-fobjc-arc;-std=c++20")
+  target_link_libraries(recomp_xinput PRIVATE "-framework GameController" "-framework Foundation")
+endif()
 
 # DirectInput 8 (keyboard and mouse) on the event pump's raw input; it
 # lists the XInput pads as game controllers.

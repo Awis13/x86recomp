@@ -1039,6 +1039,20 @@ late-frame rule; on an idle host wake-ups land 15-30 us (Linux) or
   same pads as game controllers, and WMI (Win32_PNPEntity DeviceIDs with
   "IG_") marks them as XInput ones, as games that pair the two (the
   DirectX SDK's IsXInputDevice) expect.
+  Beyond XInput, for a port's own use (SetPadEffects, pad_effects.h): a
+  DualSense's trigger effects and light. Where SDL's HIDAPI driver has
+  the pad (macOS, Linux, Windows) the triggers are sent as its effects
+  state. The pad reads every such state as the rumble state too (one
+  without the rumble bits is SDL's rumble stop), so the state carries
+  the motors as XInputSetState last set them, with the bits SDL itself
+  uses for the pad's firmware. The light goes through SDL, and back to
+  the colour SDL gives the pad by its player index when no colour is
+  wanted any more (SDL has no call for that, so the same colour is set).
+  On iOS and tvOS the pad is GameController's, SDL's driver for it sends
+  no effects, and the triggers are set through that framework
+  (pad_effects_ios.mm). None of this has been tried on a controller yet:
+  the encodings and the decision what to send are tested, the device
+  calls compiled.
 - winmm: multimedia timers on one timer thread, as on Windows (TimeProc
   callbacks, or SetEvent / PulseEvent on the given event).
 - binkw32: ffmpeg (binkvideo/binkaudio, swscale; its Bink demuxer, from

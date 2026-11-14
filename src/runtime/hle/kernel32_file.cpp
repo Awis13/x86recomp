@@ -84,7 +84,15 @@ std::vector<std::string> Components(const std::string& p) {
 std::string AbsGuest(std::string p) {
   std::replace(p.begin(), p.end(), '/', '\\');
   if (p.size() >= 2 && p[1] == ':') {
-    if (p.size() == 2) p += '\\';
+    // A drive without a following slash is relative to that drive's cwd,
+    // e.g. GTA IV's benchmark opens C:.\pc\data\Benchmark.cli.
+    if (p.size() == 2 || p[2] != '\\') {
+      const char drive = char(std::toupper(uint8_t(p[0])));
+      const std::string cwd = GuestCurrentDir();
+      const std::string base = char(std::toupper(uint8_t(cwd[0]))) == drive
+                                   ? cwd : std::string(1, drive) + ":\\";
+      p = base + "\\" + p.substr(2);
+    }
   } else if (!p.empty() && p[0] == '\\') {
     p = "C:" + p;
   } else {
