@@ -18,6 +18,11 @@
 // mixer's read cursor passes the offset (a little before it is heard, by
 // the mixer's latency: that data has been taken by then). Effects are not
 // implemented: fatal and named.
+//
+// Speakers: GetSpeakerConfig reports stereo, or 5.1 with
+// <ID>_SPATIAL_AUDIO=1 where the host renders a 5.1 mix (the mixer's
+// channels()). Buffers of more than two channels then reach the mix
+// channel for channel; on a stereo mix they are folded to two.
 
 #include <algorithm>
 #include <cmath>
@@ -144,7 +149,9 @@ float SampleAt(const Format& f, const uint8_t* p, int c) {
 class RingSource : public audio::Source {
  public:
   explicit RingSource(std::shared_ptr<Data> d) : d_(std::move(d)) {
-    channels_ = std::min<int>(d_->fmt.channels, 2);  // more are mixed down
+    // More than two channels go to a 5.1 mix as they are; to a stereo
+    // one they are folded to two here (audio::SourceChannels).
+    channels_ = audio::SourceChannels(d_->fmt.channels, M().channels());
     rate_ = int(d_->fmt.rate);
   }
   bool loop = false;
@@ -164,16 +171,15 @@ class RingSource : public audio::Source {
     for (; got < n; got++) {
       if (!frames || (!loop && next_ >= frames)) break;
       const uint8_t* p = d_->bytes.data() + size_t(next_ % frames) * f.block;
-      if (f.channels <= 2) {
+      if (f.channels <= 2 || channels_ > 2) {
         for (int c = 0; c < f.channels; c++) *out++ = SampleAt(f, p, c);
       } else {
         // WAVEFORMATEXTENSIBLE order: FL FR C LFE BL BR SL SR. Centre and
         // surrounds at -3 dB into both sides; LFE left out.
-        constexpr float k = 0.7071f;
-        float l = SampleAt(f, p, 0), r = SampleAt(f, p, 1);
-        if (f.channels >= 3) l += k * SampleAt(f, p, 2), r += k * SampleAt(f, p, 2);
-        for (int c = 4; c + 1 < f.channels; c += 2)
-          l += k * SampleAt(f, p, c), r += k * SampleAt(f, p, c + 1);
+        float frame[8];
+        for (int c = 0; c < f.channels && c < 8; c++) frame[c] = SampleAt(f, p, c);
+        float l, r;
+        audio::FoldToStereo(frame, std::min<int>(f.channels, 8), &l, &r);
         *out++ = std::clamp(l, -1.0f, 1.0f);
         *out++ = std::clamp(r, -1.0f, 1.0f);
       }
@@ -440,12 +446,19 @@ HLE_NAMED("dsound.dll", "#11", DirectSoundCreate8, 3) {
   if (!Arg(c, 1)) return DSERR_INVALIDPARAM;
   Wr32(Arg(c, 1), 0);
   if (Arg(c, 2)) return DSERR_NOAGGREGATION;
+  // <ID>_SPATIAL_AUDIO=1: a 5.1 mix through the host's spatial renderer
+  // (runtime/audio/spatial_output.h), where it has one; read once, at the
+  // first device.
+  static const bool spatial = [] {
+    const char* e = Env("SPATIAL_AUDIO");
+    return e && *e == '1';
+  }();
   // The mix runs at 44.1 kHz, the rate games' sounds and stream rings
   // are made at: those play sample for sample, and SDL converts the mix to
   // the device's rate with its band-limited resampler. Mixed at 48 kHz,
   // they went through the mixer's linear interpolation, whose images and
   // aliasing are heard as a crackle on bright sounds.
-  if (!M().Open(44100)) return DSERR_NODRIVER;
+  if (!M().Open(44100, spatial ? audio::kBedChannels : 2)) return DSERR_NODRIVER;
   Wr32(Arg(c, 1), com::Publish(std::make_shared<DirectSound>(), DirectSoundVtable()));
   return DS_OK;
 }
@@ -523,10 +536,11 @@ HLE_NAMED("dsound.dll", "IDirectSound8::GetCaps", DS8_GetCaps, 2) {
   return DS_OK;
 }
 
-// (pdwSpeakerConfig)
+// (pdwSpeakerConfig): stereo, or 5.1 when the mix is (surround.h); a game
+// that asks then makes its buffers 5.1, and they reach the mix as they are.
 HLE_NAMED("dsound.dll", "IDirectSound8::GetSpeakerConfig", DS8_GetSpeakerConfig, 2) {
   if (!Arg(c, 1)) return DSERR_INVALIDPARAM;
-  Wr32(Arg(c, 1), 4);  // DSSPEAKER_STEREO
+  Wr32(Arg(c, 1), audio::SpeakerConfigFor(M().channels()));
   return DS_OK;
 }
 

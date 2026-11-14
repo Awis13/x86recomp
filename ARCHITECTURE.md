@@ -1004,7 +1004,27 @@ late-frame rule; on an idle host wake-ups land 15-30 us (Linux) or
   guest memory; it plays silence and counts an underrun for whatever the
   ring was short of. Play cursors and position notifications advance on
   the mixer thread, in play order. RECOMP_AUDIO_MIXTHREAD=0 mixes in the
-  callback again, the old way, for A/B. runtime/audio is its own library
+  callback again, the old way, for A/B.
+  A 5.1 mix (Mixer::Open with six channels; surround.h): sources of more
+  than two channels go to it channel for channel, every other voice is
+  mixed in stereo as before (sends and reverbs included) and lands in the
+  front pair. On macOS it reaches the default device through Apple's
+  spatial mixer (spatial_output.h, spatial_chain_mac.h): the mix as an
+  ambience bed, rendered binaural for headphones (head tracking and the
+  personal profile asked for), for the built-in speakers (which drop the
+  LFE: it is folded into the fronts at -6 dB first) or a stereo pair, with
+  a peak limiter after it (the renderer's sum of six channels into two
+  can pass full scale); a device whose speaker layout has surround
+  positions takes the 5.1 as it is. The choice follows the default device
+  and its source, rate, channels and layout as they change; a device that
+  refuses its kind twice gets the mix folded to stereo, so that the mix
+  keeps being taken. The same ring and mixer thread feed it (room in the
+  ring for the largest request a device may make, its fill following the
+  device), SDL converts the ring to the device's rate, and the spatial
+  mixer adds its own latency (0.1 ms for headphones, 0.7 ms for the
+  built-in speakers, as it reports). Elsewhere (Linux, iOS, tvOS) there is
+  no spatial output and the mix stays stereo.
+  runtime/audio is its own library
   (`recomp_audio`, no HLE);
   tools/eax_capture renders with it offline to compare against
   recordings of real Creative hardware.
@@ -1030,7 +1050,10 @@ late-frame rule; on an idle host wake-ups land 15-30 us (Linux) or
 - dsound (DirectSound 8): on the same mixer, as Windows Vista and later
   implement it (software only). Buffers keep a host copy of their
   samples, updated at Unlock, and play it as a ring; the write cursor is
-  how far the mixer has read ahead. DirectSound's volume and pan law;
+  how far the mixer has read ahead. GetSpeakerConfig reports stereo, or
+  DSSPEAKER_5POINT1 with <ID>_SPATIAL_AUDIO=1 where the mix is 5.1;
+  buffers of more channels then reach it as they are (folded to stereo
+  otherwise). DirectSound's volume and pan law;
   DS3D buffers and the listener (deferred settings, rolloff) use the
   DS3D panning model above. Cones and Doppler are stored only;
   notifications and effects are not implemented.
