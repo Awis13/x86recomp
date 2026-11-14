@@ -170,6 +170,8 @@ int main() {
         }
         std::fclose(f);
       }
+      Check(InspectPrewarmCache(dir) == PrewarmCacheState::Needed,"cache inspection enables compilation");
+      Check(InspectPrewarmCache(dir + "/empty") == PrewarmCacheState::Empty,"empty cache is not reported as compiled");
       Check(PrewarmNeeded(dir), "needed: nothing in the archive (a keys file without its shard does not count)");
       {
         // The game saving to the archive: nothing done meanwhile.
@@ -201,6 +203,7 @@ int main() {
                 Exists(dir + "/metal-msl-v9-0000000000000000.bin"),
             "other generations' files removed once unused for 30 days, not before");
       Check(!PrewarmNeeded(dir), "nothing needed afterwards (the recipe without its shader not counted)");
+      Check(InspectPrewarmCache(dir) == PrewarmCacheState::Ready,"complete cache disables compilation");
       Check(PrewarmCaches(nullptr, cancel, dir) == PrewarmResult::NothingToDo, "a second run has nothing to do");
 
       // The archive has them, built as the game builds them.
@@ -227,6 +230,25 @@ int main() {
       }
       Check(found_all == recipes.size(), "the archive finds every pipeline");
       a->Close(2.0);
+
+      // A different shader hash can translate to the same Metal function.
+      // Metal finds its equivalent pipeline in the old archive, but the
+      // new recipe's key must also be persisted for the next inspection.
+      const uint64_t alias_ps = 123456;
+      const std::string alias_msl = PixelMsl(1);
+      const uint32_t alias_len = uint32_t(alias_msl.size());
+      FILE* alias_file = std::fopen(MslCacheFile(dir).c_str(), "ab");
+      std::fwrite(&alias_ps, 8, 1, alias_file);
+      std::fwrite(&alias_len, 4, 1, alias_file);
+      std::fwrite(alias_msl.data(), 1, alias_len, alias_file);
+      std::fclose(alias_file);
+      const auto alias_recipe = Recipe(alias_ps, false);
+      alias_file = std::fopen(RecipeFile(dir).c_str(), "ab");
+      std::fwrite(&alias_recipe, sizeof alias_recipe, 1, alias_file);
+      std::fclose(alias_file);
+      Check(PrewarmNeeded(dir), "equivalent pipeline has a new unsaved recipe key");
+      Check(PrewarmCaches(nullptr, cancel, dir) == PrewarmResult::Done, "equivalent pipeline warm-up finishes");
+      Check(!PrewarmNeeded(dir), "equivalent pipeline recipe is persisted after an archive hit");
       [NSFileManager.defaultManager removeItemAtPath:@(dir.c_str()) error:nil];
     }
 
@@ -257,7 +279,8 @@ int main() {
       const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
       chmod(ArchiveFolder(dir).c_str(), 0755);
       std::printf("metal_prewarm_test: with failing saves %zu of %zu in %.1f s\n", last_done, last_total, s);
-      Check(r == PrewarmResult::Done && last_done == last_total && s < 20, "failing saves do not hold it up");
+      Check(r == PrewarmResult::Incomplete && last_done == last_total && s < 20,
+            "failing saves finish promptly without claiming the cache is complete");
       [NSFileManager.defaultManager removeItemAtPath:@(dir.c_str()) error:nil];
     }
 
@@ -286,6 +309,42 @@ int main() {
       Check(PrewarmNeeded(dir), "still needed after a cancel");
       [NSFileManager.defaultManager removeItemAtPath:@(dir.c_str()) error:nil];
     }
+  }
+  // A launcher in the game's process must release the archive writer
+  // before it hands off, even when compilation was cancelled.
+  @autoreleasepool {
+    id<MTLDevice> dev = MTLCreateSystemDefaultDevice();
+    std::vector<PipelineRecipe> recipes;
+    const std::string dir = MakeCache(8, &recipes);
+    std::atomic<bool> cancel{false};
+    PrewarmArchiveLimits limits;
+    limits.workers = 1;
+    limits.drain_on_close = true;
+    limits.save_every = 1;
+    const auto result = PrewarmCaches([&](size_t done, size_t, const char* phase) {
+      if (done && std::string(phase) == "pipelines") cancel = true;
+    }, cancel, dir, limits);
+    Check(result == PrewarmResult::Cancelled,"same-process warm-up cancelled");
+    PipelineArchive::Options options;
+    options.dir = ArchiveFolder(dir);
+    options.scope = ArchiveScope(dev);
+    auto game = PipelineArchive::Open(dev,options);
+    Check(game->Saves(),"game immediately owns archive after cancelled warm-up");
+    game->CloseAndWait();
+    PrewarmStatus first, last;
+    bool saw_status = false;
+    cancel = false;
+    Check(PrewarmCaches(nullptr, cancel, dir, limits, [&](const PrewarmStatus& s) {
+      if (!saw_status) first = s;
+      saw_status = true;
+      last = s;
+    }) == PrewarmResult::Done, "resume completes the remaining pipelines");
+    Check(first.pipelines_total == recipes.size() && first.pipelines_ready == 1,
+          "resume retains the fixed pipeline total and the saved pipeline");
+    Check(last.pipelines_total == first.pipelines_total && last.pipelines_ready == recipes.size(),
+          "completion reports all pipelines ready with the same total");
+    Check(!PrewarmNeeded(dir), "resumed compilation remains complete on inspection");
+    [NSFileManager.defaultManager removeItemAtPath:@(dir.c_str()) error:nil];
   }
   if (failures) return 1;
   std::printf("metal_prewarm_test: ok\n");

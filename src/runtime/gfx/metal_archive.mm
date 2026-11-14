@@ -355,6 +355,7 @@ id<MTLRenderPipelineState> PipelineArchive::Build(MTLRenderPipelineDescriptor* p
   if (found) *found = false;
   NSArray<id<MTLBinaryArchive>>* shards;
   bool loaded;
+  id<MTLRenderPipelineState> p = nil;
   {
     std::lock_guard<std::mutex> l(mu_);
     shards = shards_;
@@ -364,7 +365,7 @@ id<MTLRenderPipelineState> PipelineArchive::Build(MTLRenderPipelineDescriptor* p
     pd.binaryArchives = shards;
     const uint64_t t0 = NowNs();
     NSError* e = nil;
-    id<MTLRenderPipelineState> p = [dev_ newRenderPipelineStateWithDescriptor:pd
+    p = [dev_ newRenderPipelineStateWithDescriptor:pd
                                                                       options:MTLPipelineOptionFailOnBinaryArchiveMiss
                                                                    reflection:nil
                                                                         error:&e];
@@ -379,36 +380,43 @@ id<MTLRenderPipelineState> PipelineArchive::Build(MTLRenderPipelineDescriptor* p
         auto it = listed_.find(key);
         if (it != listed_.end()) n = it->second;
       }
-      if (n >= 0) Used(n);
-      return p;
-    }
-    misses_.fetch_add(1, std::memory_order_relaxed);
-    miss_ns_.fetch_add(NowNs() - t0, std::memory_order_relaxed);
-    // Outdated shards? Only a miss of a pipeline they hold counts (not one
-    // never saved: built before they loaded, or not saved by its run).
-    uint64_t threshold = 0;
-    bool listed;
-    {
-      std::lock_guard<std::mutex> l(mu_);
-      listed = listed_.count(key) != 0;
-      threshold = std::min<uint64_t>(kStaleMisses, std::max<uint64_t>(8, listed_.size() / 2));
-    }
-    if (listed) {
-      const uint64_t n = listed_missed_.fetch_add(1, std::memory_order_relaxed) + 1;
-      if (n >= threshold && !found_.load(std::memory_order_relaxed) && !stale_.exchange(true)) {
-        {
-          std::lock_guard<std::mutex> l(mu_);
-          shards_ = nil;
-          listed_.clear();
+      if (n >= 0) {
+        Used(n);
+        return p;
+      }
+      // Different shader hashes/recipes can describe equivalent Metal
+      // pipelines. A hit proves the code exists, not that this recipe's
+      // key was saved. Keep its descriptor below so inspection can find
+      // that key too; reuse the hit without compiling it again.
+    } else {
+      misses_.fetch_add(1, std::memory_order_relaxed);
+      miss_ns_.fetch_add(NowNs() - t0, std::memory_order_relaxed);
+      // Outdated shards? Only a miss of a pipeline they hold counts (not one
+      // never saved: built before they loaded, or not saved by its run).
+      uint64_t threshold = 0;
+      bool listed;
+      {
+        std::lock_guard<std::mutex> l(mu_);
+        listed = listed_.count(key) != 0;
+        threshold = std::min<uint64_t>(kStaleMisses, std::max<uint64_t>(8, listed_.size() / 2));
+      }
+      if (listed) {
+        const uint64_t n = listed_missed_.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (n >= threshold && !found_.load(std::memory_order_relaxed) && !stale_.exchange(true)) {
+          {
+            std::lock_guard<std::mutex> l(mu_);
+            shards_ = nil;
+            listed_.clear();
+          }
+          auto self = shared_from_this();
+          dispatch_async(q_, ^{
+            self->DropStale();
+          });
         }
-        auto self = shared_from_this();
-        dispatch_async(q_, ^{
-          self->DropStale();
-        });
       }
     }
   }
-  id<MTLRenderPipelineState> p = [dev_ newRenderPipelineStateWithDescriptor:pd error:error];
+  if (!p) p = [dev_ newRenderPipelineStateWithDescriptor:pd error:error];
   // Kept to be saved: not when closing or saving has stopped, nor by a
   // process that only looks.
   if (!p || closing_.load() || stopped_.load() || (loaded && !writer_.load())) return p;
@@ -640,6 +648,11 @@ void PipelineArchive::Close(double cap_s, const std::atomic<bool>* cancel) {
     std::fprintf(stderr, "gfx: pipeline archive: not saved within %.1f s, left to finish\n", double(NowNs() - t0) / 1e9);
   else if (NowNs() - t0 > 500000000ull)
     std::fprintf(stderr, "gfx: pipeline archive: saved in %.1f s at exit\n", double(NowNs() - t0) / 1e9);
+}
+
+void PipelineArchive::CloseAndWait() {
+  Close(30.0);
+  dispatch_sync(q_, ^{});
 }
 
 PipelineArchive::Stats PipelineArchive::TakeStats() {
