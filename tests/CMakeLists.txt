@@ -73,6 +73,14 @@ target_compile_options(mixer_ring_test PRIVATE -O2)
 target_link_libraries(mixer_ring_test PRIVATE Threads::Threads)
 add_test(NAME mixer_ring COMMAND mixer_ring_test)
 
+# surround_test: the 5.1 mix's pure parts (runtime/audio/surround.h):
+# where sources land in it, the LFE fold, the speaker configuration
+# reported, the way a device is rendered for; portable.
+add_executable(surround_test surround_test.cpp)
+target_include_directories(surround_test PRIVATE ${PROJECT_SOURCE_DIR}/src)
+target_compile_features(surround_test PRIVATE cxx_std_20)
+add_test(NAME surround COMMAND surround_test)
+
 # gl_draw_test: the GL context's vertex arrays and immediate mode against
 # a reference model of GL's conversions, through a recording device;
 # portable.
