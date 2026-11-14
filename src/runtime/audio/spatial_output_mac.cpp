@@ -297,13 +297,13 @@ class MacSpatialOutput final : public SpatialOutput {
     const double ms = 1000.0 / rate_;
     char rendering[256];
     if (OutputIsRendered(k))
-      std::snprintf(rendering, sizeof rendering, "the spatial mixer for %s%s%s, personal profile %s, LFE %s; "
+      std::snprintf(rendering, sizeof rendering, "the spatial mixer for %s%s%s, personal profile %s, LFE %s%s; "
                     "mixer latency %.2f ms",
                     OutputKindName(k), guessed_ ? " (the system does not say what plays it: taken as headphones)" : "",
                     OutputTracksHead(k) ? (chain_.head_tracking() ? ", head tracking on" : ", head tracking refused")
                                         : "",
                     chain_.personal() ? "asked for" : "refused", OutputDropsLfe(k) ? "into the front pair" : "kept",
-                    chain_.latency_ms());
+                    OutputCuesBack(k) ? ", the back pair's spectral cue" : "", chain_.latency_ms());
     else
       std::snprintf(rendering, sizeof rendering, "%s", OutputKindName(k));
     WarnF("audio: spatial audio %s: '%s' (%d channels%s, %d Hz): %s; device buffer %d frames (%.1f ms), device "

@@ -1,7 +1,7 @@
 // The 5.1 mix's pure parts (runtime/audio/surround.h): where each channel
 // of a source lands in the mix, stereo into the front pair, the LFE fold,
-// the speaker configuration DirectSound reports, and the way a device is
-// rendered for; portable.
+// the speaker configuration DirectSound reports, the way a device is
+// rendered for, the limiter and the back pair's spectral cue; portable.
 
 #include <cmath>
 #include <cstdio>
@@ -216,6 +216,57 @@ void Limiter() {
   Check(std::fabs(r[600] / r1[600]) < 1.0f, "right after the burst it is still down (no pumping per sample)");
 }
 
+// A tone's gain (dB) through the back cue on one channel, the other silent:
+// the RMS of the last half second of 1 s at 48 kHz.
+double CueGain(double hz, bool right, double* other) {
+  BackCue cue;
+  cue.SetRate(48000);
+  const int n = 48000;
+  std::vector<float> on(n), off(n, 0.0f);
+  for (int i = 0; i < n; i++) on[size_t(i)] = 0.5f * float(std::sin(2 * 3.14159265358979323846 * hz * i / 48000));
+  std::vector<float> ref = on;
+  cue.Process(right ? off.data() : on.data(), right ? on.data() : off.data(), n);
+  double s = 0, r = 0, o = 0;
+  for (int i = n / 2; i < n; i++) {
+    s += double(on[size_t(i)]) * on[size_t(i)];
+    r += double(ref[size_t(i)]) * ref[size_t(i)];
+    o += std::fabs(off[size_t(i)]);
+  }
+  *other = o;
+  return 10 * std::log10(s / r);
+}
+
+// The back pair's cue: the 4.5 kHz band down 10 dB, the 1.1 kHz band up
+// (4 dB less the dip's skirt), the bass and the far treble near as they were; each channel its
+// own filter; only for headphones.
+void Cue() {
+  double other = 0, o2 = 0;
+  const double bass = CueGain(100, false, &other), bump = CueGain(1100, false, &o2);
+  const double dip = CueGain(4500, true, &o2), treble = CueGain(16000, false, &o2);
+  std::printf("back cue: 100 Hz %+.2f, 1.1 kHz %+.2f, 4.5 kHz %+.2f, 16 kHz %+.2f dB\n", bass, bump, dip, treble);
+  Check(std::fabs(bass) < 0.5, "back cue: the bass as it was");
+  Check(bump > 2.0 && bump < 3.5, "back cue: 1.1 kHz up (4 dB less the dip's skirt: about 2.7)");
+  Check(dip < -9.0 && dip > -11.0, "back cue: 4.5 kHz down about 10 dB, on the right channel too");
+  Check(treble > -2.0 && treble < 1.0, "back cue: the far treble near as it was");
+  Check(other == 0 && o2 == 0, "back cue: a silent channel stays silent (no shared state)");
+  BackCue a;
+  a.SetRate(48000);
+  float bl[64], br[64];
+  for (int i = 0; i < 64; i++) bl[i] = br[i] = i == 0 ? 1.0f : 0.0f;
+  a.Process(bl, br, 64);
+  a.SetRate(48000);
+  float bl2[64], br2[64];
+  for (int i = 0; i < 64; i++) bl2[i] = br2[i] = i == 0 ? 1.0f : 0.0f;
+  a.Process(bl2, br2, 64);
+  bool same = true;
+  for (int i = 0; i < 64; i++) same &= bl[i] == bl2[i] && br[i] == br2[i] && bl[i] == br[i];
+  Check(same, "back cue: SetRate clears the state; both channels filtered alike");
+  Check(OutputCuesBack(OutputKind::kHeadphones), "back cue on headphones");
+  Check(!OutputCuesBack(OutputKind::kBuiltInSpeakers) && !OutputCuesBack(OutputKind::kExternalSpeakers) &&
+            !OutputCuesBack(OutputKind::kStraight) && !OutputCuesBack(OutputKind::kFoldedStereo),
+        "no back cue for speakers, a 5.1 device or the folded stereo");
+}
+
 }  // namespace
 
 int main() {
@@ -228,6 +279,7 @@ int main() {
   Sources();
   Fallback();
   Limiter();
+  Cue();
   if (g_failures) return 1;
   std::printf("ok\n");
   return 0;

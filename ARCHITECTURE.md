@@ -1011,8 +1011,11 @@ late-frame rule; on an idle host wake-ups land 15-30 us (Linux) or
   front pair. On macOS it reaches the default device through Apple's
   spatial mixer (spatial_output.h, spatial_chain_mac.h): the mix as an
   ambience bed, rendered binaural for headphones (head tracking and the
-  personal profile asked for), for the built-in speakers (which drop the
-  LFE: it is folded into the fronts at -6 dB first) or a stereo pair, with
+  personal profile asked for; the back pair given the back's spectral
+  cue first, as the renderer leaves a sound behind with nearly the
+  spectrum of one ahead: surround.h's BackCue), for the built-in speakers
+  (which drop the LFE: it is folded into the fronts at -6 dB first) or a
+  stereo pair, with
   a peak limiter after it (the renderer's sum of six channels into two
   can pass full scale); a device whose speaker layout has surround
   positions takes the 5.1 as it is. The choice follows the default device

@@ -2,7 +2,9 @@
 // (runtime/audio/spatial_chain_mac.h), rendered offline without a device,
 // through the same SpatialChain::Render the output unit's callback calls:
 //  - headphones: each front channel heard on its own side, the back ones
-//    too and unlike the front ones, the LFE heard, head tracking asked for;
+//    too and unlike the front ones, the LFE heard, head tracking asked for,
+//    the back pair duller than the front (the back's spectral cue);
+//  - external speakers: no such cue;
 //  - the built-in speakers: the renderer itself drops the LFE (rendered
 //    without the chain), and through the chain it is heard (folded); no
 //    head tracking;
@@ -203,6 +205,28 @@ int main() {
     }
   Check(std::sqrt(diff / energy) > 0.3, "headphones: back left rendered unlike front left");
   Check(Db(lfe.Rms(0)) > -40, "headphones: the LFE heard without a fold");
+
+  // The back's spectral cue: on headphones a back channel's 5 kHz against
+  // its 500 Hz (both ears' energy) is well under a front channel's; on
+  // external speakers (no cue) the two are alike.
+  auto tilt = [](OutputKind kind, int channel, double* out) {
+    Out hi, lo;
+    if (!Through(kind, {channel, 5000}, &hi) || !Through(kind, {channel, 500}, &lo)) return false;
+    *out = 10 * std::log10((hi.Rms(0) * hi.Rms(0) + hi.Rms(1) * hi.Rms(1)) /
+                           (lo.Rms(0) * lo.Rms(0) + lo.Rms(1) * lo.Rms(1)));
+    return true;
+  };
+  double hp_f = 0, hp_b = 0, hp_br = 0, ext_f = 0, ext_b = 0;
+  if (!tilt(OutputKind::kHeadphones, kFL, &hp_f) || !tilt(OutputKind::kHeadphones, kBL, &hp_b) ||
+      !tilt(OutputKind::kHeadphones, kBR, &hp_br) || !tilt(OutputKind::kExternalSpeakers, kFL, &ext_f) ||
+      !tilt(OutputKind::kExternalSpeakers, kBL, &ext_b)) {
+    std::printf("FAIL: the tilt tones did not render\n");
+    return 1;
+  }
+  std::printf("5 kHz against 500 Hz: headphones FL %+.1f BL %+.1f BR %+.1f dB; external speakers FL %+.1f BL %+.1f dB\n",
+              hp_f, hp_b, hp_br, ext_f, ext_b);
+  Check(hp_b < hp_f - 6 && hp_br < hp_f - 6, "headphones: the back pair duller than the front by the back cue");
+  Check(std::fabs(ext_b - ext_f) < 1, "external speakers: the back pair's spectrum as the front's (no cue)");
   Check(raw_lfe < -100, "built-in speakers: the renderer itself drops the LFE");
   Check(Db(spk_lfe.Rms(0)) > -40 && Db(spk_lfe.Rms(1)) > -40, "built-in speakers: the LFE heard through the chain");
   Check(Db(ext_fl.Rms(0)) > -20 && Db(ext_fl.Rms(1)) < -60, "external speakers: front left on the left only");

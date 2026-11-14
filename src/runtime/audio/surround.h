@@ -3,7 +3,8 @@
 // channel count land in the mix (and fold to stereo), the LFE fold for
 // outputs that drop it, the speaker configuration DirectSound reports for
 // the mix, which way a host output device is rendered for, the fallback
-// when a device refuses that, and the peak limiter after the renderer.
+// when a device refuses that, the back's spectral cue before a headphone
+// renderer and the peak limiter after it.
 // Pure, no host audio API; the mixer (mixer.h), DirectSound (dsound.cpp)
 // and the Apple output (spatial_output.h, spatial_chain_mac.h) use them.
 //
@@ -15,6 +16,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <iterator>
 
 namespace recomp::audio {
 
@@ -173,6 +175,9 @@ inline bool OutputDropsLfe(OutputKind k) { return k == OutputKind::kBuiltInSpeak
 // Head tracking is asked for on headphones only.
 inline bool OutputTracksHead(OutputKind k) { return k == OutputKind::kHeadphones; }
 
+// The back pair is given the back's spectral cue on headphones only.
+inline bool OutputCuesBack(OutputKind k) { return k == OutputKind::kHeadphones; }
+
 // Whether a kind goes through the host's spatial renderer.
 inline bool OutputIsRendered(OutputKind k) {
   return k == OutputKind::kHeadphones || k == OutputKind::kBuiltInSpeakers || k == OutputKind::kExternalSpeakers;
@@ -243,6 +248,63 @@ class PeakLimiter {
  private:
   float release_ = 0.0f, env_ = 0.0f, min_gain_ = 1.0f;
   uint64_t limited_ = 0;
+};
+
+// The back's spectral cue for the back pair, before a headphone renderer.
+// Apple's spatial mixer renders the bed's back pair at +-110 degrees, and
+// the image of a sound panned between them (a sound behind) comes out
+// with nearly the spectrum of one panned between the front pair (a sound
+// ahead): measured offline (macOS 26, headphones, the generic HRTF, the
+// same noise in FL+FR and in BL+BR), the ears' 2-12 kHz spectra differ by
+// 4.4 dB RMS and the back image is 0.7 dB brighter above 4 kHz, not
+// duller. Both sit in the middle, so ahead and behind sound the same.
+//
+// Blauert's directional bands (Spatial Hearing, 1997, 2.3.2): a band near
+// 1 kHz is heard as behind, one near 4-5 kHz as ahead, as the pinna
+// shadows the treble of a sound from behind. So the back pair is cut
+// 10 dB at 4.5 kHz (Q 0.7) and lifted 4 dB at 1.1 kHz (Q 1), RBJ peaking
+// filters: through the renderer the spectra then differ by 8.2 dB RMS and
+// the back image is 6.4 dB duller above 4 kHz; a single back channel's
+// interaural level difference stays near what it was (14.3 dB, from 16.7)
+// and the front pair is not touched. Of the shapes measured (high shelves
+// at 3 and 4 kHz of -6 and -9 dB, a 5 kHz dip, these two bands at -8/+3
+// dB) this gave the largest difference with the side cues kept.
+class BackCue {
+ public:
+  static constexpr double kDipHz = 4500, kDipDb = -10, kDipQ = 0.7;
+  static constexpr double kBumpHz = 1100, kBumpDb = 4, kBumpQ = 1.0;
+
+  // Coefficients for `rate`; clears the filters' state.
+  void SetRate(double rate) {
+    dip_ = Peaking(rate, kDipHz, kDipDb, kDipQ);
+    bump_ = Peaking(rate, kBumpHz, kBumpDb, kBumpQ);
+    std::fill(std::begin(state_), std::end(state_), 0.0);
+  }
+  // n frames of the back left and back right channels, in place.
+  void Process(float* bl, float* br, int n) {
+    float* ch[2] = {bl, br};
+    for (int c = 0; c < 2; c++)
+      for (int i = 0; i < n; i++) ch[c][i] = float(Run(bump_, &state_[c * 4 + 2], Run(dip_, &state_[c * 4], ch[c][i])));
+  }
+
+ private:
+  struct Coefs {
+    double b0 = 1, b1 = 0, b2 = 0, a1 = 0, a2 = 0;
+  };
+  static Coefs Peaking(double rate, double hz, double db, double q) {
+    const double a = std::pow(10.0, db / 40), w = 2 * 3.14159265358979323846 * hz / rate, cw = std::cos(w);
+    const double alpha = std::sin(w) / (2 * q), a0 = 1 + alpha / a;
+    return {(1 + alpha * a) / a0, -2 * cw / a0, (1 - alpha * a) / a0, -2 * cw / a0, (1 - alpha / a) / a0};
+  }
+  // Transposed direct form II; z holds the two state values.
+  static double Run(const Coefs& k, double* z, double x) {
+    const double y = k.b0 * x + z[0];
+    z[0] = k.b1 * x - k.a1 * y + z[1];
+    z[1] = k.b2 * x - k.a2 * y;
+    return y;
+  }
+  Coefs dip_, bump_;
+  double state_[8] = {};
 };
 
 }  // namespace recomp::audio

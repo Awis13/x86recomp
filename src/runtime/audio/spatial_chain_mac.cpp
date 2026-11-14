@@ -79,6 +79,7 @@ bool SpatialChain::Configure(OutputKind kind, double rate, UInt32 max_frames, Pu
   max_frames_ = max_frames;
   inter_.assign(size_t(max_frames) * kBedChannels, 0.0f);
   limiter_.SetRate(rate);
+  back_cue_.SetRate(rate);
   head_tracking_ = personal_ = false;
   latency_ms_ = 0;
   if (!OutputIsRendered(kind)) return true;  // no renderer: Fill alone
@@ -147,8 +148,9 @@ bool SpatialChain::SetRenderedKind(OutputKind kind) {
   return true;
 }
 
-// n frames of the mix into io: the 5.1 bed (6 planar buffers) with the LFE
-// folded where the renderer drops it, or for kFoldedStereo two buffers of
+// n frames of the mix into io: the 5.1 bed (6 planar buffers) with the
+// back pair's spectral cue on headphones and the LFE folded where the
+// renderer drops it, or for kFoldedStereo two buffers of
 // the mix folded to stereo.
 void SpatialChain::Fill(AudioBufferList* io, UInt32 n) {
   n = std::min(n, max_frames_);
@@ -165,6 +167,9 @@ void SpatialChain::Fill(AudioBufferList* io, UInt32 n) {
     auto* dst = static_cast<float*>(io->mBuffers[b].mData);
     for (UInt32 i = 0; i < n; i++) dst[i] = inter_[size_t(i) * kBedChannels + b];
   }
+  if (io->mNumberBuffers >= UInt32(kBedChannels) && OutputCuesBack(k))
+    back_cue_.Process(static_cast<float*>(io->mBuffers[kBL].mData), static_cast<float*>(io->mBuffers[kBR].mData),
+                      int(n));
   if (io->mNumberBuffers >= UInt32(kBedChannels) && OutputDropsLfe(k))
     FoldLfe(static_cast<float*>(io->mBuffers[kFL].mData), static_cast<float*>(io->mBuffers[kFR].mData),
             static_cast<float*>(io->mBuffers[kLFE].mData), int(n));

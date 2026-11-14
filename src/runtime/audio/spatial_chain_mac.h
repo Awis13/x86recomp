@@ -5,8 +5,10 @@
 // set up for the 5.1 mix (one input, the mix as an ambience bed,
 // kAudioChannelLayoutTag_MPEG_5_1_A: L R C LFE Ls Rs, surround.h's order;
 // planar float; stereo out; the output type for the kind; head tracking
-// asked for on headphones and the personal profile's Auto mode), the LFE
-// folded first where the renderer drops it and a peak limiter after it;
+// asked for on headphones and the personal profile's Auto mode), the back
+// pair given the back's spectral cue first on headphones (surround.h's
+// BackCue), the LFE folded first where the renderer drops it and a peak
+// limiter after it;
 // for a 5.1 device, the mix as it is; failing those, the mix folded to
 // stereo here. The output unit's render callback calls Render; a test
 // renders it offline.
@@ -85,6 +87,7 @@ class SpatialChain {
   UInt32 max_frames_ = 0;
   std::vector<float> inter_;  // a pull's interleaved frames
   PeakLimiter limiter_;
+  BackCue back_cue_;
   std::atomic<uint64_t> limited_{0};
   std::atomic<float> lowest_gain_{1.0f};
   bool head_tracking_ = false, personal_ = false;
