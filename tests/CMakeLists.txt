@@ -287,6 +287,19 @@ if(APPLE)
   set_tests_properties(metal_rcas PROPERTIES SKIP_RETURN_CODE 77)
 endif()
 
+# metal_output_curve_test: the curve the Metal backend puts the frame
+# through on its way to the window (gfx/output_curve.h), its setting and
+# output_curve on the GPU against the curves written out (the GPU part
+# skipped without a Metal device); macOS.
+if(APPLE)
+  add_executable(metal_output_curve_test metal_output_curve_test.mm)
+  set_source_files_properties(metal_output_curve_test.mm PROPERTIES COMPILE_OPTIONS "-fobjc-arc;-std=c++20")
+  target_include_directories(metal_output_curve_test PRIVATE "${PROJECT_SOURCE_DIR}/src")
+  target_link_libraries(metal_output_curve_test PRIVATE "-framework Metal" "-framework Foundation")
+  add_test(NAME metal_output_curve COMMAND metal_output_curve_test)
+  set_tests_properties(metal_output_curve PROPERTIES SKIP_RETURN_CODE 77)
+endif()
+
 # metal_archive_test: pipelines kept compiled between runs on the Metal
 # backend (gfx/metal_archive.h): found in a later archive, a damaged shard,
 # another scope, the shard cap (skipped without a Metal device); macOS.
