@@ -3,8 +3,9 @@
 // through the same SpatialChain::Render the output unit's callback calls:
 //  - headphones: each front channel heard on its own side, the back ones
 //    too and unlike the front ones, the LFE heard, head tracking asked for,
-//    the back pair duller than the front (the back's spectral cue);
-//  - external speakers: no such cue;
+//    the back pair duller than the front (the back's spectral cue), a
+//    room after an impulse;
+//  - external speakers: no such cue, no room;
 //  - the built-in speakers: the renderer itself drops the LFE (rendered
 //    without the chain), and through the chain it is heard (folded); no
 //    head tracking;
@@ -49,6 +50,7 @@ struct Feed {
   double freq = 1000;
   float amp = 0.5f;
   bool pattern = false;
+  bool impulse = false;  // one sample of `amp` in `channel`, 0.5 s in
   uint64_t t = 0;
 };
 
@@ -57,7 +59,9 @@ void Pull(void* ctx, float* frames, int n) {
   for (int i = 0; i < n; i++, f->t++)
     for (int c = 0; c < kBedChannels; c++) {
       float v = 0;
-      if (f->pattern)
+      if (f->impulse)
+        v = c == f->channel && f->t == uint64_t(kRate / 2) ? f->amp : 0.0f;
+      else if (f->pattern)
         v = 0.1f * float(c + 1);
       else if (f->channel < 0 || f->channel == c)
         v = f->amp * float(std::sin(2 * M_PI * f->freq * double(f->t) / kRate));
@@ -227,6 +231,39 @@ int main() {
               hp_f, hp_b, hp_br, ext_f, ext_b);
   Check(hp_b < hp_f - 6 && hp_br < hp_f - 6, "headphones: the back pair duller than the front by the back cue");
   Check(std::fabs(ext_b - ext_f) < 1, "external speakers: the back pair's spectrum as the front's (no cue)");
+
+  // The room: an impulse in front left, the direct sound (2.5 ms from its
+  // peak) against everything after it, both ears. Without a room the
+  // renderer gives about 42 dB; with it about 11.5 dB (surround.h's Room).
+  auto drr = [](OutputKind kind, double* out) {
+    Feed f;
+    f.channel = kFL;
+    f.impulse = true;
+    Out o;
+    if (!Through(kind, f, &o)) return false;
+    size_t peak = 0;
+    double top = 0;
+    for (size_t i = 0; i < o.ch[0].size(); i++) {
+      const double e = double(o.ch[0][i]) * o.ch[0][i] + double(o.ch[1][i]) * o.ch[1][i];
+      if (e > top) top = e, peak = i;
+    }
+    double direct = 0, rest = 0;
+    for (size_t i = peak > 120 ? peak - 120 : 0; i < o.ch[0].size(); i++) {
+      const double e = double(o.ch[0][i]) * o.ch[0][i] + double(o.ch[1][i]) * o.ch[1][i];
+      (i < peak + 120 ? direct : rest) += e;
+    }
+    *out = 10 * std::log10(direct / (rest + 1e-30));
+    return true;
+  };
+  double drr_hp = 0, drr_ext = 0;
+  if (!drr(OutputKind::kHeadphones, &drr_hp) || !drr(OutputKind::kExternalSpeakers, &drr_ext)) {
+    std::printf("FAIL: the impulse did not render\n");
+    return 1;
+  }
+  std::printf("an impulse in front left, direct sound over the rest: headphones %.1f dB, external speakers %.1f dB\n",
+              drr_hp, drr_ext);
+  Check(drr_hp > 6 && drr_hp < 20, "headphones: the room heard after the direct sound");
+  Check(drr_ext > 30, "external speakers: no room added");
   Check(raw_lfe < -100, "built-in speakers: the renderer itself drops the LFE");
   Check(Db(spk_lfe.Rms(0)) > -40 && Db(spk_lfe.Rms(1)) > -40, "built-in speakers: the LFE heard through the chain");
   Check(Db(ext_fl.Rms(0)) > -20 && Db(ext_fl.Rms(1)) < -60, "external speakers: front left on the left only");

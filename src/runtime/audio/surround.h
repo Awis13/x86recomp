@@ -3,8 +3,8 @@
 // channel count land in the mix (and fold to stereo), the LFE fold for
 // outputs that drop it, the speaker configuration DirectSound reports for
 // the mix, which way a host output device is rendered for, the fallback
-// when a device refuses that, the back's spectral cue before a headphone
-// renderer and the peak limiter after it.
+// when a device refuses that, the room and the back's spectral cue before
+// a headphone renderer and the peak limiter after it.
 // Pure, no host audio API; the mixer (mixer.h), DirectSound (dsound.cpp)
 // and the Apple output (spatial_output.h, spatial_chain_mac.h) use them.
 //
@@ -17,6 +17,7 @@
 #include <cmath>
 #include <cstdint>
 #include <iterator>
+#include <vector>
 
 namespace recomp::audio {
 
@@ -178,6 +179,10 @@ inline bool OutputTracksHead(OutputKind k) { return k == OutputKind::kHeadphones
 // The back pair is given the back's spectral cue on headphones only.
 inline bool OutputCuesBack(OutputKind k) { return k == OutputKind::kHeadphones; }
 
+// The bed is given a room (Room) on headphones only: speakers play in a
+// room of their own.
+inline bool OutputHasRoom(OutputKind k) { return k == OutputKind::kHeadphones; }
+
 // Whether a kind goes through the host's spatial renderer.
 inline bool OutputIsRendered(OutputKind k) {
   return k == OutputKind::kHeadphones || k == OutputKind::kBuiltInSpeakers || k == OutputKind::kExternalSpeakers;
@@ -305,6 +310,145 @@ class BackCue {
   }
   Coefs dip_, bump_;
   double state_[8] = {};
+};
+
+// A room for the bed before a headphone renderer: early reflections and a
+// late reverberation, both added to the bed's five full-range channels,
+// so that the renderer places them around the listener as it places the
+// speakers (head tracking and the personal profile apply to them too).
+// Apple's renderer for headphones is anechoic (no reflections: a channel
+// is one HRTF), which is heard inside or at the head; its own reverb
+// (kAudioUnitProperty_UsesInternalReverb) was measured to differ from one
+// render to the next and to take most of the side cues where it widens
+// the image.
+//
+// Early: each full-range channel reflected into its neighbours (the other
+// side of its pair, the other pair on its side; the centre into the front
+// pair) 9-19 ms later, low-passed (one pole, 5 kHz). Late: a feedback
+// delay network of 8 lines (29.7-73.1 ms, a Hadamard matrix, each line
+// low-passed so the treble dies first), 0.5 s to fall 60 dB; every
+// channel feeds lines of its own, and each output channel takes the lines
+// with signs from its own row of a Hadamard matrix, so the five outputs
+// are uncorrelated (a diffuse tail). Nothing is added to the dry signal
+// and nothing delays it: no latency.
+//
+// Measured offline through the renderer (macOS 26, headphones, the
+// generic HRTF, with BackCue): an impulse in front left comes out with its
+// direct sound 41.7 dB over everything after it without the room (no
+// room at all), 11.5 dB with it (a small room at a metre or two); the
+// tail's interaural correlation (50-300 ms) is 0.34; front left alone
+// 0.43 (0.53 dry). The cost: the back image's difference from the front
+// one (BackCue's doc) goes from 8.2 to 6.5 dB RMS (4.4 with neither), and
+// the side cues soften as in a room (front left's interaural level
+// difference 8.8 dB from 10.4, back left's 10.9 from 14.7). Half these
+// levels (early 0.15, late 0.20) leave 16 dB of direct sound over the
+// room; 1.4 times them, 8.5 dB and the side cues 7.7/9.0 dB. CPU: 1.5 ms
+// a second of audio at 48 kHz on one core of an M3 Pro.
+class Room {
+ public:
+  static constexpr int kLines = 8;
+  static constexpr double kRt60 = 0.5, kDampHz = 5000, kEarlyLowpassHz = 5000;
+  // The level of the room against the dry bed (linear).
+  static constexpr float kEarlyGain = 0.25f, kLateGain = 0.35f;
+
+  // Other levels than those (for measuring).
+  void SetLevels(float early, float late) {
+    early_gain_ = early;
+    late_gain_ = late;
+  }
+
+  // Delay lines for `rate` (allocates); clears the state.
+  void SetRate(double rate) {
+    static constexpr double kLineMs[kLines] = {29.7, 37.1, 41.1, 43.7, 53.0, 59.5, 67.3, 73.1};
+    for (int i = 0; i < kLines; i++) {
+      const int len = std::max(1, int(kLineMs[i] * 0.001 * rate + 0.5));
+      line_[i].assign(size_t(len), 0.0f);
+      pos_[i] = 0;
+      gain_[i] = float(std::pow(10.0, -3.0 * len / (kRt60 * rate)));
+      damp_state_[i] = 0;
+    }
+    damp_ = float(1 - std::exp(-2 * kPi * kDampHz / rate));
+    early_lp_ = float(1 - std::exp(-2 * kPi * kEarlyLowpassHz / rate));
+    for (int k = 0; k < kEarlyPaths; k++) {
+      early_delay_[k] = std::max(1, int(kEarly[k].ms * 0.001 * rate + 0.5));
+      early_state_[k] = 0;
+    }
+    hist_len_ = 1;
+    while (hist_len_ <= *std::max_element(std::begin(early_delay_), std::end(early_delay_))) hist_len_ <<= 1;
+    for (auto& h : hist_) h.assign(size_t(hist_len_), 0.0f);
+    hist_pos_ = 0;
+  }
+
+  // n frames of the bed (kBedChannels planar buffers), in place.
+  void Process(float* const* ch, int n) {
+    if (line_[0].empty()) return;
+    static constexpr int kFull[5] = {kFL, kFR, kFC, kBL, kBR};
+    for (int i = 0; i < n; i++) {
+      float x[5];
+      for (int c = 0; c < 5; c++) {
+        x[c] = ch[kFull[c]][i];
+        hist_[c][size_t(hist_pos_)] = x[c];
+      }
+      float add[kBedChannels] = {};
+      for (int k = 0; k < kEarlyPaths; k++) {
+        const float v = hist_[kEarly[k].from][size_t((hist_pos_ - early_delay_[k]) & (hist_len_ - 1))];
+        early_state_[k] += early_lp_ * (v * kEarly[k].gain - early_state_[k]);
+        add[kFull[kEarly[k].to]] += early_gain_ * early_state_[k];
+      }
+      hist_pos_ = (hist_pos_ + 1) & (hist_len_ - 1);
+      // The lines' outputs, damped, then mixed by the Hadamard matrix.
+      float v[kLines], f[kLines];
+      for (int l = 0; l < kLines; l++) {
+        damp_state_[l] += damp_ * (line_[l][size_t(pos_[l])] - damp_state_[l]);
+        v[l] = f[l] = damp_state_[l];
+      }
+      Hadamard(f);
+      for (int l = 0; l < kLines; l++) {
+        line_[l][size_t(pos_[l])] = gain_[l] * f[l] * kInvSqrt8 + x[kFeed[l]];
+        if (++pos_[l] == int(line_[l].size())) pos_[l] = 0;
+      }
+      Hadamard(v);  // row o of the matrix gives output o its signs
+      for (int c = 0; c < 5; c++) add[kFull[c]] += late_gain_ * kInvSqrt8 * kOutWeight[c] * v[kOutRow[c]];
+      for (int c = 0; c < 5; c++) ch[kFull[c]][i] += add[kFull[c]];
+    }
+  }
+
+ private:
+  static constexpr double kPi = 3.14159265358979323846;
+  static constexpr float kInvSqrt8 = 0.35355339f;
+  struct Early {
+    int from, to;  // indices into kFull: FL FR FC BL BR
+    double ms;
+    float gain;
+  };
+  static constexpr int kEarlyPaths = 10;
+  static constexpr Early kEarly[kEarlyPaths] = {
+      {0, 1, 11, 1.0f}, {1, 0, 13, 1.0f}, {3, 4, 12, 1.0f}, {4, 3, 14, 1.0f}, {0, 3, 17, 0.7f},
+      {1, 4, 19, 0.7f}, {3, 0, 16, 0.7f}, {4, 1, 18, 0.7f}, {2, 0, 9, 0.8f},  {2, 1, 10, 0.8f}};
+  // The channel (index into FL FR FC BL BR) each line is fed from.
+  static constexpr int kFeed[kLines] = {0, 1, 3, 4, 2, 0, 1, 3};
+  // Each output's Hadamard row (1-5: never the all-ones row) and weight
+  // (the centre's tail lower: the tail comes from around, not ahead).
+  static constexpr int kOutRow[5] = {1, 2, 5, 3, 4};
+  static constexpr float kOutWeight[5] = {1.0f, 1.0f, 0.5f, 1.0f, 1.0f};
+  // In place, unnormalised: a Sylvester Hadamard matrix of order 8.
+  static void Hadamard(float* a) {
+    for (int h = 1; h < kLines; h <<= 1)
+      for (int i = 0; i < kLines; i += h << 1)
+        for (int j = i; j < i + h; j++) {
+          const float x = a[j], y = a[j + h];
+          a[j] = x + y;
+          a[j + h] = x - y;
+        }
+  }
+  std::vector<float> line_[kLines];
+  int pos_[kLines] = {};
+  float gain_[kLines] = {}, damp_state_[kLines] = {};
+  float damp_ = 0, early_lp_ = 0, early_gain_ = kEarlyGain, late_gain_ = kLateGain;
+  int early_delay_[kEarlyPaths] = {};
+  float early_state_[kEarlyPaths] = {};
+  std::vector<float> hist_[5];
+  int hist_len_ = 1, hist_pos_ = 0;
 };
 
 }  // namespace recomp::audio

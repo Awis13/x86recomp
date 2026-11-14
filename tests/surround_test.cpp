@@ -1,7 +1,8 @@
 // The 5.1 mix's pure parts (runtime/audio/surround.h): where each channel
 // of a source lands in the mix, stereo into the front pair, the LFE fold,
 // the speaker configuration DirectSound reports, the way a device is
-// rendered for, the limiter and the back pair's spectral cue; portable.
+// rendered for, the limiter, the back pair's spectral cue and the room;
+// portable.
 
 #include <cmath>
 #include <cstdio>
@@ -267,6 +268,95 @@ void Cue() {
         "no back cue for speakers, a 5.1 device or the folded stereo");
 }
 
+// The room: an impulse in front left passes at once and unchanged (no
+// latency, nothing added at its own instant), the reflections come 9 ms
+// or more later in the other channels, the tail falls about 60 dB in half
+// a second, the four corner channels' tails are far from alike, the LFE is
+// left alone, silence stays silence, noise does not run away; headphones
+// only.
+void RoomTest() {
+  const int rate = 48000, n = rate;
+  std::vector<std::vector<float>> buf(6, std::vector<float>(size_t(n), 0.0f));
+  float* ch[6];
+  for (int c = 0; c < 6; c++) ch[c] = buf[size_t(c)].data();
+  buf[kFL][0] = 1.0f;
+  Room room;
+  room.SetRate(rate);
+  // In slices, as the chain calls it.
+  for (int i = 0; i < n; i += 512) {
+    float* s[6];
+    for (int c = 0; c < 6; c++) s[c] = ch[c] + i;
+    room.Process(s, std::min(512, n - i));
+  }
+  Check(buf[kFL][0] == 1.0f, "room: the impulse itself passes unchanged");
+  bool early_quiet = true;
+  for (int c = 0; c < 6; c++)
+    for (int i = (c == kFL ? 1 : 0); i < rate * 9 / 1000 - 1; i++) early_quiet &= buf[size_t(c)][size_t(i)] == 0.0f;
+  Check(early_quiet, "room: nothing in any channel for the first 9 ms but the impulse");
+  auto energy = [&](int c, double a, double b) {
+    double e = 0;
+    for (int i = int(a * rate); i < int(b * rate); i++) e += double(buf[size_t(c)][size_t(i)]) * buf[size_t(c)][size_t(i)];
+    return e;
+  };
+  double early = 0, late = 0;
+  for (int c : {kFL, kFR, kFC, kBL, kBR}) {
+    early += energy(c, 0.009, 0.1);
+    late += energy(c, 0.45, 0.55);
+  }
+  const double fall = 10 * std::log10(late / early);
+  std::printf("room: 0.45-0.55 s against 9-100 ms %.1f dB; FR %.1f BL %.1f dB of the impulse in 9-100 ms\n", fall,
+              10 * std::log10(energy(kFR, 0.009, 0.1)), 10 * std::log10(energy(kBL, 0.009, 0.1)));
+  Check(fall < -45 && fall > -80, "room: the tail falls about 60 dB in half a second");
+  Check(energy(kFR, 0.009, 0.1) > 1e-3 && energy(kBL, 0.009, 0.1) > 1e-3, "room: reflections reach the other channels");
+  Check(energy(kLFE, 0, 1) == 0, "room: the LFE left alone");
+  // The corners' tails (0.1-0.4 s) against each other.
+  const int corners[4] = {kFL, kFR, kBL, kBR};
+  double worst = 0;
+  for (int a = 0; a < 4; a++)
+    for (int b = a + 1; b < 4; b++) {
+      double xy = 0;
+      for (int i = rate / 10; i < rate * 4 / 10; i++)
+        xy += double(buf[size_t(corners[a])][size_t(i)]) * buf[size_t(corners[b])][size_t(i)];
+      worst = std::max(worst, std::fabs(xy) / std::sqrt(energy(corners[a], 0.1, 0.4) * energy(corners[b], 0.1, 0.4)));
+    }
+  std::printf("room: the corners' tails correlate %.2f at most\n", worst);
+  Check(worst < 0.5, "room: the corners' tails far from alike (correlation under 0.5)");
+
+  Room quiet;
+  quiet.SetRate(rate);
+  std::vector<std::vector<float>> zero(6, std::vector<float>(512, 0.0f));
+  float* z[6];
+  for (int c = 0; c < 6; c++) z[c] = zero[size_t(c)].data();
+  quiet.Process(z, 512);
+  bool silent = true;
+  for (const auto& c : zero)
+    for (float x : c) silent &= x == 0.0f;
+  Check(silent, "room: silence stays silence");
+
+  // 20 s of full-scale noise in every channel: bounded.
+  Room loud;
+  loud.SetRate(rate);
+  uint32_t seed = 1;
+  float peak = 0;
+  for (int k = 0; k < 20 * rate / 512; k++) {
+    for (auto& c : zero)
+      for (float& x : c) {
+        seed = seed * 1664525u + 1013904223u;
+        x = float(int32_t(seed)) / 2147483648.0f;
+      }
+    loud.Process(z, 512);
+    for (const auto& c : zero)
+      for (float x : c) peak = std::max(peak, std::fabs(x));
+  }
+  std::printf("room: 20 s of full-scale noise in every channel peaks at %.2f\n", peak);
+  Check(std::isfinite(peak) && peak < 4.0f, "room: noise does not run away");
+
+  Check(OutputHasRoom(OutputKind::kHeadphones), "room on headphones");
+  Check(!OutputHasRoom(OutputKind::kBuiltInSpeakers) && !OutputHasRoom(OutputKind::kExternalSpeakers) &&
+            !OutputHasRoom(OutputKind::kStraight) && !OutputHasRoom(OutputKind::kFoldedStereo),
+        "no room for speakers, a 5.1 device or the folded stereo");
+}
+
 }  // namespace
 
 int main() {
@@ -280,6 +370,7 @@ int main() {
   Fallback();
   Limiter();
   Cue();
+  RoomTest();
   if (g_failures) return 1;
   std::printf("ok\n");
   return 0;
