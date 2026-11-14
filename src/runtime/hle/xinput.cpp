@@ -18,6 +18,7 @@
 
 #include "runtime/hle/hle.h"
 #include "runtime/hle/input_state.h"
+#include "runtime/hle/pad_effects_ios.h"
 #include "runtime/hle/user32_window.h"
 #include "runtime/hle/xinput.h"
 #include "runtime/log.h"
@@ -32,6 +33,9 @@ struct Pad {
   SDL_Gamepad* gp = nullptr;
   uint32_t packet = 0;
   uint8_t last[12] = {};  // XINPUT_GAMEPAD last reported
+  PadRumble rumble;        // the rumble it was last given
+  PadEffectsSent effects;  // SetPadEffects: what it has taken
+  bool effects_refused = false;  // said once
 };
 
 std::mutex g_mu;
@@ -190,6 +194,12 @@ HLE_NAMED("xinput1_3.dll", "#2", XInputGetState, 2) {
   return ERROR_SUCCESS;
 }
 
+// Rumble on a pad, remembered: a DualSense's trigger effects are sent
+// with the rumble as it is (SetPadEffects).
+void Rumble(Pad& p, uint16_t low, uint16_t high, uint32_t ms) {
+  if (SDL_RumbleGamepad(p.gp, low, high, ms)) p.rumble.Set(low, high, ms, SDL_GetTicks());
+}
+
 // XInputSetState(dwUserIndex, pVibration): XINPUT_VIBRATION
 // {wLeftMotorSpeed, wRightMotorSpeed}; held until changed.
 HLE_NAMED("xinput1_3.dll", "#3", XInputSetState, 2) {
@@ -198,7 +208,7 @@ HLE_NAMED("xinput1_3.dll", "#3", XInputSetState, 2) {
   if (!p) return ERROR_DEVICE_NOT_CONNECTED;
   if (!Arg(c, 1)) return ERROR_BAD_ARGUMENTS;
   uint32_t v = Rd32(Arg(c, 1));
-  SDL_RumbleGamepad(p->gp, uint16_t(v), uint16_t(v >> 16), 0xFFFFFFFF);
+  Rumble(*p, uint16_t(v), uint16_t(v >> 16), 0xFFFFFFFF);
   return ERROR_SUCCESS;
 }
 
@@ -238,7 +248,86 @@ bool ReadPad(uint32_t index, PadState* out) {
 
 void RumblePad(uint32_t index, uint16_t low, uint16_t high, uint32_t ms) {
   std::lock_guard<std::mutex> l(g_mu);
-  if (Pad* p = PadAt(index)) SDL_RumbleGamepad(p->gp, low, high, ms);
+  if (Pad* p = PadAt(index)) Rumble(*p, low, high, ms);
+}
+
+namespace {
+
+// Whether the pad has trigger effects and a light to set: a DualSense.
+bool HasEffects(SDL_Gamepad* gp) { return SDL_GetRealGamepadType(gp) == SDL_GAMEPAD_TYPE_PS5; }
+
+// The light SDL gave the pad when it opened it.
+PadColour OwnColour(SDL_Gamepad* gp) { return Ds5PlayerColour(SDL_GetGamepadPlayerIndex(gp)); }
+
+// Both triggers' effects to a DualSense. With SDL's own driver (HIDAPI:
+// macOS, Linux, Windows) as its effects state, with the rumble as it is
+// now (pad_effects.h says why); on iOS and tvOS the pad is
+// GameController's, and SDL's driver for it sends no effects, so through
+// that framework.
+bool SendTriggers(Pad& p, const TriggerEffect& left, const TriggerEffect& right) {
+#if defined(__APPLE__) && (TARGET_OS_IOS || TARGET_OS_TV)
+  (void)p;
+  if (SetAdaptiveTriggers(left, right)) return true;
+  SDL_SetError("no DualSense among GameController's pads");
+  return false;
+#else
+  const bool improved = Ds5ImprovedRumble(SDL_GetGamepadVendor(p.gp), SDL_GetGamepadProduct(p.gp),
+                                          SDL_GetGamepadFirmwareVersion(p.gp));
+  uint8_t state[kDs5EffectsSize];
+  EncodeDs5Triggers(left, right, p.rumble.At(SDL_GetTicks(), improved), state);
+  return SDL_SendGamepadEffect(p.gp, state, sizeof state);
+#endif
+}
+
+// Sends what `s` says and notes what the pad took. A refusal is said once
+// for a pad.
+void Send(Pad& p, const PadSend& s) {
+  const bool triggers_ok = s.triggers && SendTriggers(p, s.left, s.right);
+  if (s.triggers && !triggers_ok && !p.effects_refused) {
+    p.effects_refused = true;
+    WarnF("xinput: %s: trigger effects: %s\n", SDL_GetGamepadName(p.gp), SDL_GetError());
+  }
+  const bool light_ok =
+      s.light && SDL_SetGamepadLED(p.gp, s.colour.red, s.colour.green, s.colour.blue);
+  if (s.light && !light_ok && !p.effects_refused) {
+    p.effects_refused = true;
+    WarnF("xinput: %s: light: %s\n", SDL_GetGamepadName(p.gp), SDL_GetError());
+  }
+  NotePadSend(p.effects, s, triggers_ok, light_ok);
+}
+
+// How long SDL's writer thread is given to put the last effects on the
+// pad before the process goes.
+constexpr uint32_t kLastWriteMs = 50;
+
+}  // namespace
+
+bool SetPadEffects(uint32_t index, const PadEffects& effects) {
+  std::lock_guard<std::mutex> l(g_mu);
+  Pad* p = PadAt(index);
+  if (!p) return false;
+  const bool has = HasEffects(p->gp);
+  // What the pad refused is sent again at the next call that wants it.
+  // (SDL waits 10 ms in a call it refuses for a pad kept out of its
+  // enhanced report mode: callers should not ask every frame.)
+  Send(*p, NextPadSend(has, p->effects, effects, has ? OwnColour(p->gp) : PadColour{}));
+  return has;
+}
+
+void ClearPadEffects() {
+  bool sent = false;
+  {
+    std::lock_guard<std::mutex> l(g_mu);
+    for (Pad& p : g_pads) {
+      if (!p.gp || !HasEffects(p.gp)) continue;
+      const PadSend s = LastPadSend(p.effects, OwnColour(p.gp));
+      Send(p, s);
+      sent = sent || s.triggers || s.light;
+    }
+  }
+  // SDL writes to the pad from a thread of its own. (Waited for without
+  // the lock: the other threads' XInput calls go on.)
+  if (sent) SDL_Delay(kLastWriteMs);
 }
 
 void TestPadButton(int button, bool down) {
