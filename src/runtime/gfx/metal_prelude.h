@@ -133,6 +133,19 @@ void r_color0(inout vec4 c) {
   return p;
 }
 
+// The same sampled-depth correction with a draw's known texture types.
+// The backend must select this shader only for that mask; other bindings
+// keep the generic shader. The translation's hash includes this prefix,
+// so existing MSL caches, recipes and archives also distinguish variants.
+inline std::string MetalSampledDepthGlsl(const hlsl::Program& p, uint16_t mask) {
+  if (p.stage != hlsl::Stage::Pixel) return p.glsl;
+  return "#undef R_DEPTH_TEX\n"
+         "vec4 r_sampled_depth_tex(int n, vec4 v) { return (" +
+         std::to_string(mask) +
+         " & (1 << n)) != 0 ? vec4(1.0 - v.rgb, v.a) : v; }\n"
+         "#define R_DEPTH_TEX(n, v) r_sampled_depth_tex(n, v)\n" + p.glsl;
+}
+
 // The lean variants (a pixel shader without the alpha test): the MSL of a
 // translation (with the prelude) gets the switch as the macro R_ALPHA_TEST
 // in place of the function constant r_alpha_test, so the full variant
