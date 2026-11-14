@@ -73,6 +73,47 @@ target_compile_options(mixer_ring_test PRIVATE -O2)
 target_link_libraries(mixer_ring_test PRIVATE Threads::Threads)
 add_test(NAME mixer_ring COMMAND mixer_ring_test)
 
+# surround_test: the 5.1 mix's pure parts (runtime/audio/surround.h):
+# where sources land in it, the LFE fold, the speaker configuration
+# reported, the way a device is rendered for; portable.
+add_executable(surround_test surround_test.cpp)
+target_include_directories(surround_test PRIVATE ${PROJECT_SOURCE_DIR}/src)
+target_compile_features(surround_test PRIVATE cxx_std_20)
+add_test(NAME surround COMMAND surround_test)
+
+# audio_dump_test: RECOMP_AUDIO_DUMP's files written off the audio threads
+# (runtime/audio/dump.h): Write does not wait for a stalled disk, frames
+# arrive in order, a full ring drops and counts; portable.
+add_executable(audio_dump_test audio_dump_test.cpp)
+target_include_directories(audio_dump_test PRIVATE ${PROJECT_SOURCE_DIR}/src)
+target_compile_features(audio_dump_test PRIVATE cxx_std_20)
+target_link_libraries(audio_dump_test PRIVATE Threads::Threads)
+add_test(NAME audio_dump COMMAND audio_dump_test)
+
+if(TARGET recomp_audio)
+  # mixer_bed_test: the mixer's 5.1 mix rendered offline (5.1, 7.1 and
+  # stereo voices, DirectSound's pan) and its stereo mix's frames.
+  add_executable(mixer_bed_test mixer_bed_test.cpp)
+  target_link_libraries(mixer_bed_test PRIVATE recomp_audio)
+  add_test(NAME mixer_bed COMMAND mixer_bed_test)
+endif()
+
+if(APPLE AND NOT RECOMP_IOS)
+  # spatial_chain_test: what the spatial output runs between the mix and
+  # the device (spatial_chain_mac.h), rendered offline without a device, for
+  # each kind of output: where each channel is heard, the LFE fold, the
+  # limiter, head tracking asked for on headphones only, the 5.1 as it is,
+  # the folded stereo, a change of kind as it renders; and the speaker
+  # layouts a device may have. Skipped where the host has no spatial mixer.
+  add_executable(spatial_chain_test spatial_chain_test.cpp
+                 ${PROJECT_SOURCE_DIR}/src/runtime/audio/spatial_chain_mac.cpp)
+  target_include_directories(spatial_chain_test PRIVATE ${PROJECT_SOURCE_DIR}/src)
+  target_compile_features(spatial_chain_test PRIVATE cxx_std_20)
+  target_link_libraries(spatial_chain_test PRIVATE "-framework AudioToolbox" "-framework CoreFoundation")
+  add_test(NAME spatial_chain COMMAND spatial_chain_test)
+  set_tests_properties(spatial_chain PROPERTIES SKIP_RETURN_CODE 77)
+endif()
+
 # gl_draw_test: the GL context's vertex arrays and immediate mode against
 # a reference model of GL's conversions, through a recording device;
 # portable.
