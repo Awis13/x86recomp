@@ -115,6 +115,9 @@ struct Window {
   // Host fullscreen (UpdateFullscreen), entered for a screen of fs_w x fs_h.
   bool fullscreen = false;
   int fs_w = 0, fs_h = 0;
+  // The player left host fullscreen (Alt+Enter or the system's switch):
+  // a plain host window, movable to another display, until asked back.
+  bool user_windowed = false;
   SDL_Window* sdl = nullptr;
   // Built-in controls (see "built-in control classes"): the text is
   // `title`; selection, font, image and check state are kept here.
@@ -154,6 +157,11 @@ struct Clip {
   uint32_t hwnd = 0;
 };
 Clip g_clip;
+// A window the player sizes and moves (PlayerWindow): Command or leaving
+// the app frees the pointer, a click in the window takes it back.
+std::atomic<bool> g_pointer_freed{false};  // read by DirectInput's thread too
+// The window SetRelativeMouse was last asked to grab (clip or DirectInput).
+std::atomic<SDL_Window*> g_relative_wanted{nullptr};
 uint32_t g_capture = 0;  // SetCapture
 
 // RegisterHotKey: a matching key press becomes WM_HOTKEY instead of a key
@@ -454,8 +462,78 @@ void ActivateApp(uint32_t hwnd, bool active) {
   Post(hwnd, active ? WM_SETFOCUS : WM_KILLFOCUS, 0, 0);
 }
 
+void SetUserWindowed(uint32_t hwnd, bool on);
+GameConfig::Fullscreen FullscreenPolicy();
+
+int ToPoints(SDL_Window* sdl, int px);
+
+// Size a player-sized window for a client of pw x ph pixels: the largest
+// that fits its display's usable area at the same aspect, centred there
+// when it had to shrink (a game resolution can be the whole screen). The
+// frame is fitted to the window (MapToClient).
+void SizePlayerWindow(SDL_Window* sdl, int pw, int ph) {
+  int w = ToPoints(sdl, pw), h = ToPoints(sdl, ph);
+  const SDL_DisplayID d = SDL_GetDisplayForWindow(sdl);
+  SDL_Rect u;
+  int top = 0, left = 0, bottom = 0, right = 0;
+  if (!SDL_GetWindowBordersSize(sdl, &top, &left, &bottom, &right))
+    top = 28;  // shortcut: a hidden window has no frame yet; the usual title bar
+  if (SDL_GetDisplayUsableBounds(d, &u)) {
+    const int mw = u.w - left - right, mh = u.h - top - bottom;
+    if (mw > 0 && mh > 0 && (w > mw || h > mh)) {
+      const double k = std::min(double(mw) / w, double(mh) / h);
+      w = std::max(int(w * k), 1);
+      h = std::max(int(h * k), 1);
+      SDL_SetWindowSize(sdl, w, h);
+      SDL_SetWindowPosition(sdl, u.x + left + (mw - w) / 2, u.y + top + (mh - h) / 2);
+      return;
+    }
+  }
+  SDL_SetWindowSize(sdl, w, h);
+}
+
+bool PlayerWindow(uint32_t hwnd) {
+  std::lock_guard<std::recursive_mutex> l(g_mu);
+  Window* w = Win(hwnd);
+  return w && !w->fullscreen &&
+         (w->user_windowed || FullscreenPolicy() == GameConfig::Fullscreen::Window);
+}
+
+void FreePointer(uint32_t hwnd, bool freed) {
+  if (g_pointer_freed == freed || (freed && !PlayerWindow(hwnd))) return;
+  g_pointer_freed = freed;
+  SDL_Window* w = g_relative_wanted;
+  if (w && !Background()) {
+    SetRelativeMouse(w, !freed);
+    g_relative_wanted = w;  // still wanted once the pointer is taken back
+  }
+}
+
+// Windows the player sizes and moves freely (the window policy, or a
+// fullscreen left by the player): the frame is fitted to the host window
+// (MapToClient), and the system's fullscreen switch fills that display.
+SDL_WindowFlags PlayerSizedFlag() {
+  return FullscreenPolicy() == GameConfig::Fullscreen::Window ? SDL_WINDOW_RESIZABLE : 0;
+}
+
 void HandleSdlEvent(const SDL_Event& e) {
   switch (e.type) {
+    // The system's own fullscreen switch (green button, ⌃⌘F): leaving a
+    // fullscreen we entered keeps the window a window until the player
+    // enters fullscreen again.
+    case SDL_EVENT_WINDOW_LEAVE_FULLSCREEN:
+    case SDL_EVENT_WINDOW_ENTER_FULLSCREEN: {
+      const bool leave = e.type == SDL_EVENT_WINDOW_LEAVE_FULLSCREEN;
+      uint32_t h = HwndForSdl(e.window.windowID);
+      bool by_player;
+      {
+        std::lock_guard<std::recursive_mutex> l(g_mu);
+        Window* w = Win(h);
+        by_player = w && (leave ? w->fullscreen : w->user_windowed);
+      }
+      if (by_player) SetUserWindowed(h, leave);
+      break;
+    }
     case SDL_EVENT_QUIT: {
       std::lock_guard<std::recursive_mutex> l(g_mu);
       std::fprintf(stderr, "user32: host quit request: WM_CLOSE to the game's windows\n");
@@ -474,6 +552,7 @@ void HandleSdlEvent(const SDL_Event& e) {
       break;
     case SDL_EVENT_WINDOW_FOCUS_LOST:
       if (uint32_t h = HwndForSdl(e.window.windowID)) {
+        FreePointer(h, true);
         // Release keys so nothing stays stuck while we're away.
         for (int vk = 0; vk < 256; vk++) g_key_down[vk] = 0;
         ActivateApp(h, false);
@@ -498,6 +577,18 @@ void HandleSdlEvent(const SDL_Event& e) {
       if (!down) lp |= 0xC0000000u;
       else if (was_down) lp |= 0x40000000u;
       bool alt = g_key_down[0x12];
+      if (down && (e.key.scancode == SDL_SCANCODE_LGUI || e.key.scancode == SDL_SCANCODE_RGUI))
+        FreePointer(h, true);
+      if (down && !was_down && alt && gvk == 0x0D) {  // Alt+Enter: fullscreen on/off
+        bool on;
+        {
+          std::lock_guard<std::recursive_mutex> l(g_mu);
+          Window* w = Win(h);
+          on = w && !w->user_windowed;
+        }
+        SetUserWindowed(h, on);
+        break;
+      }
       bool sys = alt || gvk == 0x79 /* F10 */ || gvk == 0x12;
       if (alt) lp |= 1u << 29;
       if (down) {
@@ -524,7 +615,7 @@ void HandleSdlEvent(const SDL_Event& e) {
     }
     case SDL_EVENT_MOUSE_MOTION: {
       uint32_t h = HwndForSdl(e.motion.windowID);
-      if (!h) break;
+      if (!h || g_pointer_freed) break;  // a freed pointer is the desktop's
       int ox, oy;
       WindowOrigin(h, &ox, &oy);
       const ClientMap cm = MapToClient(h);
@@ -589,6 +680,10 @@ void HandleSdlEvent(const SDL_Event& e) {
       uint32_t h = HwndForSdl(e.button.windowID);
       if (!h) break;
       bool down = e.type == SDL_EVENT_MOUSE_BUTTON_DOWN;
+      if (g_pointer_freed) {  // the click that takes the pointer back is not the game's
+        if (down) FreePointer(h, false);
+        break;
+      }
       int ox, oy;
       WindowOrigin(h, &ox, &oy);
       int x = g_mouse_x - ox, y = g_mouse_y - oy;  // where motion left it
@@ -741,13 +836,14 @@ bool CoversScreen(const Window& w) {
 void UpdateFullscreen(uint32_t hwnd) {
   using F = GameConfig::Fullscreen;
   SDL_Window* sdl;
-  bool want;
+  bool want, own_mode;
   int sw, sh, cw, ch;
   {
     std::lock_guard<std::recursive_mutex> l(g_mu);
     Window* w = Win(hwnd);
     if (!w || !w->sdl) return;
-    want = FullscreenPolicy() != F::Window && CoversScreen(*w);
+    want = FullscreenPolicy() != F::Window && !w->user_windowed && CoversScreen(*w);
+    own_mode = w->mode_w != 0;
     ScreenFor(*w, &sw, &sh);
     // (Also when the host window left fullscreen by itself.)
     const bool actual = SDL_GetWindowFlags(w->sdl) & SDL_WINDOW_FULLSCREEN;
@@ -789,8 +885,9 @@ void UpdateFullscreen(uint32_t hwnd) {
       }
       SDL_free(modes);
     }
-    // On the display whose size the game sees.
-    if (SDL_GetDisplayForWindow(sdl) != SDL_GetPrimaryDisplay())
+    // On the display whose size the game sees. A display mode of the
+    // game's own is shown on any display: fullscreen where the window is.
+    if (!own_mode && SDL_GetDisplayForWindow(sdl) != SDL_GetPrimaryDisplay())
       SDL_SetWindowPosition(sdl, SDL_WINDOWPOS_CENTERED_DISPLAY(SDL_GetPrimaryDisplay()),
                             SDL_WINDOWPOS_CENTERED_DISPLAY(SDL_GetPrimaryDisplay()));
     SDL_SetWindowFullscreenMode(sdl, exclusive ? &m : nullptr);
@@ -822,6 +919,28 @@ void UpdateFullscreenAll() {
       if (w.sdl && !w.destroyed) hwnds.push_back(h);
   }
   for (uint32_t h : hwnds) UpdateFullscreen(h);
+}
+
+// on: leave host fullscreen for a plain window of the client's size; off:
+// fullscreen again where the window now is (UpdateFullscreen decides).
+void SetUserWindowed(uint32_t hwnd, bool on) {
+  SDL_Window* sdl;
+  int cw, ch;
+  {
+    std::lock_guard<std::recursive_mutex> l(g_mu);
+    Window* w = Win(hwnd);
+    if (!w || !w->sdl || w->user_windowed == on) return;
+    w->user_windowed = on;
+    if (on) w->fullscreen = false;
+    sdl = w->sdl;
+    GameClientSize(*w, &cw, &ch);
+  }
+  SDL_SetWindowResizable(sdl, on || PlayerSizedFlag());
+  if (on) {
+    SDL_SetWindowFullscreen(sdl, false);
+    SizePlayerWindow(sdl, cw, ch);
+  }
+  UpdateFullscreen(hwnd);
 }
 
 }  // namespace
@@ -1260,7 +1379,12 @@ void SetExclusiveMode(uint32_t hwnd, int w, int h) {
     win->mode_h = h;
     sdl = win->fullscreen ? nullptr : win->sdl;
   }
-  if (sdl && w) SDL_SetWindowSize(sdl, ToPoints(sdl, w), ToPoints(sdl, h));
+  if (sdl && w) {
+    if (SDL_GetWindowFlags(sdl) & SDL_WINDOW_RESIZABLE)
+      SizePlayerWindow(sdl, w, h);
+    else
+      SDL_SetWindowSize(sdl, ToPoints(sdl, w), ToPoints(sdl, h));
+  }
   UpdateFullscreen(hwnd);
 }
 
@@ -1288,7 +1412,23 @@ std::vector<ModeSize> DisplayModeSizes() {
     return v;
   }();
   EnsureSdlVideo();
-  return BuildModeSizes(g_desktop_w, g_desktop_h, extra);
+  // Every display's own size too, and nothing above the largest display:
+  // fullscreen follows the window, so a bigger second display can be filled.
+  std::vector<ModeSize> sizes = extra;
+  int mw = g_desktop_w, mh = g_desktop_h;
+  int n = 0;
+  if (SDL_DisplayID* ids = SDL_GetDisplays(&n)) {
+    for (int i = 0; i < n; i++)
+      if (const SDL_DisplayMode* m = SDL_GetDesktopDisplayMode(ids[i])) {
+        const float d = m->pixel_density > 0 ? m->pixel_density : 1.0f;
+        const int w = int(std::lround(float(m->w) * d)), h = int(std::lround(float(m->h) * d));
+        sizes.push_back({w, h});
+        mw = std::max(mw, w);
+        mh = std::max(mh, h);
+      }
+    SDL_free(ids);
+  }
+  return BuildModeSizes(mw, mh, sizes);
 }
 
 void ClientAreaSize(uint32_t hwnd, int* w, int* h) {
@@ -1329,7 +1469,14 @@ void RefreshPointerStyle(SDL_Window* w) {
 #endif
 
 void SetRelativeMouse(SDL_Window* w, bool on) {
-  if (!w || SDL_GetWindowRelativeMouseMode(w) == on) return;
+  if (!w) return;
+  if (on) g_relative_wanted = w;
+  else {
+    SDL_Window* was = w;  // only if it is still this window's
+    g_relative_wanted.compare_exchange_strong(was, nullptr);
+  }
+  if (g_pointer_freed) on = false;  // the player freed it (FreePointer)
+  if (SDL_GetWindowRelativeMouseMode(w) == on) return;
   SDL_SetWindowRelativeMouseMode(w, on);
 #if defined(__APPLE__) && TARGET_OS_IOS
   const int n = g_relative_windows += on ? 1 : -1;
@@ -1462,7 +1609,7 @@ uint32_t CreateWindowEx(Ctx& c, bool wide) {
     ClientSize(win, &cw, &ch);
     win.sdl = SDL_CreateWindow(AnsiToUtf8(win.title).c_str(), ToPoints(nullptr, cw), ToPoints(nullptr, ch),
                                SDL_WINDOW_HIDDEN | SDL_WINDOW_HIGH_PIXEL_DENSITY |
-                                   GfxWindowFlags());
+                                   GfxWindowFlags() | PlayerSizedFlag());
     if (!win.sdl) FatalF("SDL_CreateWindow: %s", SDL_GetError());
   }
   uint32_t hwnd = win.hwnd;
