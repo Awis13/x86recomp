@@ -17,7 +17,13 @@ bool GlslToSpirv(const std::string& glsl, ShaderStage stage, std::vector<uint32_
                  std::string* log);
 
 #if defined(__APPLE__)
-bool SpirvToMsl(const std::vector<uint32_t>& spirv, std::string* msl, std::string* log);
+struct SpirvMslOptions {
+  // A vertex function without outputs, returning void, for a pipeline that
+  // does not rasterize (one that writes memory, hlsl/capture_position.h).
+  bool disable_rasterization = false;
+};
+bool SpirvToMsl(const std::vector<uint32_t>& spirv, std::string* msl, std::string* log,
+                const SpirvMslOptions& opt = {});
 #endif
 
 }  // namespace recomp::gfx

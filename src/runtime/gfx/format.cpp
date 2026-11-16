@@ -1,5 +1,6 @@
 // Format/FVF/primitive helpers shared by all backends.
 
+#include <algorithm>
 #include "runtime/gfx/device.h"
 
 namespace recomp::gfx {
@@ -122,6 +123,83 @@ void DecodeDxt(const uint8_t* src, uint32_t pitch, Format f, int w, int h, uint3
         for (int x = 0; x < 4 && bx * 4 + x < w; x++)
           out[size_t(by * 4 + y) * w + bx * 4 + x] = px[y * 4 + x];
     }
+  }
+}
+
+uint8_t MinAlpha(const uint8_t* src, uint32_t pitch, Format f, int w, int h) {
+  if (!src || w <= 0 || h <= 0) return 0;
+  uint32_t lo = 255;
+  switch (f) {
+    case Format::X8R8G8B8:
+    case Format::R8G8B8:
+    case Format::R5G6B5:
+    case Format::X1R5G5B5:
+    case Format::X4R4G4B4:
+    case Format::R3G3B2:
+    case Format::L8:
+      return 255;
+    case Format::A8R8G8B8:
+    case Format::A8:
+    case Format::A8L8:
+    case Format::A1R5G5B5:
+    case Format::A4R4G4B4:
+      for (int y = 0; y < h && lo; y++) {
+        const uint8_t* r = src + size_t(y) * pitch;
+        for (int x = 0; x < w; x++) {
+          uint32_t a;
+          switch (f) {
+            case Format::A8R8G8B8: a = r[4 * x + 3]; break;
+            case Format::A8: a = r[x]; break;
+            case Format::A8L8: a = r[2 * x + 1]; break;
+            case Format::A1R5G5B5: a = (r[2 * x + 1] & 0x80) ? 255 : 0; break;
+            default: a = (r[2 * x + 1] >> 4) * 17; break;  // A4R4G4B4
+          }
+          lo = std::min(lo, a);
+        }
+      }
+      return uint8_t(lo);
+    case Format::DXT1:
+    case Format::DXT2:
+    case Format::DXT3:
+    case Format::DXT4:
+    case Format::DXT5: {
+      // Only the texels inside w x h (a small level's block is padded).
+      const bool dxt1 = f == Format::DXT1, explicit_alpha = f == Format::DXT2 || f == Format::DXT3;
+      const int bw = (w + 3) / 4, bh = (h + 3) / 4, bsize = dxt1 ? 8 : 16;
+      for (int by = 0; by < bh && lo; by++)
+        for (int bx = 0; bx < bw && lo; bx++) {
+          const uint8_t* b = src + size_t(by) * pitch + size_t(bx) * bsize;
+          uint32_t inside = 0;  // texel i's bit
+          for (int y = 0; y < 4 && by * 4 + y < h; y++)
+            for (int x = 0; x < 4 && bx * 4 + x < w; x++) inside |= 1u << (y * 4 + x);
+          if (dxt1) {
+            const uint32_t c0 = b[0] | b[1] << 8, c1 = b[2] | b[3] << 8;
+            if (c0 > c1) continue;  // four colours, all opaque
+            const uint32_t idx = b[4] | b[5] << 8 | b[6] << 16 | uint32_t(b[7]) << 24;
+            for (int i = 0; i < 16; i++)
+              if ((inside >> i & 1) && ((idx >> (2 * i)) & 3) == 3) lo = 0;  // transparent black
+          } else if (explicit_alpha) {
+            for (int i = 0; i < 16; i++)
+              if (inside >> i & 1) lo = std::min<uint32_t>(lo, ((b[i / 2] >> (4 * (i & 1))) & 15) * 17);
+          } else {
+            uint32_t pal[8] = {b[0], b[1]};
+            if (pal[0] > pal[1]) {
+              for (int k = 1; k < 7; k++) pal[k + 1] = ((7 - k) * pal[0] + k * pal[1]) / 7;
+            } else {
+              for (int k = 1; k < 5; k++) pal[k + 1] = ((5 - k) * pal[0] + k * pal[1]) / 5;
+              pal[6] = 0;
+              pal[7] = 255;
+            }
+            uint64_t bits = 0;
+            for (int k = 0; k < 6; k++) bits |= uint64_t(b[2 + k]) << (8 * k);
+            for (int i = 0; i < 16; i++)
+              if (inside >> i & 1) lo = std::min(lo, pal[(bits >> (3 * i)) & 7]);
+          }
+        }
+      return uint8_t(lo);
+    }
+    default:
+      return 0;
   }
 }
 

@@ -103,6 +103,71 @@ struct Sampler {
   ParamType type = ParamType::Sampler2D;  // Sampler2D, Sampler3D or SamplerCube
 };
 
+// A value a pixel shader computes (PixelAlpha), as found in its bytecode:
+//   scale * P + offset + offset_k * c[offset_constant].(offset_lane)
+// P being the product of what is named (each optional, 1 if none): one
+// channel of a 2D texture's texel sampled at a TEXCOORD varying's two
+// lanes, one lane of a COLOR varying and one lane of a float register the
+// application sets. With none of them P is 0 (the value is the offset).
+struct AlphaValue {
+  bool known = false;
+  int sampler = -1;       // the texel's sampler register (-1: no texel)
+  uint8_t channel = 3;    // its channel (0-3: r, g, b, a)
+  uint32_t texcoord = 0;  // sampled at varying TEXCOORDn's lanes u and v
+  uint8_t u = 0, v = 1;
+  int color = -1;  // varying COLORn's lane color_lane (-1: none)
+  uint8_t color_lane = 3;
+  int constant = -1;  // c[constant]'s lane constant_lane (-1: none)
+  uint8_t constant_lane = 0;
+  float scale = 0.0f, offset = 0.0f;
+  int offset_constant = -1;  // -1: none
+  uint8_t offset_lane = 0;
+  float offset_k = 0.0f;
+  bool operator==(const AlphaValue&) const = default;
+};
+
+// Pixel shaders from bytecode (TranslateOptions::coverage): where the
+// coverage of a pixel comes from, for effects that need it without
+// running the shader (rays meeting alpha-tested geometry). Followed
+// through mov, add, mul, mad, texld (texldb, texldl, texldd; not texldp,
+// not a swizzled sampler) and ps_1_x's tex, in main's straight-line code;
+// a write in an if block or a predicated one may or may not happen
+// (unknown after it); loops and subroutines are not followed (nothing
+// known). One pass over the instructions, none for shaders of more than
+// kCoverageInstructions.
+struct PixelAlpha {
+  AlphaValue color0;  // COLOR0's alpha, what the alpha test compares
+  uint32_t kills = 0;  // texkill instructions (HLSL clip)
+  // Known if there is one texkill, outside if blocks, and every component
+  // it tests holds this value or a number >= 0: the pixel is discarded
+  // where it is below 0.
+  AlphaValue kill;
+  // Whether a component a texkill tests may depend on a texel: data from
+  // a texture sample whose coordinate depends on an interpolated input
+  // (v#, t#; not the screen position, vFace or constants: a dither
+  // pattern read at vPos is not a texel's) or on such a texel, reaching
+  // it in program order (a write from clean sources that surely happens
+  // clears what it writes; one predicated, in a branch on another path,
+  // or in a conditional call does not; loops to a fixed point,
+  // subroutines where called, a break's state carried past the loop), or
+  // a condition that may depend on one (a predicate, an if, a break before
+  // it in the loop, or in an earlier iteration) deciding whether it runs.
+  // Found past kCoverageInstructions as well.
+  bool kill_reads_texel = false;
+};
+inline constexpr size_t kCoverageInstructions = 4096;
+
+// Vertex shaders from bytecode (TranslateOptions::coverage): a lane of a
+// TEXCOORDn or COLORn varying that is a lane of an input moved there
+// unchanged (mov, through temporaries; main's straight-line code, outside
+// if blocks, not predicated).
+struct MovedLane {
+  Semantic varying;
+  uint8_t lane = 0;
+  uint8_t input = 0;       // the input's slot (Program::inputs)
+  uint8_t input_lane = 0;
+};
+
 struct Program {
   Stage stage = Stage::Vertex;
   uint32_t major = 0, minor = 0;  // shader model
@@ -126,6 +191,33 @@ struct Program {
   // Bytecode: the float registers c0-c255 read by number (not through a0
   // or aL, not ones the shader defines).
   std::bitset<256> float_reads;
+  // Bytecode: the lowest register a read through a0 or aL is based at (a
+  // skinned vertex shader's bone palette, c[n + a0.x]); -1: none.
+  int rel_const_base = -1;
+  // Bytecode with TranslateOptions::coverage: pixel shaders' alpha
+  // (PixelAlpha), vertex shaders' moved varying lanes (MovedLane). Not
+  // serialized: HLSL source has neither.
+  PixelAlpha pixel_alpha;
+  std::vector<MovedLane> moved_lanes;
+  // Set by TranslateBytecode without TranslateOptions::coverage: the two
+  // above were not looked for. False for HLSL source (Compile,
+  // Deserialize), which has neither to look for.
+  bool coverage_skipped = false;
+  // Bytecode with TranslateOptions::ray_reflection: the sampler whose reads
+  // became calls of r_rt_reflect (RayReflectionCall); -1 if none did. Kept
+  // by the copies a backend makes its variants from (it makes those calls
+  // ray queries in each). The varying location of the origin's input
+  // (VaryingLocation: a variant without it has no ray to trace), and how
+  // many of the calls are in subroutines (a backend may give ray queries to
+  // main's only). Not serialized.
+  int ray_reflection_sampler = -1;
+  int ray_reflection_location = -1;
+  uint32_t ray_reflection_stub_calls = 0;
+  // Likewise with TranslateOptions::ray_shadow: the sampler whose reads
+  // became calls of r_rt_shadow (RayShadowCall), -1 if none did, and how
+  // many of them are in subroutines. Not serialized.
+  int ray_shadow_sampler = -1;
+  uint32_t ray_shadow_stub_calls = 0;
 };
 
 // D3DXSHADER flags that change the translation.
@@ -145,6 +237,56 @@ bool Compile(std::string_view source, const std::vector<Define>& defines,
 // same GLSL contract. No constant table: applications set the registers
 // the bytecode reads. On failure returns false with a message in *errors.
 bool TranslateBytecode(const uint32_t* tokens, size_t count, Program* out, std::string* errors);
+// Pixel shaders (ps_3_0) whose reads of one sampler a backend that traces
+// rays makes ray queries (TranslateOptions::ray_reflection): every texld,
+// texldl and texldd of `sampler` becomes
+//   r_rt_reflect(gl_FragCoord, v<origin>, coordinate, c[registers[0]],
+//                c[registers[1]], c[registers[2]], c[registers[3]])
+// (vec4s: the pixel's position, the input register holding the reflection
+// ray's start in world space (xyz), the read's coordinate as the shader
+// computed it (the ray's direction, xyz; texldp's divided by its w, as the
+// read divides it), four float registers the hit is
+// lit with), and the sampler is not declared. The GLSL defines the
+// function as "nothing hit" (vec4(0.0)); the Metal backend replaces the
+// calls (gfx/rt_forward_reflection.h). Not taken (the sampler read as
+// usual) unless the shader declares input `origin` with a semantic other
+// than POSITION and the registers are below 224.
+struct RayReflectionCall {
+  int sampler = -1;  // 0-15; -1: none
+  uint32_t origin = 0;
+  uint32_t registers[4] = {};
+};
+// Pixel shaders (ps_3_0) whose reads of one sampler a backend that traces
+// rays makes shadow rays toward a far light (TranslateOptions::ray_shadow):
+// every texld, texldl and texldd of `sampler` becomes
+//   r_rt_shadow(gl_FragCoord, coordinate, c[light_register])
+// (vec4s: the pixel's position, the read's coordinate as the shader
+// computed it (the point in world space, xyz; texldp's divided by its w),
+// the float register holding the light's direction), and the sampler is
+// not declared. The call's x is 1 where the point sees the light, 0 where
+// it is in shadow. The GLSL defines the function as "lit" (vec4(1.0)); the
+// Metal backend replaces the calls (gfx/rt_forward_reflection.h). Not taken
+// (the sampler read as usual) unless the register is below 224.
+// A texldd of the sampler is the shadow toward a point instead, a local
+// light's:
+//   r_rt_shadow_to(gl_FragCoord, coordinate, ddx, ddy)
+// the coordinate the point in world space (xyz), ddx the vector from it to
+// the light (xyz), ddy.x the light's weight at the point: nothing is asked
+// (lit) where it is not above 0. A shader may make several such reads, one
+// a light.
+struct RayShadowCall {
+  int sampler = -1;  // 0-15; -1: none
+  uint32_t light_register = 0;
+};
+struct TranslateOptions {
+  // Program::pixel_alpha and moved_lanes found (for ray tracing; the
+  // translation is the same either way).
+  bool coverage = false;
+  RayReflectionCall ray_reflection;
+  RayShadowCall ray_shadow;
+};
+bool TranslateBytecode(const uint32_t* tokens, size_t count, Program* out, std::string* errors,
+                       const TranslateOptions& options);
 
 // A compiled shader function's tokens, version to END included, token i
 // being read(i): D3D9 is given no length, only where the function starts.

@@ -688,6 +688,7 @@ uint32_t CreateBuffer(Ctx& c, bool index) {
   b->fvf_or_format = Arg(c, 3);
   b->pool = Arg(c, 4);
   Device* d = com::As<Device>(b->device);
+  if (d && d->buffer_versions) b->contents.Track();
   if (d && d->shared_buffers) {
     b->mem = uint32_t(SharedAlloc(d, length, true));
     b->shared = b->mem != 0;
@@ -789,13 +790,59 @@ uint32_t CreateShader(Ctx& c, bool pixel) {
   s->pixel = pixel;
   s->tokens = ReadFunction(Arg(c, 1));
   if (const auto fix = recomp::Game().shader_tokens) fix(s->tokens);
+  // A pixel shader that reads the traced shadow mask (the game's hook says
+  // which), while shadows are traced.
+  gfx::RayShadow shadow;
+  const auto consumer = recomp::Game().ray_shadow_consumer;
+  const bool shadowed = pixel && consumer && gfx::RayTracedShadows() && consumer(s->tokens, &shadow);
+  // Likewise one that reads the traced reflections.
+  gfx::RayReflection reflection;
+  const auto reflector = recomp::Game().ray_reflection_consumer;
+  const bool reflected = pixel && reflector && gfx::RayTracedReflections() && reflector(s->tokens, &reflection);
+  // And one translated to trace its reflections itself (a forward shader).
+  gfx::RayForwardReflection forward;
+  const auto forwarder = recomp::Game().ray_forward_reflection_consumer;
+  const bool forwarded =
+      pixel && forwarder && gfx::RayTracedForwardReflections() && forwarder(s->tokens, &forward);
+  // And one translated to trace its far light's shadow itself (lit where
+  // the device cannot).
+  gfx::RayForwardShadow fwd_shadow;
+  const auto fwd_shadower = recomp::Game().ray_forward_shadow_consumer;
+  const bool fwd_shadowed = pixel && fwd_shadower && gfx::RayTracedShadows() && fwd_shadower(s->tokens, &fwd_shadow);
+  // And one that takes part in denoising the lit scene.
+  gfx::RayDenoise denoise;
+  const auto denoiser = recomp::Game().ray_denoise_consumer;
+  const bool denoised = pixel && denoiser && Dev(c)->gfx->RayTracingOn() && denoiser(s->tokens, &denoise);
+  // And one of the deferred lighting's, for the local lights the device
+  // lights itself.
+  gfx::RayLightVolume light_volume;
+  const auto volumer = recomp::Game().ray_light_volume_consumer;
+  const bool volumed = pixel && volumer && gfx::RayTracedShadows() && volumer(s->tokens, &light_volume);
+  // And one that reads the ray-traced ambient occlusion.
+  gfx::RayOcclusion occlusion;
+  const auto occluder = recomp::Game().ray_occlusion_consumer;
+  const bool occluded = pixel && occluder && gfx::RayTracedShadows() && occluder(s->tokens, &occlusion);
   s->program = ReadTranslated(s->tokens);
   if (!s->program) {
     // Compiled bytecode: translated here.
     DumpBytecode(*s);
     auto p = std::make_shared<hlsl::Program>();
     std::string err;
-    if (!hlsl::TranslateBytecode(s->tokens.data(), s->tokens.size(), p.get(), &err))
+    hlsl::TranslateOptions o;
+    o.coverage = Dev(c)->gfx->RayTracingOn();  // (alpha-cut geometry in the ray-traced scene)
+    if (forwarded) {
+      o.ray_reflection.sampler = int(forward.sampler);
+      o.ray_reflection.origin = forward.origin_input;
+      o.ray_reflection.registers[0] = forward.light_register;
+      o.ray_reflection.registers[1] = forward.colour_register;
+      o.ray_reflection.registers[2] = forward.ambient_registers[0];
+      o.ray_reflection.registers[3] = forward.ambient_registers[1];
+    }
+    if (fwd_shadowed) {
+      o.ray_shadow.sampler = int(fwd_shadow.sampler);
+      o.ray_shadow.light_register = fwd_shadow.light_register;
+    }
+    if (!hlsl::TranslateBytecode(s->tokens.data(), s->tokens.size(), p.get(), &err, o))
       FatalF("d3d9: Create%sShader: %s (<ID>_SHADER_DUMP writes the tokens)",
              pixel ? "Pixel" : "Vertex", err.c_str());
     s->program = std::move(p);
@@ -804,6 +851,13 @@ uint32_t CreateShader(Ctx& c, bool pixel) {
     FatalF("d3d9: Create%sShader with a %s shader", pixel ? "Pixel" : "Vertex",
            pixel ? "vertex" : "pixel");
   s->id = Dev(c)->gfx->CreateShader(*s->program);
+  if (shadowed && s->id) Dev(c)->gfx->SetRayShadow(s->id, shadow);
+  if (reflected && s->id) Dev(c)->gfx->SetRayReflection(s->id, reflection);
+  if (forwarded && s->id) Dev(c)->gfx->SetRayForwardReflection(s->id, forward);
+  if (fwd_shadowed && s->id) Dev(c)->gfx->SetRayForwardShadow(s->id, fwd_shadow);
+  if (denoised && s->id) Dev(c)->gfx->SetRayDenoise(s->id, denoise);
+  if (volumed && s->id) Dev(c)->gfx->SetRayLightVolume(s->id, light_volume);
+  if (occluded && s->id) Dev(c)->gfx->SetRayOcclusion(s->id, occlusion);
   Wr32(Arg(c, 2), com::Publish(s, ShaderVtable(pixel)));
   return D3D_OK;
 }
@@ -1248,7 +1302,17 @@ uint32_t BufferLock(Ctx& c) {
       b->last_use = 0;
     }
   }
+  // The contents may change (gfx::VertexStream::version, BufferContents).
+  if (!(flags & D3DLOCK_READONLY) && d && d->buffer_versions) b->contents.WriteLock(d->gfx->FrameSerial());
   Wr32(Arg(c, 3), b->mem + off);
+  return D3D_OK;
+}
+
+// What was written since the lock is there now (BufferContents::Unlock);
+// nothing to do unless a device tracks buffer contents.
+uint32_t BufferUnlock(Ctx& c) {
+  if (!BufferContentsTracked().load(std::memory_order_relaxed)) return D3D_OK;
+  Buf(c)->contents.Unlock();
   return D3D_OK;
 }
 
@@ -1271,7 +1335,7 @@ uint32_t BufferLock(Ctx& c) {
   }                                                                                 \
   HLE_NAMED("d3d9.dll", Iface "::GetPriority", Prefix##_GetPriority, 1) { return Buf(c)->priority; } \
   HLE_NAMED("d3d9.dll", Iface "::Lock", Prefix##_Lock, 5) { return BufferLock(c); }  \
-  HLE_NAMED("d3d9.dll", Iface "::Unlock", Prefix##_Unlock, 1) { return D3D_OK; }
+  HLE_NAMED("d3d9.dll", Iface "::Unlock", Prefix##_Unlock, 1) { return BufferUnlock(c); }
 
 D3D9_BUFFER_METHODS("IDirect3DVertexBuffer9", D3DVB9, false)
 D3D9_BUFFER_METHODS("IDirect3DIndexBuffer9", D3DIB9, true)

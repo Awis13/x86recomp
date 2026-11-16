@@ -23,19 +23,47 @@
 
 #include "runtime/gfx/metal_archive.h"
 #include "runtime/gfx/metal_cache.h"
+#include "runtime/gfx/rt_forward_reflection.h"
 
 namespace recomp::gfx {
 
 namespace {
 
 // A function to compile: a translated shader's, with the alpha test or
-// without it (`full` false: its lean variant).
+// without it (`full` false: its lean variant); a pixel shader's with the
+// ray queries (`forward`: kRtForwardPs) or without.
 struct FunctionSpec {
   uint64_t hash;
-  bool vertex, full;
+  bool vertex, full, forward;
 };
 
-uint64_t FunctionKey(uint64_t hash, bool full) { return hash * 2 + (full ? 0 : 1); }
+uint64_t FunctionKey(uint64_t hash, bool full, bool forward) {
+  return hash * 4 + (full ? 0 : 1) + (forward ? 2 : 0);
+}
+
+// A translated shader's function from its plain MSL, made as the game
+// makes it (metal_device.mm: CompileShader, RtForwardCompile, Lean), so
+// that the archive matches: a vertex shader's as it is; a pixel shader's
+// given the ray queries where `forward` (RtForwardReflectionPatch, plain
+// where they cannot be put in or do not compile), then its lean macros,
+// compiled with the alpha test (`full`) or without it. Nil where it does
+// not compile, with the compiler's words in `why`.
+id<MTLFunction> CompileFunction(id<MTLDevice> dev, const std::string& plain, const FunctionSpec& f,
+                                std::string* why) {
+  for (int patched = f.forward ? 1 : 0; patched >= 0; patched--) {
+    std::string text = plain;
+    if (patched && !RtForwardReflectionPatch(&text)) continue;
+    const bool has_lean = MetalLeanMacros(&text, f.vertex);
+    NSError* err = nil;
+    id<MTLLibrary> lib = [dev newLibraryWithSource:@(text.c_str())
+                                           options:has_lean ? LeanMslOptions(f.full) : nil
+                                             error:&err];
+    if (id<MTLFunction> fn = [lib newFunctionWithName:@"main0"]) return fn;
+    // (What the last try said, for the caller's message.)
+    if (why && err) *why = err.localizedDescription.UTF8String;
+  }
+  return nil;
+}
 
 // The cache files' content: the translated shaders' MSL and the recipes
 // (each once), of this translation generation (metal_cache.h).
@@ -114,15 +142,15 @@ Plan MakePlan(const std::string& dir, id<MTLDevice> dev) {
     if (saved.count(ArchiveKey(r))) { p.cached++; continue; }
     auto vs = msl.find(r.vs), ps = msl.find(r.ps);
     if (vs == msl.end() || ps == msl.end()) continue;
-    const bool lean = r.key.lean & kLeanPs;
+    const bool lean = r.key.lean & kLeanPs, forward = r.key.lean & kRtForwardPs;
     if (lean) {
       // A lean variant needs the alpha test's macro (MetalLeanMacros).
       std::string text = ps->second;
       if (!MetalLeanMacros(&text, false)) continue;
     }
     p.recipes.push_back(r);
-    if (fns.insert(FunctionKey(r.vs, true)).second) p.functions.push_back({r.vs, true, true});
-    if (fns.insert(FunctionKey(r.ps, !lean)).second) p.functions.push_back({r.ps, false, !lean});
+    if (fns.insert(FunctionKey(r.vs, true, false)).second) p.functions.push_back({r.vs, true, true, false});
+    if (fns.insert(FunctionKey(r.ps, !lean, forward)).second) p.functions.push_back({r.ps, false, !lean, forward});
   }
   return p;
 }
@@ -223,25 +251,21 @@ PrewarmResult PrewarmCaches(const PrewarmProgress& progress, const std::atomic<b
                  plan.recipes.size(), threads);
 
     // The functions, compiled as the game compiles them (CompileShader,
-    // Lean): the same MSL, the same macros, so that the archive matches.
+    // Lean): the same MSL, the same macros, the same ray queries, so that
+    // the archive matches.
     std::mutex fn_mu;
     std::unordered_map<uint64_t, id<MTLFunction>> fns;
     Parallel(plan.functions.size(), threads, cancel, [&](size_t i) {
       const FunctionSpec& f = plan.functions[i];
-      std::string text = plan.src->msl.at(f.hash);
-      const bool has_lean = MetalLeanMacros(&text, f.vertex);
-      NSError* err = nil;
-      id<MTLLibrary> lib = [dev newLibraryWithSource:@(text.c_str())
-                                             options:has_lean ? LeanMslOptions(f.full) : nil
-                                               error:&err];
-      id<MTLFunction> fn = [lib newFunctionWithName:@"main0"];
+      std::string why;
+      id<MTLFunction> fn = CompileFunction(dev, plan.src->msl.at(f.hash), f, &why);
       if (!fn)
         std::fprintf(stderr, "gfx: prewarm: shader %016llx (%s, %s) failed: %s\n",
                      (unsigned long long)f.hash, f.vertex ? "vertex" : "pixel", f.full ? "full" : "lean",
-                     err ? err.localizedDescription.UTF8String : "main0 function unavailable");
+                     why.empty() ? "main0 function unavailable" : why.c_str());
       {
         std::lock_guard<std::mutex> l(fn_mu);
-        fns[FunctionKey(f.hash, f.full)] = fn;
+        fns[FunctionKey(f.hash, f.full, f.forward)] = fn;
       }
       report("shaders");
     });
@@ -253,8 +277,8 @@ PrewarmResult PrewarmCaches(const PrewarmProgress& progress, const std::atomic<b
       id<MTLFunction> vs = nil, ps = nil;
       {
         std::lock_guard<std::mutex> l(fn_mu);
-        vs = fns[FunctionKey(r.vs, true)];
-        ps = fns[FunctionKey(r.ps, !(r.key.lean & kLeanPs))];
+        vs = fns[FunctionKey(r.vs, true, false)];
+        ps = fns[FunctionKey(r.ps, !(r.key.lean & kLeanPs), (r.key.lean & kRtForwardPs) != 0)];
       }
       bool built = false;
       if (vs && ps) {

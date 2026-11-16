@@ -644,6 +644,10 @@ void DrawCounted(Device& d, gfx::ShaderDraw& sd, const char* what) {
   const bool instanced = sd.indices && !sd.streams[0].data && (freq0 & kIndexedData);
   const uint32_t instances = instanced ? std::max<uint32_t>(freq0 & 0x3FFFFFFF, 1) : 1;
   gfx::VertexStream per_instance[16];
+  sd.instanced = instanced;
+  // Buffer versions only for a device that asks (ray tracing).
+  const bool versions = d.buffer_versions;
+  const uint64_t frame = versions ? d.gfx->FrameSerial() : 0;
   for (int s = 0; s < 16; s++) {
     const Device::Stream& st = d.streams[s];
     if (st.freq != 1 && st.buffer.guest && !(st.freq & (kIndexedData | kInstanceData)))
@@ -653,6 +657,12 @@ void DrawCounted(Device& d, gfx::ShaderDraw& sd, const char* what) {
     if (!b || st.offset >= b->length) continue;
     sd.streams[s] = {static_cast<const uint8_t*>(GPtr(b->mem)) + st.offset, b->length - st.offset,
                      st.stride};
+    if (versions) {
+      sd.streams[s].version = b->contents.Version();
+      sd.streams[s].buffer = b->contents.id;
+      sd.streams[s].buffer_offset = st.offset;
+      sd.streams[s].dynamic = BufferDynamic(*b, frame);
+    }
     NoteBufferUse(d, b);
     if (instanced && (st.freq & kInstanceData)) {
       per_instance[s] = sd.streams[s];
@@ -737,6 +747,12 @@ HLE_NAMED("d3d9.dll", "IDirect3DDevice9::DrawIndexedPrimitive", D3DDev9_DrawInde
   uint64_t start = uint64_t(Arg(c, 5)) * sd.index_size;
   if (start + uint64_t(n) * sd.index_size > ib->length) return D3DERR_INVALIDCALL;
   sd.indices = static_cast<const uint8_t*>(GPtr(ib->mem)) + start;
+  if (d->buffer_versions) {
+    sd.index_version = ib->contents.Version();
+    sd.index_buffer = ib->contents.id;
+    sd.index_offset = uint32_t(start);
+    sd.index_dynamic = BufferDynamic(*ib, d->gfx->FrameSerial());
+  }
   NoteBufferUse(*d, ib);
   sd.base_vertex = int32_t(Arg(c, 2));
   sd.min_index = Arg(c, 3);

@@ -33,6 +33,7 @@
 
 #include "runtime/gfx/metal_archive.h"
 #include "runtime/gfx/metal_prelude.h"
+#include "runtime/gfx/rt_forward_reflection.h"
 
 namespace recomp::gfx {
 
@@ -50,10 +51,17 @@ struct PipeKey {
 static_assert(sizeof(PipeKey) == 32, "no padding");
 // PipeKey::lean: a shader made without what the draw does not use.
 constexpr uint8_t kLeanPs = 1;  // the pixel shader without the alpha test
+// Not a variant: the pixel shader has the ray queries (its MSL patched,
+// rt_forward_reflection.h). In the key so that a recipe says so (a
+// pipeline built from it patches the MSL the same way) and the archive's
+// key has the patch's version (ArchiveKey: a pipeline of an older patch
+// is not taken for one of this).
+constexpr uint8_t kRtForwardPs = 2;
 
 // A pipeline compiled in a run, for later runs: its shaders' translations
 // (Shader::hash) and the rest of its key (vs, ps 0). The pipeline
-// archive's key for it is the record's hash (ArchiveKey).
+// archive's key for it is the record's hash (ArchiveKey; with the ray
+// queries' patch version where kRtForwardPs).
 struct PipelineRecipe {
   uint64_t vs, ps;
   PipeKey key;
@@ -66,7 +74,10 @@ inline uint64_t Fnv64(const void* p, size_t n) {
   return h;
 }
 
-inline uint64_t ArchiveKey(const PipelineRecipe& r) { return Fnv64(&r, sizeof r); }
+inline uint64_t ArchiveKey(const PipelineRecipe& r) {
+  const uint64_t h = Fnv64(&r, sizeof r);
+  return r.key.lean & kRtForwardPs ? h ^ (uint64_t(kRtForwardVersion) * 0x9E3779B97F4A7C15ull) : h;
+}
 
 // A pipeline's descriptor from its key and functions.
 inline MTLRenderPipelineDescriptor* DescribePipeline(const PipeKey& k, id<MTLFunction> vs, id<MTLFunction> ps) {

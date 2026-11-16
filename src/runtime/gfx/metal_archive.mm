@@ -350,6 +350,11 @@ bool PipelineArchive::Saves() {
 
 // ---- lookups
 
+bool PipelineArchive::Listed(uint64_t key) {
+  std::lock_guard<std::mutex> l(mu_);
+  return shards_ && listed_.count(key) != 0;
+}
+
 id<MTLRenderPipelineState> PipelineArchive::Build(MTLRenderPipelineDescriptor* pd, uint64_t key, NSError** error,
                                                   bool* found) {
   if (found) *found = false;

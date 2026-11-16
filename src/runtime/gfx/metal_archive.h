@@ -137,6 +137,12 @@ class PipelineArchive : public std::enable_shared_from_this<PipelineArchive> {
   id<MTLRenderPipelineState> Build(MTLRenderPipelineDescriptor* pd, uint64_t key, NSError** error,
                                    bool* found = nullptr);
 
+  // Any thread: whether a loaded shard lists `key` (Build then finds its
+  // pipeline at once, unless the shard is outdated); false until the
+  // shards are loaded. For a caller that would rather not wait for a
+  // pipeline Build would have to compile.
+  bool Listed(uint64_t key);
+
   // No more new pipelines kept, saves not started any more but for
   // Close's (the device calls it first thing when it goes).
   void BeginClose();
