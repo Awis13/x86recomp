@@ -18,6 +18,7 @@
 #include <thread>
 #include <vector>
 
+#include "runtime/gfx/frame_log.h"
 #include "runtime/hle/hle.h"
 #include "runtime/hle/kernel32_state.h"
 #include "runtime/hle/locale.h"
@@ -575,6 +576,7 @@ HLE64("kernel32.dll", GetCurrentThreadId, 0) { return CurrentThread()->tid; }
 HLE64("kernel32.dll", ExitProcess, 1) {
   uint32_t code = uint32_t(Arg(c, 0));
   if (Game().before_exit) Game().before_exit();
+  recomp::gfx::FrameLogFlush();  // (the frame log's last lines: _Exit runs no atexit hook)
   std::fflush(stdout);
   std::fprintf(stderr, "ExitProcess(%u)\n", code);
   std::fflush(stderr);
@@ -584,6 +586,7 @@ HLE64("kernel32.dll", ExitProcess, 1) {
 HLE64("kernel32.dll", TerminateProcess, 2) {
   if (uint32_t(Arg(c, 0)) == 0xFFFFFFFF) {
     std::fprintf(stderr, "TerminateProcess(self, %u)\n", uint32_t(Arg(c, 1)));
+    recomp::gfx::FrameLogFlush();
     std::_Exit(int(Arg(c, 1)));
   }
   return 0;

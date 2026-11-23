@@ -40,13 +40,15 @@ bool GlslToSpirv(const std::string& glsl, ShaderStage stage, std::vector<uint32_
 }
 
 #if defined(__APPLE__)
-bool SpirvToMsl(const std::vector<uint32_t>& spirv, std::string* msl, std::string* log) {
+bool SpirvToMsl(const std::vector<uint32_t>& spirv, std::string* msl, std::string* log,
+                const SpirvMslOptions& opt) {
   try {
     spirv_cross::CompilerMSL c(spirv);
     spirv_cross::CompilerMSL::Options o = c.get_msl_options();
     o.set_msl_version(2, 1);
     o.enable_decoration_binding = true;
     o.enable_clip_distance_user_varying = false;
+    o.disable_rasterization = opt.disable_rasterization;
     c.set_msl_options(o);
     *msl = c.compile();
   } catch (const std::exception& e) {

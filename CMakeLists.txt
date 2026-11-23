@@ -219,7 +219,8 @@ add_library(recomp_hlsl SHARED
   src/runtime/hlsl/check.cpp
   src/runtime/hlsl/glsl.cpp
   src/runtime/hlsl/hlsl.cpp
-  src/runtime/hlsl/bytecode.cpp)
+  src/runtime/hlsl/bytecode.cpp
+  src/runtime/hlsl/capture_position.cpp)
 target_include_directories(recomp_hlsl PUBLIC src)
 target_compile_features(recomp_hlsl PUBLIC cxx_std_20)
 if(NOT RECOMP_IOS)
@@ -236,7 +237,8 @@ add_library(recomp_gfx SHARED
   src/runtime/gfx/device.cpp
   src/runtime/gfx/gpu_device.cpp
   src/runtime/gfx/shader_compile.cpp
-  src/runtime/gfx/target_size.cpp)
+  src/runtime/gfx/target_size.cpp
+  src/runtime/gfx/frame_log.cpp)
 target_include_directories(recomp_gfx PUBLIC src)
 target_compile_features(recomp_gfx PUBLIC cxx_std_20)
 # Shaders translated at run time (Direct3D 9) are compiled then: glslang
@@ -250,15 +252,29 @@ if(APPLE)
   find_package(spirv_cross_glsl CONFIG REQUIRED)
   find_package(spirv_cross_msl CONFIG REQUIRED)
   target_link_libraries(recomp_gfx PRIVATE spirv-cross-msl)
-  # The Metal backend (Objective-C++, ARC).
-  # prewarm.mm: PrewarmCaches (gfx/prewarm.h), for launchers.
+  # The Metal backend (Objective-C++, ARC), its pipeline archive
+  # (gfx/metal_archive.h), its ray-traced scene, shadows and reflections
+  # (gfx/rt_scene.h, gfx/rt_alpha.h, gfx/rt_shadow.h, gfx/rt_reflection.h,
+  # gfx/rt_forward_reflection.h), the accumulation of sparsely traced terms
+  # (gfx/rt_accumulate.h) and MetalFX's denoiser of the lit scene
+  # (gfx/rt_denoise.h). prewarm.mm: PrewarmCaches (gfx/prewarm.h), for
+  # launchers.
   target_sources(recomp_gfx PRIVATE src/runtime/gfx/metal_device.mm src/runtime/gfx/metal_archive.mm
-                 src/runtime/gfx/prewarm.mm)
+                 src/runtime/gfx/prewarm.mm src/runtime/gfx/rt_scene.mm
+                 src/runtime/gfx/rt_alpha.mm src/runtime/gfx/rt_shadow.mm src/runtime/gfx/rt_reflection.mm
+                 src/runtime/gfx/rt_forward_reflection.mm src/runtime/gfx/rt_denoise.mm
+                 src/runtime/gfx/rt_accumulate.mm src/runtime/gfx/rt_many_lights.mm src/runtime/gfx/rt_occlusion.mm src/runtime/gfx/rt_fog.mm
+                 src/runtime/gfx/flight_recorder.mm)
   set_source_files_properties(src/runtime/gfx/metal_device.mm src/runtime/gfx/metal_archive.mm
-    src/runtime/gfx/prewarm.mm
+    src/runtime/gfx/prewarm.mm src/runtime/gfx/rt_scene.mm
+    src/runtime/gfx/rt_alpha.mm src/runtime/gfx/rt_shadow.mm src/runtime/gfx/rt_reflection.mm
+    src/runtime/gfx/rt_forward_reflection.mm src/runtime/gfx/rt_denoise.mm src/runtime/gfx/rt_accumulate.mm
+    src/runtime/gfx/rt_many_lights.mm src/runtime/gfx/rt_occlusion.mm src/runtime/gfx/rt_fog.mm
+    src/runtime/gfx/flight_recorder.mm
     TARGET_DIRECTORY recomp_gfx PROPERTIES COMPILE_OPTIONS "-fobjc-arc;-std=c++20")
   target_link_libraries(recomp_gfx PRIVATE "-framework Metal" "-framework MetalFX"
-                        "-framework QuartzCore" "-framework Foundation")
+                        "-framework QuartzCore" "-framework Foundation" "-framework AVFoundation"
+                        "-framework CoreMedia" "-framework CoreVideo")
   if(RECOMP_IOS)
     target_link_libraries(recomp_gfx PRIVATE "-framework UIKit")
   else()
