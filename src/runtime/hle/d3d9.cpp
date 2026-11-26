@@ -607,6 +607,8 @@ HLE_NAMED("d3d9.dll", "IDirect3D9::CreateDevice", D3D9_CreateDevice, 7) {
   SDL_Window* w = SdlWindowFor(d->hwnd);
   if (!w) FatalF("d3d9: CreateDevice: no SDL window for hwnd %08X", d->hwnd);
   d->gfx = CreateGfxDevice(w);
+  d->buffer_versions = d->gfx->TracksBufferContents();
+  if (d->buffer_versions) BufferContentsTracked().store(true, std::memory_order_relaxed);
   SetUpSharedBuffers(*d);
   uint32_t self = com::Publish(d, DeviceVtable());
   com::AddRef(d->d3d);

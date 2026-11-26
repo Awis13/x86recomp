@@ -10,6 +10,8 @@
 #include <cstring>
 #include <string>
 
+#include "runtime/audio/dump.h"
+#include "runtime/audio/spatial_output.h"
 #include "runtime/log.h"
 #include "runtime/platform.h"
 
@@ -106,7 +108,8 @@ Vec3 Normalize(const Vec3& v, const Vec3& fallback) {
 }
 
 // Next frame of the current pass into dst[0..1] (mono is duplicated,
-// positional stereo is folded to mono). False at the end of the pass.
+// positional stereo is folded to mono), or a source of more channels into
+// dst[0..5] in the 5.1 mix's order. False at the end of the pass.
 bool Fetch(Voice& v, float* dst) {
   int ch = v.src->channels();
   if (v.buf_head_ * ch >= v.buf_.size()) {
@@ -121,6 +124,9 @@ bool Fetch(Voice& v, float* dst) {
   v.buf_head_++;
   if (ch == 1) {
     dst[0] = dst[1] = f[0];
+  } else if (ch > 2) {
+    for (int c = 0; c < kBedChannels; c++) dst[c] = 0.0f;
+    AddToBed(f, ch, dst);
   } else if (v.positional) {
     dst[0] = dst[1] = 0.5f * (f[0] + f[1]);
   } else {
@@ -138,18 +144,29 @@ bool Prime(Voice& v) {
   if (!Fetch(v, v.a_)) return false;
   if (!Fetch(v, v.b_)) {
     v.at_end_ = true;
-    v.b_[0] = v.a_[0];
-    v.b_[1] = v.a_[1];
+    for (int c = 0; c < kBedChannels; c++) v.b_[c] = v.a_[c];
   }
   return true;
 }
 
-// RECOMP_AUDIO_DUMP=dir: what the device is given, as raw float stereo
-// at the mixer's rate, to dir/out.f32 (finding clicks).
-FILE* DumpFile(const char* name) {
-  const char* dir = std::getenv("RECOMP_AUDIO_DUMP");
-  if (!dir || !*dir) return nullptr;
-  return std::fopen((std::string(dir) + "/" + name).c_str(), "wb");
+// Whether a thread of our own mixes (RECOMP_AUDIO_MIXTHREAD=0: the device
+// callback does).
+bool OwnThread() {
+  static const bool own_thread = [] {
+    const char* e = std::getenv("RECOMP_AUDIO_MIXTHREAD");
+    return !(e && *e == '0');
+  }();
+  return own_thread;
+}
+
+
+// RECOMP_AUDIO_DUMP=dir: dir/name, written off the audio thread
+// (dump.h); null without the variable. Kept for the process's life.
+AudioDump* OpenDump(const char* name, int channels) {
+  auto* d = new AudioDump;
+  if (d->Open(name, channels)) return d;
+  delete d;
+  return nullptr;
 }
 
 // The mixer thread's period: 10 ms, the length of DirectSound's fragment,
@@ -232,7 +249,9 @@ void LogMixer(bool mixed, double wait_ms, double mix_ms, double period_ms, int f
 }
 
 void SDLCALL AudioCallback(void* ud, SDL_AudioStream* s, int additional, int) {
-  static FILE* dump = DumpFile("out.f32");
+  // RECOMP_AUDIO_DUMP=dir: what the device is given, as raw float stereo
+  // at the mixer's rate, to dir/out.f32 (finding clicks).
+  static AudioDump* dump = OpenDump("out.f32", 2);
   // RECOMP_AUDIO_MUTE=1: the device plays silence (tests on the real
   // device path, quietly).
   static const bool mute = [] {
@@ -259,7 +278,7 @@ void SDLCALL AudioCallback(void* ud, SDL_AudioStream* s, int additional, int) {
   // The n frames now in buf as the device is given them, at the mixer's
   // rate (the dump, the mute and the tone test all see that).
   auto shape = [&](int n) {
-    if (dump) std::fwrite(buf, sizeof(float), size_t(n) * 2, dump);
+    if (dump) dump->Write(buf, n);
     if (mute) std::memset(buf, 0, sizeof(float) * 2 * size_t(n));
     if (tone) {
       static double phase = 0;
@@ -363,11 +382,18 @@ Mixer& GetMixer() {
   return m;
 }
 
-bool Mixer::Open(int rate) {
-  if (stream_) return true;
+Mixer::Mixer() = default;
+Mixer::~Mixer() = default;
+
+bool Mixer::Open(int rate, int channels) {
+  if (stream_ || spatial_) return true;
   if (!SDL_InitSubSystem(SDL_INIT_AUDIO)) {
     WarnF("audio: SDL audio init failed: %s\n", SDL_GetError());
     return false;
+  }
+  if (channels >= kBedChannels) {
+    if (OpenSpatial(rate, OpenSpatialOutput())) return true;
+    WarnF("audio: no spatial output on this host: the mix stays stereo\n");
   }
   // The device runs at its own rate (asked for another, macOS converts and
   // the requests come unevenly: gaps of up to 70 ms on a 23 ms buffer);
@@ -404,10 +430,7 @@ bool Mixer::Open(int rate) {
   request_frames_ = std::max((dev_frames * rate + device_rate_ - 1) / device_rate_, 1);
   // A thread of our own mixes from here on, into a ring the callback
   // copies out; RECOMP_AUDIO_MIXTHREAD=0 keeps the callback mixing.
-  static const bool own_thread = [] {
-    const char* e = std::getenv("RECOMP_AUDIO_MIXTHREAD");
-    return !(e && *e == '0');
-  }();
+  const bool own_thread = OwnThread();
   if (own_thread) StartThread();
   SDL_ResumeAudioStreamDevice(stream_);
   WarnF("audio: %d Hz stereo on SDL driver '%s' (device %d Hz, %d channels, %d-frame buffer)\n",
@@ -419,12 +442,123 @@ bool Mixer::Open(int rate) {
   return true;
 }
 
-void Mixer::OpenOffline(int rate) {
-  if (!stream_) Init(rate);
+// The 5.1 mix through the spatial output: the same ring and mixer thread
+// as the stereo device's, the ring's frames converted to the device's rate
+// by SDL (band-limited, as for the stereo device) on the output's
+// real-time thread.
+bool Mixer::OpenSpatial(int rate, std::unique_ptr<SpatialOutput> out) {
+  if (!out || stream_ || spatial_) return false;
+  device_rate_ = out->rate();
+  if (device_rate_ != rate) {
+    const SDL_AudioSpec mix{SDL_AUDIO_F32, kBedChannels, rate}, dev{SDL_AUDIO_F32, kBedChannels, device_rate_};
+    conv_ = SDL_CreateAudioStream(&mix, &dev);
+    if (!conv_) {
+      WarnF("audio: no %d to %d Hz conversion of 5.1: %s\n", rate, device_rate_, SDL_GetError());
+      return false;
+    }
+  }
+  channels_ = kBedChannels;
+  Init(rate);
+  request_frames_ = std::max((out->device_frames() * rate + device_rate_ - 1) / device_rate_, 1);
+  largest_request_ = (out->max_frames() * rate + device_rate_ - 1) / device_rate_;
+  if (OwnThread()) StartThread();
+  spatial_ = std::move(out);
+  auto pull = [](void* m, float* f, int n) { static_cast<Mixer*>(m)->PullBed(f, n); };
+  auto changed = [](void* m, int frames) { static_cast<Mixer*>(m)->SetRequest(frames); };
+  if (!spatial_->Start(pull, changed, this)) {
+    StopThread();
+    spatial_.reset();
+    if (conv_) SDL_DestroyAudioStream(conv_);
+    conv_ = nullptr;
+    channels_ = 2;
+    largest_request_ = 0;
+    thread_mode_.store(false, std::memory_order_relaxed);
+    return false;
+  }
+  if (mix_thread())
+    WarnF("audio: %d Hz 5.1 mix through the spatial output at %d Hz, mixed on a thread of its own: "
+          "%d-frame periods, ring filled to %d frames (%.1f ms; %d-frame device requests), room for %d "
+          "(requests up to %d)\n",
+          rate, device_rate_, period_, period_target_.load(), period_target_.load() * 1000.0 / rate,
+          request_frames_, ring_.Capacity(), largest_request_);
+  else
+    WarnF("audio: %d Hz 5.1 mix through the spatial output at %d Hz, mixed in its callback\n", rate,
+          device_rate_);
+  return true;
+}
+
+// The device now asks for `device_frames` at its rate: two of its requests
+// and a period ahead, as at the start, within the ring's room.
+void Mixer::SetRequest(int device_frames) {
+  if (!rate_ || !device_rate_ || !period_) return;
+  const int request = int(std::clamp<int64_t>(
+      (int64_t(device_frames) * rate_ + device_rate_ - 1) / device_rate_, 1, 1 << 24));
+  const int target = FillTarget(request, period_, ring_.Capacity());
+  period_target_.store(target, std::memory_order_relaxed);
+  WarnF("audio: device requests of %d frames: the ring filled to %d frames (%.1f ms)\n", request, target,
+        target * 1000.0 / rate_);
+}
+
+// The 5.1 mix for the spatial output's real-time thread: like the stereo
+// device's callback, the ring's frames (or a mix made here, without the
+// mixer thread) converted to the device's rate.
+void Mixer::PullBed(float* out, int n) {
+  static AudioDump* dump = OpenDump("bed.f32", kBedChannels);
+  constexpr int ch = kBedChannels;
+  constexpr int bpf = int(ch * sizeof(float));
+  float buf[kChunk * ch];
+  int silent = 0;
+  using Clock = std::chrono::steady_clock;
+  static Clock::time_point prev;
+  const auto t0 = Clock::now();
+  const double gap =
+      prev.time_since_epoch().count() ? std::chrono::duration<double, std::milli>(t0 - prev).count() : 0;
+  prev = t0;
+  // k frames of the mix at the mixer's rate into dst.
+  auto take = [&](float* dst, int k) {
+    if (mix_thread()) {
+      const int got = Take(dst, k);
+      if (got < k) silent += k - got;
+    } else {
+      Mix(dst, k);
+    }
+    if (dump) dump->Write(dst, k);
+  };
+  if (conv_) {
+    const int want = n * bpf;
+    for (int left; (left = want - SDL_GetAudioStreamAvailable(conv_)) > 0;) {
+      const int64_t need = (int64_t(left) * rate_ + int64_t(device_rate_) * bpf - 1) /
+                           (int64_t(device_rate_) * bpf);
+      const int k = int(std::min<int64_t>(need + 1, kChunk));
+      take(buf, k);
+      SDL_PutAudioStreamData(conv_, buf, k * bpf);
+    }
+    const int got = std::max(SDL_GetAudioStreamData(conv_, out, want), 0);
+    if (got < want) std::memset(reinterpret_cast<uint8_t*>(out) + got, 0, size_t(want - got));
+  } else {
+    for (int done = 0; done < n;) {
+      const int k = std::min(n - done, kChunk);
+      take(out + size_t(done) * ch, k);
+      done += k;
+    }
+  }
+  if (log_timing && n > 0 && mix_thread())
+    LogDevice(device_rate_, n, std::chrono::duration<double, std::milli>(Clock::now() - t0).count(), gap,
+              silent);
+}
+
+void Mixer::OpenOffline(int rate, int channels) {
+  if (stream_ || spatial_) return;
+  channels_ = channels >= kBedChannels ? kBedChannels : 2;
+  device_rate_ = rate;
+  Init(rate);
 }
 
 void Mixer::Init(int rate) {
   rate_ = rate;
+  // The stereo voices' own mix under a 5.1 mix, room for the most a wake
+  // mixes at once (grown if ever short, off the device's thread).
+  if (channels_ != 2) stereo_.assign(size_t(2) * size_t(kChunk), 0.0f);
   low_pass_ = LowPassTable(rate);
   send_low_pass_ = SendLowPassTable(rate);
   reverb_.Open(rate);
@@ -438,6 +572,13 @@ void Mixer::Close() {
   // lock-free, so it may stop while the device still asks), then the
   // streams stop the callback.
   StopThread();
+  if (spatial_) {
+    spatial_->Stop();  // no pull after it
+    spatial_.reset();
+    if (conv_) SDL_DestroyAudioStream(conv_);
+    conv_ = nullptr;
+    SDL_QuitSubSystem(SDL_INIT_AUDIO);
+  }
   if (stream_) {
     SDL_DestroyAudioStream(stream_);  // stops the callback first
     stream_ = nullptr;
@@ -445,6 +586,8 @@ void Mixer::Close() {
     conv_ = nullptr;
     SDL_QuitSubSystem(SDL_INIT_AUDIO);
   }
+  channels_ = 2;
+  largest_request_ = 0;
   thread_mode_.store(false, std::memory_order_relaxed);
   reverb_.Close();
 }
@@ -454,16 +597,28 @@ void Mixer::Close() {
 // old in-callback mixing had (it ran on the device's own thread), and
 // they let the thread come back from a stall of 40 ms without silence,
 // mixing several periods in the one wake it gets.
-void Mixer::StartThread() {
+void Mixer::SizeRing(int request, int largest) {
   period_ = std::max(int(std::lround(rate_ * kPeriodMs / 1000.0)), 1);
-  period_target_ = 2 * request_frames_ + period_;
+  request_frames_ = request;
+  // A 5.1 mix's device may change as the game runs: room for the largest
+  // requests a device makes (the fill itself follows the device).
   int capacity = 1;
-  while (capacity < period_target_ + period_) capacity *= 2;
-  ring_.Reset(capacity);
+  while (capacity < RingRoom(request, period_, largest)) capacity *= 2;
+  ring_.Reset(capacity, channels_);
+  const int target = FillTarget(request, period_, capacity);
+  period_target_.store(target, std::memory_order_relaxed);
+  // The mixer thread mixes up to the fill at a wake (the stereo voices'
+  // own mix of a 5.1 mix too).
+  mix_buf_.assign(size_t(channels_) * size_t(channels_ == 2 ? target : capacity), 0.0f);
+  if (channels_ != 2) stereo_.assign(size_t(2) * size_t(capacity), 0.0f);
+}
+
+void Mixer::StartThread() {
+  SizeRing(request_frames_, largest_request_);
+  const int target = period_target_.load(std::memory_order_relaxed);
   // A ring of silence at the fill to start with: the device's first
   // requests can come before the thread's first periods.
-  mix_buf_.assign(size_t(2) * size_t(period_target_), 0.0f);
-  ring_.Write(mix_buf_.data(), period_target_);
+  ring_.Write(mix_buf_.data(), target);
   stop_.store(false, std::memory_order_relaxed);
   thread_mode_.store(true, std::memory_order_relaxed);
   try {
@@ -514,7 +669,7 @@ void Mixer::ThreadMain() {
     // short of its fill; that, and what fits, is what is mixed now: a
     // stall of several periods is caught up in this one wake.
     const int free = ring_.Free();
-    const int n = std::min(period_target_ - (ring_.Capacity() - free), free);
+    const int n = std::min(period_target_.load(std::memory_order_relaxed) - (ring_.Capacity() - free), free);
     if (n > 0) {
       if (log_timing) {
         const auto w = std::chrono::steady_clock::now();
@@ -549,7 +704,8 @@ void Mixer::ThreadMain() {
 // the mixer thread has not put there yet.
 int Mixer::Take(float* out, int n) {
   const int got = ring_.Read(out, n);
-  if (got < n) std::memset(out + 2 * size_t(got), 0, sizeof(float) * 2 * size_t(n - got));
+  const size_t ch = size_t(ring_.channels());
+  if (got < n) std::memset(out + ch * size_t(got), 0, sizeof(float) * ch * size_t(n - got));
   return got;
 }
 
@@ -846,16 +1002,28 @@ void Mixer::LowPass(const std::vector<std::array<float, 2>>& table, float lf, fl
 }
 
 void Mixer::Mix(float* out, int frames) {
-  std::memset(out, 0, sizeof(float) * 2 * frames);
+  // A 5.1 mix: the stereo voices, their sends and the reverbs are mixed
+  // in stereo as always (st), sources of more channels straight into out,
+  // and st joins the front pair at the end.
+  const bool bed = channels_ != 2;
+  if (bed && stereo_.size() < size_t(2) * size_t(frames)) stereo_.resize(size_t(2) * size_t(frames));
+  float* st = bed ? stereo_.data() : out;
+  std::memset(st, 0, sizeof(float) * 2 * frames);
+  if (bed) std::memset(out, 0, sizeof(float) * size_t(channels_) * size_t(frames));
   std::lock_guard<std::mutex> l(mu_);
   for (auto& s : sends_) s.assign(size_t(frames) * 2, 0.0f);
   bool reverb = digital_.Begin(now_ms());
   if (reverb) wet_.assign(size_t(frames), 0.0f);
-  for (Voice* v : voices_)
-    if (v->state == Voice::State::Playing) MixVoice(*v, out, frames, reverb);
+  for (Voice* v : voices_) {
+    if (v->state != Voice::State::Playing) continue;
+    if (bed && v->src && v->src->channels() > 2)
+      MixBed(*v, out, frames);
+    else
+      MixVoice(*v, st, frames, reverb);
+  }
   const float* sends[Reverb::kBuses];
   for (int b = 0; b < Reverb::kBuses; b++) sends[b] = sends_[b].data();
-  reverb_.Render(sends, out, frames);
+  reverb_.Render(sends, st, frames);
   // The digital reverb works on Miles' 32-bit mix scale.
   if (reverb) {
     wet_int_.resize(size_t(frames));
@@ -864,10 +1032,65 @@ void Mixer::Mix(float* out, int frames) {
                                                   -2147483648.0, 2147483647.0)));
     reverb_out_.assign(size_t(frames) * 2, 0);
     digital_.Render(wet_int_.data(), frames, reverb_out_.data(), true);
-    for (int i = 0; i < 2 * frames; i++) out[i] += float(reverb_out_[i]) / DigitalReverb::kScale;
+    for (int i = 0; i < 2 * frames; i++) st[i] += float(reverb_out_[i]) / DigitalReverb::kScale;
   }
   mixed_ += uint64_t(frames);
-  for (int i = 0; i < 2 * frames; i++) out[i] = std::clamp(out[i], -1.0f, 1.0f);
+  if (bed) AddStereoToBed(st, out, frames);
+  for (int i = 0; i < channels_ * frames; i++) out[i] = std::clamp(out[i], -1.0f, 1.0f);
+}
+
+// A source of more than two channels, frames in the 5.1 mix's order: each
+// channel interpolated and ramped as MixVoice does a stereo one, the left
+// pair at the voice's left gain, the right pair at its right, centre and
+// LFE at their mean (the volume, with no pan).
+void Mixer::MixBed(Voice& v, float* out, int frames) {
+  if (!v.src || (!v.primed_ && !Prime(v))) {
+    v.state = Voice::State::Done;
+    v.eos = true;
+    return;
+  }
+  float tl, tr, send_volume;
+  TargetGains(v, &tl, &tr, &send_volume);
+  if (!v.gains_valid_) {
+    v.cur_l_ = tl;
+    v.cur_r_ = tr;
+    v.gains_valid_ = true;
+  }
+  const float dl = (tl - v.cur_l_) / frames, dr = (tr - v.cur_r_) / frames;
+  const double step = (v.rate > 0 ? v.rate : v.src->rate()) / double(rate_);
+  for (int i = 0; i < frames; i++) {
+    const float f = float(v.frac_);
+    v.cur_l_ += dl;
+    v.cur_r_ += dr;
+    const float mid = 0.5f * (v.cur_l_ + v.cur_r_);
+    const float g[kBedChannels] = {v.cur_l_, v.cur_r_, mid, mid, v.cur_l_, v.cur_r_};
+    float* o = out + size_t(kBedChannels) * size_t(i);
+    for (int c = 0; c < kBedChannels; c++) o[c] += (v.a_[c] + (v.b_[c] - v.a_[c]) * f) * g[c];
+    v.frac_ += step;
+    while (v.frac_ >= 1.0) {
+      v.frac_ -= 1.0;
+      if (v.at_end_) {
+        v.passes++;
+        if (v.loops == 0 || v.passes < v.loops) {
+          v.Seek(0);
+          if (Prime(v)) continue;
+        }
+        v.state = Voice::State::Done;
+        v.eos = true;
+        v.cur_l_ = tl;
+        v.cur_r_ = tr;
+        return;
+      }
+      for (int c = 0; c < kBedChannels; c++) v.a_[c] = v.b_[c];
+      v.pos_++;
+      if (!Fetch(v, v.b_)) {
+        v.at_end_ = true;
+        for (int c = 0; c < kBedChannels; c++) v.b_[c] = v.a_[c];
+      }
+    }
+  }
+  v.cur_l_ = tl;
+  v.cur_r_ = tr;
 }
 
 }  // namespace recomp::audio

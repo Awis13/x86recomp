@@ -21,8 +21,10 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <iterator>
 #include <map>
 #include <set>
 #include <string>
@@ -95,7 +97,8 @@ std::string FloatBitsExpr(uint32_t bits) {
 
 class Translator {
  public:
-  Translator(const uint32_t* t, size_t n, Program* out) : t_(t), n_(n), out_(out) {}
+  Translator(const uint32_t* t, size_t n, Program* out, const TranslateOptions& o)
+      : t_(t), n_(n), out_(out), coverage_(o.coverage), rt_call_(o.ray_reflection), rt_shadow_(o.ray_shadow) {}
 
   void Run() {
     if (n_ < 2) Fail("shader too short");
@@ -112,6 +115,15 @@ class Translator {
     Decode();
     Declare();
     if (!pixel_) out_->position_matrix = PositionMatrix(&out_->position_note);
+    if (coverage_ && ins_.size() <= kCoverageInstructions) {
+      if (pixel_) out_->pixel_alpha = PixelAlphaOf();
+      else out_->moved_lanes = MovedLanes();
+    } else if (coverage_ && pixel_) {
+      // Past the limit only what discards may read (bounded as well).
+      for (const Ins& in : ins_) out_->pixel_alpha.kills += in.op == TEXKILL ? 1 : 0;
+      if (out_->pixel_alpha.kills) out_->pixel_alpha.kill_reads_texel = KillReadsTexel();
+    }
+    out_->coverage_skipped = !coverage_;
     Emit();
   }
 
@@ -353,6 +365,639 @@ class Translator {
     return int(b);
   }
 
+  // ---- the pixel's alpha (Program::pixel_alpha)
+
+  // What a component of a register holds, as far as PixelAlphaOf follows
+  // it: not known, a varying's lane as interpolated, or an AlphaValue.
+  struct Sym {
+    enum Kind : uint8_t { kUnknown, kVarying, kValue } kind = kUnknown;
+    Semantic var;
+    uint8_t lane = 0;
+    AlphaValue v;
+  };
+  using Lanes = std::array<Sym, 4>;
+
+  static Sym Literal(float x) {
+    Sym s;
+    s.kind = Sym::kValue;
+    s.v.known = true;
+    s.v.offset = x;
+    return s;
+  }
+  // A number alone: no factor, no register in the offset.
+  static bool IsLiteral(const AlphaValue& v) {
+    return v.sampler < 0 && v.color < 0 && v.constant < 0 && v.offset_constant < 0;
+  }
+  // A COLOR varying's lane as a factor; other varyings are none.
+  static Sym AsValue(const Sym& s) {
+    if (s.kind != Sym::kVarying) return s;
+    if (s.var.usage != kColor) return Sym{};
+    Sym r;
+    r.kind = Sym::kValue;
+    r.v.known = true;
+    r.v.color = int(s.var.index);
+    r.v.color_lane = s.lane;
+    r.v.scale = 1.0f;
+    return r;
+  }
+  // m * s + c.
+  static Sym Affine(Sym s, float m, float c) {
+    s = AsValue(s);
+    if (s.kind != Sym::kValue) return Sym{};
+    s.v.scale *= m;
+    s.v.offset = s.v.offset * m + c;
+    s.v.offset_k = s.v.offset_constant >= 0 ? s.v.offset_k * m : 0.0f;
+    return s;
+  }
+  // a + b: one of them a number, or a constant register's lane (times a
+  // number, plus one) that goes into the other's offset.
+  static Sym Sum(Sym a, Sym b) {
+    a = AsValue(a);
+    b = AsValue(b);
+    if (a.kind != Sym::kValue || b.kind != Sym::kValue) return Sym{};
+    for (int k = 0; k < 2; k++) {
+      Sym x = k ? b : a;
+      const AlphaValue& y = (k ? a : b).v;
+      if (IsLiteral(y)) {
+        x.v.offset += y.offset;
+        return x;
+      }
+      if (y.sampler < 0 && y.color < 0 && y.constant >= 0 && y.offset_constant < 0 && x.v.offset_constant < 0) {
+        x.v.offset_constant = y.constant;
+        x.v.offset_lane = y.constant_lane;
+        x.v.offset_k = y.scale;
+        x.v.offset += y.offset;
+        return x;
+      }
+    }
+    return Sym{};
+  }
+  // a * b: one of them a number, or both products without offsets, each
+  // kind of factor from one side at most.
+  static Sym Product(Sym a, Sym b) {
+    a = AsValue(a);
+    b = AsValue(b);
+    if (a.kind != Sym::kValue || b.kind != Sym::kValue) return Sym{};
+    if (IsLiteral(a.v)) return Affine(b, a.v.offset, 0.0f);
+    if (IsLiteral(b.v)) return Affine(a, b.v.offset, 0.0f);
+    const AlphaValue &x = a.v, &y = b.v;
+    if (x.offset != 0.0f || y.offset != 0.0f || x.offset_constant >= 0 || y.offset_constant >= 0) return Sym{};
+    if ((x.sampler >= 0 && y.sampler >= 0) || (x.color >= 0 && y.color >= 0) || (x.constant >= 0 && y.constant >= 0))
+      return Sym{};
+    Sym r = a;
+    if (y.sampler >= 0) {
+      r.v.sampler = y.sampler;
+      r.v.channel = y.channel;
+      r.v.texcoord = y.texcoord;
+      r.v.u = y.u;
+      r.v.v = y.v;
+    }
+    if (y.color >= 0) {
+      r.v.color = y.color;
+      r.v.color_lane = y.color_lane;
+    }
+    if (y.constant >= 0) {
+      r.v.constant = y.constant;
+      r.v.constant_lane = y.constant_lane;
+    }
+    r.v.scale = x.scale * y.scale;
+    return r;
+  }
+
+  // Component `lane` of source `p`, its swizzle and modifier applied:
+  // temporaries from `temps`, ps_1_x's texture registers from `tx`.
+  Sym SrcSym(const Param& p, int lane, const std::map<uint32_t, Lanes>& temps,
+             const std::map<uint32_t, Lanes>& tx) const {
+    if (p.rel) return Sym{};
+    const uint8_t c = uint8_t((p.swz >> (2 * lane)) & 3);
+    Sym s;
+    switch (p.type) {
+      case TEMP: {
+        auto it = temps.find(p.num);
+        s = it != temps.end() ? it->second[c] : Literal(0.0f);  // (temporaries start at 0)
+        break;
+      }
+      case INPUT:
+        if (major_ >= 3) {
+          auto it = ps3_inputs_.find(p.num);
+          if (it == ps3_inputs_.end() || it->second.first.usage == kPosition) return Sym{};
+          s.var = it->second.first;
+        } else {
+          s.var = {kColor, p.num};
+        }
+        s.kind = Sym::kVarying;
+        s.lane = c;
+        break;
+      case TEXTURE:
+        if (major_ == 1) {
+          auto it = tx.find(p.num);
+          if (it == tx.end()) return Sym{};
+          s = it->second[c];
+        } else {
+          s.kind = Sym::kVarying;
+          s.var = {kTexcoord, p.num};
+          s.lane = c;
+        }
+        break;
+      case CONST: {
+        auto it = defs_.find(p.num);
+        if (it != defs_.end()) {
+          float f;
+          std::memcpy(&f, &it->second[c], 4);
+          s = Literal(f);
+        } else if (p.num < 256) {
+          s.kind = Sym::kValue;
+          s.v.known = true;
+          s.v.constant = int(p.num);
+          s.v.constant_lane = c;
+          s.v.scale = 1.0f;
+        } else {
+          return Sym{};
+        }
+        break;
+      }
+      default:
+        return Sym{};
+    }
+    switch (p.mod) {
+      case 0: return s;
+      case 1: return Affine(s, -1.0f, 0.0f);
+      case 2: return Affine(s, 1.0f, -0.5f);
+      case 3: return Affine(s, -1.0f, 0.5f);
+      case 4: return Affine(s, 2.0f, -1.0f);
+      case 5: return Affine(s, -2.0f, 1.0f);
+      case 6: return Affine(s, -1.0f, 1.0f);
+      case 7: return Affine(s, 2.0f, 0.0f);
+      case 8: return Affine(s, -2.0f, 0.0f);
+      case 11:
+        if (s.kind == Sym::kValue && IsLiteral(s.v)) return Literal(std::fabs(s.v.offset));
+        return Sym{};
+      default: return Sym{};
+    }
+  }
+
+  // A texture sample's components: `coord`'s first two components must be
+  // lanes of one TEXCOORD varying, the sampler 2D.
+  Lanes Texel(uint32_t sampler, uint32_t sampler_swz, const Sym& cu, const Sym& cv) const {
+    Lanes r{};
+    if (sampler_swz != 0xE4) return r;  // (the translation does not swizzle it)
+    auto st = sampler_type_.find(sampler);
+    if (st != sampler_type_.end() && st->second != ParamType::Sampler2D) return r;
+    if (cu.kind != Sym::kVarying || cv.kind != Sym::kVarying || cu.var.usage != kTexcoord || !(cu.var == cv.var))
+      return r;
+    for (int l = 0; l < 4; l++) {
+      Sym& s = r[l];
+      s.kind = Sym::kValue;
+      s.v.known = true;
+      s.v.sampler = int(sampler);
+      s.v.channel = uint8_t((sampler_swz >> (2 * l)) & 3);
+      s.v.texcoord = cu.var.index;
+      s.v.u = cu.lane;
+      s.v.v = cv.lane;
+      s.v.scale = 1.0f;
+    }
+    return r;
+  }
+
+  // ---- what a texkill may read (PixelAlpha::kill_reads_texel)
+
+  // Per register (type << 16 | number), the components that may hold
+  // something computed from a texel (`tex`) and from an interpolated input
+  // (`var`): a sample taints only where its coordinate has either, so a
+  // texture read at the screen position (a dither) is not a texel's.
+  struct Lanes2 {
+    std::map<uint32_t, uint8_t> lanes;
+    bool operator==(const Lanes2&) const = default;
+    void Join(const Lanes2& o) {
+      for (const auto& [k, m] : o.lanes) lanes[k] |= m;
+    }
+    void Set(uint32_t key, uint8_t mask, bool on) {
+      if (on) {
+        lanes[key] |= mask;
+        return;
+      }
+      auto it = lanes.find(key);
+      if (it == lanes.end()) return;
+      it->second &= uint8_t(~mask);
+      if (!it->second) lanes.erase(it);
+    }
+  };
+  struct Taint {
+    Lanes2 tex, var;
+    bool operator==(const Taint&) const = default;
+    void Join(const Taint& o) {
+      tex.Join(o.tex);
+      var.Join(o.var);
+    }
+  };
+  static uint32_t TaintKey(const Param& p) { return p.type << 16 | p.num; }
+  // The components of source `p` an instruction `op` writing `dst_mask`
+  // reads: per component, the swizzle's for the components written; the
+  // scalar instructions, the first; others, all four the swizzle names.
+  static uint8_t ReadMask(uint32_t op, const Param& p, uint32_t dst_mask) {
+    uint32_t lanes = 0xF;
+    switch (op) {
+      case MOV: case ADD: case SUB: case MAD: case MUL: case MIN: case MAX: case SLT: case SGE: case FRC:
+      case ABS: case CMP: case CND: case LRP: case SGN: case MOVA: case SETP: case DSX: case DSY:
+        lanes = dst_mask & 0xF;
+        break;
+      case RCP: case RSQ: case EXP: case LOG: case EXPP: case LOGP: case POW: case IFC: case BREAKC:
+        lanes = 1;
+        break;
+      default: break;
+    }
+    uint8_t m = 0;
+    for (int l = 0; l < 4; l++)
+      if (lanes & (1u << l)) m |= uint8_t(1u << ((p.swz >> (2 * l)) & 3));
+    return m;
+  }
+  // Whether the components `m` of source `p` (or the register addressing
+  // it) are in `map`.
+  static bool In(const Lanes2& map, const Param& p, uint8_t m) {
+    if (p.rel) {
+      Param r;
+      r.type = p.rel_type;
+      r.num = p.rel_num;
+      if (In(map, r, uint8_t(1u << (p.rel_comp & 3)))) return true;
+    }
+    auto it = map.lanes.find(TaintKey(p));
+    return it != map.lanes.end() && (it->second & m) != 0;
+  }
+  // Whether source `p` is an interpolated input itself (v#, t# after
+  // ps_1_x; not the position, vPos, vFace or constants).
+  bool Interpolated(const Param& p) const {
+    if (p.type == INPUT) {
+      if (major_ < 3) return true;
+      auto it = ps3_inputs_.find(p.num);
+      return it != ps3_inputs_.end() && it->second.first.usage != kPosition;
+    }
+    return p.type == TEXTURE && major_ >= 2;
+  }
+  bool Tex(const Taint& t, uint32_t op, const Param& p, uint32_t dst_mask) const {
+    return In(t.tex, p, ReadMask(op, p, dst_mask));
+  }
+  bool Var(const Taint& t, uint32_t op, const Param& p, uint32_t dst_mask) const {
+    return Interpolated(p) || In(t.var, p, ReadMask(op, p, dst_mask));
+  }
+  static bool Opens(uint32_t op, bool loop) { return loop ? op == REP || op == LOOP_ : op == IF || op == IFC; }
+  static bool Closes(uint32_t op, bool loop) { return loop ? op == ENDREP || op == ENDLOOP : op == ENDIF; }
+  // The index of the instruction closing the if block (or loop) opened at
+  // `at`; ins_.size() if none.
+  size_t BlockEnd(size_t at, bool loop) const {
+    int depth = 0;
+    for (size_t i = at + 1; i < ins_.size(); i++) {
+      if (Opens(ins_[i].op, loop)) depth++;
+      else if (Closes(ins_[i].op, loop) && depth-- == 0) return i;
+    }
+    return ins_.size();
+  }
+  // Whether [from, to) breaks out of the loop it is in (breaks of loops
+  // nested in it not counted).
+  bool Breaks(size_t from, size_t to) const {
+    for (size_t i = from; i < to; i++) {
+      if (Opens(ins_[i].op, true)) {
+        i = BlockEnd(i, true);
+        continue;
+      }
+      if (ins_[i].op == BREAK || ins_[i].op == BREAKC || ins_[i].op == BREAKP) return true;
+    }
+    return false;
+  }
+  // The instructions [from, to) run on taint `t`, in program order: a write
+  // whose sources are clean clears what it writes when it surely happens
+  // (not `weak`, not predicated), else adds nothing; a write under a
+  // condition that may depend on a texel (`ctrl`, a predicate) is a
+  // texel's. If blocks run each branch on its own copy, joined after;
+  // loops repeat to a fixed point (the maps only grow: it ends); a break
+  // leaves its state in `exits`, what follows it runs where it did not
+  // break; calls run their subroutine in place (conditional ones weak).
+  // Texkills reading a texel's set *kill; a break decided by a texel sets
+  // *texel_break (the loop's). Returns `ctrl` as the instructions leave it
+  // (a break decided by a texel in them sets it).
+  bool RunTaint(size_t from, size_t to, Taint& t, bool weak, bool ctrl, Taint* exits, bool* texel_break, int calls,
+                bool* kill) const {
+    for (size_t i = from; i < to; i++) {
+      const Ins& in = ins_[i];
+      switch (in.op) {
+        case IF: case IFC: {
+          bool cond = ctrl;
+          for (const Param& p : in.src) cond = cond || Tex(t, in.op, p, 1);
+          const size_t end = BlockEnd(i, false);
+          size_t mid = end;
+          for (size_t k = i + 1, depth = 0; k < end; k++) {
+            if (ins_[k].op == IF || ins_[k].op == IFC) depth++;
+            else if (ins_[k].op == ENDIF) depth--;
+            else if (ins_[k].op == ELSE && depth == 0) mid = k;
+          }
+          Taint a = t, b = t;
+          const bool ca = RunTaint(i + 1, mid, a, weak, cond, exits, texel_break, calls, kill);
+          const bool cb = mid < end && RunTaint(mid + 1, end, b, weak, cond, exits, texel_break, calls, kill);
+          a.Join(b);
+          t = a;
+          // A break in it: what follows runs only where it did not.
+          if (Breaks(i + 1, end)) ctrl = ctrl || cond || ca || cb;
+          i = end;
+          continue;
+        }
+        case REP: case LOOP_: {
+          const size_t end = BlockEnd(i, true);
+          Taint head = t, out;
+          bool texel = false;  // a break in it decided by a texel
+          for (bool all = ctrl;;) {
+            for (;;) {
+              Taint b = head;
+              RunTaint(i + 1, end, b, weak, all, &out, &texel, calls, kill);
+              Taint next = head;
+              next.Join(b);
+              if (next == head) break;
+              head = next;
+            }
+            // Then every later iteration depends on that texel: again, all
+            // under it.
+            if (!texel || all) break;
+            all = true;
+          }
+          head.Join(out);
+          t = head;
+          i = end;
+          continue;
+        }
+        case BREAK: case BREAKC: case BREAKP: {
+          bool cond = false;
+          for (const Param& p : in.src) cond = cond || Tex(t, in.op, p, 1);
+          if (exits) exits->Join(t);
+          // What follows in the loop runs only where it did not break.
+          if (in.op != BREAK) ctrl = ctrl || cond;
+          if ((cond || ctrl) && texel_break) *texel_break = true;
+          continue;
+        }
+        case CALL: case CALLNZ: {
+          if (in.src.empty() || calls >= 8) continue;
+          bool cond = ctrl;
+          for (size_t k = 1; k < in.src.size(); k++) cond = cond || Tex(t, in.op, in.src[k], 1);
+          for (size_t k = 0; k < ins_.size(); k++)
+            if (ins_[k].op == LABEL_ && !ins_[k].src.empty() && ins_[k].src[0].num == in.src[0].num) {
+              size_t ret = k + 1;
+              while (ret < ins_.size() && ins_[ret].op != RET && ins_[ret].op != LABEL_) ret++;
+              // (Its ctrl not kept: control comes back after the call, a
+              // break cannot leave a subroutine, which the translation makes
+              // a GLSL function.)
+              RunTaint(k + 1, ret, t, weak || in.op == CALLNZ, cond, exits, texel_break, calls + 1, kill);
+              break;
+            }
+          continue;
+        }
+        case RET: case LABEL_:
+          return ctrl;  // (main's end, or a subroutine's)
+        default: break;
+      }
+      if (in.op == TEXKILL) {
+        // The components the translation tests: x, y, z in ps_1_x, all four after.
+        const uint8_t m = major_ == 1 ? 0x7 : 0xF;
+        *kill = *kill || ctrl || (in.predicated && Tex(t, MOV, in.pred, m)) || In(t.tex, in.dst, m);
+        continue;
+      }
+      if (!in.has_dst || in.op == DCL || in.op == DEF || in.op == DEFI || in.op == DEFB) continue;
+      // A ps_1_x co-issued pair reads its sources before either writes.
+      const bool pair = i + 1 < to && ins_[i + 1].coissue && ins_[i + 1].has_dst;
+      bool tv[2] = {}, vv[2] = {};
+      for (int k = 0; k < (pair ? 2 : 1); k++) {
+        const Ins& x = ins_[i + size_t(k)];
+        const uint32_t dm = x.dst.mask & 0xF;
+        // (Predication applies per component written, whatever the instruction.)
+        bool tx = ctrl || (x.predicated && Tex(t, MOV, x.pred, dm)), vr = false;
+        if (major_ == 1 && x.op == TEX) {
+          tx = true;  // (at TEXCOORDn)
+        } else if (x.op == TEX || x.op == TEXLDL || x.op == TEXLDD) {
+          // A texel where its coordinate (or gradients) is a texel's or
+          // interpolated; the sampler itself is no source.
+          for (size_t s = 0; s < x.src.size(); s++)
+            if (s != 1) {
+              tx = tx || Tex(t, x.op, x.src[s], 0xF) || Var(t, x.op, x.src[s], 0xF);
+              vr = vr || Var(t, x.op, x.src[s], 0xF);
+            }
+        } else {
+          for (const Param& p : x.src) {
+            tx = tx || Tex(t, x.op, p, dm);
+            vr = vr || Var(t, x.op, p, dm);
+          }
+          // The matrix instructions read the rows after their second source.
+          const int rows = x.op == M4X4 || x.op == M3X4 ? 4 : x.op == M4X3 || x.op == M3X3 ? 3 : x.op == M3X2 ? 2 : 1;
+          for (int r = 1; r < rows && x.src.size() > 1; r++) {
+            Param row = x.src[1];
+            row.num += uint32_t(r);
+            tx = tx || Tex(t, x.op, row, dm);
+            vr = vr || Var(t, x.op, row, dm);
+          }
+          if (major_ == 1 && x.op == TEXCOORD) vr = true;
+        }
+        tv[k] = tx;
+        vv[k] = vr;
+      }
+      for (int k = 0; k < (pair ? 2 : 1); k++) {
+        const Ins& x = ins_[i + size_t(k)];
+        const uint8_t mask = uint8_t(x.dst.mask & 0xF);
+        const bool sure = !weak && !x.predicated;
+        if (tv[k] || sure) t.tex.Set(TaintKey(x.dst), mask, tv[k]);
+        if (vv[k] || sure) t.var.Set(TaintKey(x.dst), mask, vv[k]);
+      }
+      if (pair) i++;
+    }
+    return ctrl;
+  }
+
+  bool KillReadsTexel() const {
+    Taint t;
+    bool kill = false;
+    RunTaint(0, ins_.size(), t, false, false, nullptr, nullptr, 0, &kill);
+    return kill;
+  }
+
+  PixelAlpha PixelAlphaOf() const {
+    PixelAlpha r;
+    for (const Ins& in : ins_) r.kills += in.op == TEXKILL ? 1 : 0;
+    if (r.kills) r.kill_reads_texel = KillReadsTexel();
+    std::map<uint32_t, Lanes> temps, tx;
+    Lanes oc0{};
+    int depth = 0;
+    bool kill_ok = false;
+    AlphaValue kill;
+    // The value instruction `in` gives each component (before its result
+    // modifiers).
+    auto value = [&](const Ins& in) -> Lanes {
+      Lanes v{};
+      const std::vector<Param>& s = in.src;
+      auto src = [&](size_t i, int l) { return SrcSym(s[i], l, temps, tx); };
+      if (major_ == 1 && in.op == TEX) {
+        Sym cu, cv;
+        cu.kind = cv.kind = Sym::kVarying;
+        cu.var = cv.var = {kTexcoord, in.dst.num};
+        cv.lane = 1;
+        return Texel(in.dst.num, 0xE4, cu, cv);
+      }
+      for (int l = 0; l < 4; l++) {
+        if (!(in.dst.mask & (1u << l))) continue;
+        if (in.op == MOV && s.size() == 1) v[l] = src(0, l);
+        else if (in.op == ADD && s.size() == 2) v[l] = Sum(src(0, l), src(1, l));
+        else if (in.op == MUL && s.size() == 2) v[l] = Product(src(0, l), src(1, l));
+        else if (in.op == MAD && s.size() == 3) v[l] = Sum(Product(src(0, l), src(1, l)), src(2, l));
+      }
+      if ((in.op == TEX && in.ctl != 1 && s.size() == 2) || ((in.op == TEXLDL || in.op == TEXLDD) && s.size() >= 2)) {
+        const Lanes t = Texel(s[1].num, s[1].swz, src(0, 0), src(0, 1));
+        for (int l = 0; l < 4; l++)
+          if (in.dst.mask & (1u << l)) v[l] = t[l];
+      }
+      return v;
+    };
+    auto write = [&](const Ins& in, Lanes v) {
+      const Param& d = in.dst;
+      const Lanes zero = {Literal(0.0f), Literal(0.0f), Literal(0.0f), Literal(0.0f)};
+      Lanes* to = d.type == TEMP                    ? &temps.try_emplace(d.num, zero).first->second
+                  : d.type == COLOROUT && d.num == 0 ? &oc0
+                  : major_ == 1 && d.type == TEXTURE ? &tx[d.num]
+                                                     : nullptr;
+      if (!to) return;
+      for (int l = 0; l < 4; l++) {
+        if (!(d.mask & (1u << l))) continue;
+        Sym x = v[l];
+        if (depth > 0 || in.predicated) x = Sym{};
+        if (d.shift) x = Affine(x, std::ldexp(1.0f, d.shift), 0.0f);
+        if ((d.mod & 1) && x.kind != Sym::kUnknown) {
+          // Saturated: a number clamped; COLOR0 as it is (the alpha test
+          // clamps it); a product of values in [0, 1] (texels, colours,
+          // a scale up to 1) as it is; anything else not known.
+          x = AsValue(x);
+          const AlphaValue& a = x.v;
+          if (x.kind == Sym::kValue && IsLiteral(a)) x = Literal(std::clamp(a.offset, 0.0f, 1.0f));
+          else if (!(d.type == COLOROUT && d.num == 0) &&
+                   !(x.kind == Sym::kValue && a.constant < 0 && a.offset == 0.0f && a.offset_constant < 0 &&
+                     a.scale >= 0.0f && a.scale <= 1.0f))
+            x = Sym{};
+        }
+        (*to)[l] = x;
+      }
+    };
+    for (size_t i = 0; i < ins_.size(); i++) {
+      const Ins& in = ins_[i];
+      if (in.op == IF || in.op == IFC) {
+        depth++;
+        continue;
+      }
+      if (in.op == ENDIF) {
+        depth--;
+        continue;
+      }
+      if (in.op == ELSE) continue;
+      if (in.op == RET && depth == 0) break;
+      if (in.op == CALL || in.op == CALLNZ || in.op == LABEL_ || in.op == LOOP_ || in.op == REP ||
+          in.op == BREAK || in.op == BREAKC || in.op == BREAKP) {
+        PixelAlpha none;
+        none.kills = r.kills;
+        none.kill_reads_texel = r.kill_reads_texel;
+        return none;
+      }
+      if (in.op == TEXKILL) {
+        // Every component tested (as the translation tests them: x, y and
+        // z in ps_1_x, all four after) holds one value, or a number >= 0.
+        Param p = in.dst;
+        p.swz = 0xE4;
+        p.mod = 0;
+        bool ok = r.kills == 1 && depth == 0 && !in.predicated, have = false;
+        for (int l = 0; l < (major_ == 1 ? 3 : 4) && ok; l++) {
+          const Sym s = AsValue(SrcSym(p, l, temps, tx));
+          if (s.kind != Sym::kValue) ok = false;
+          else if (IsLiteral(s.v)) ok = s.v.offset >= 0.0f;
+          else if (!have) kill = s.v, have = true;
+          else ok = kill == s.v;
+        }
+        kill_ok = ok && have;
+        continue;
+      }
+      if (!in.has_dst || in.op == DCL || in.op == DEF || in.op == DEFI || in.op == DEFB) continue;
+      // ps_1_x co-issued pairs read their sources before either writes.
+      if (i + 1 < ins_.size() && ins_[i + 1].coissue && ins_[i + 1].has_dst) {
+        const Lanes a = value(in), b = value(ins_[i + 1]);
+        write(in, a);
+        write(ins_[i + 1], b);
+        i++;
+        continue;
+      }
+      write(in, value(in));
+    }
+    const Sym a = AsValue(major_ == 1 ? (temps.count(0) ? temps[0][3] : Literal(0.0f)) : oc0[3]);
+    if (a.kind == Sym::kValue) r.color0 = a.v;
+    if (kill_ok) r.kill = kill;
+    return r;
+  }
+
+  // ---- vertex shaders' moved varying lanes (Program::moved_lanes)
+
+  std::vector<MovedLane> MovedLanes() const {
+    // Per lane of temporaries and outputs: input register * 4 + its lane
+    // moved there, or -1.
+    using Src = std::array<int, 4>;
+    std::map<uint32_t, Src> temps, outs;  // outputs by type << 16 | number
+    int depth = 0;
+    for (const Ins& in : ins_) {
+      if (in.op == IF || in.op == IFC) {
+        depth++;
+        continue;
+      }
+      if (in.op == ENDIF) {
+        depth--;
+        continue;
+      }
+      if (in.op == RET && depth == 0) break;
+      if (in.op == CALL || in.op == CALLNZ || in.op == LABEL_ || in.op == LOOP_ || in.op == REP ||
+          in.op == BREAK || in.op == BREAKC || in.op == BREAKP)
+        return {};
+      if (!in.has_dst || in.op == DCL || in.op == DEF || in.op == DEFI || in.op == DEFB) continue;
+      Src v = {-1, -1, -1, -1};
+      if (in.op == MOV && in.src.size() == 1 && depth == 0 && !in.predicated && in.dst.mod == 0 && in.dst.shift == 0) {
+        const Param& s = in.src[0];
+        for (int l = 0; l < 4 && s.mod == 0 && !s.rel; l++) {
+          const int c = int((s.swz >> (2 * l)) & 3);
+          if (s.type == INPUT) {
+            v[l] = int(s.num) * 4 + c;
+          } else if (s.type == TEMP) {
+            auto it = temps.find(s.num);
+            v[l] = it != temps.end() ? it->second[size_t(c)] : -1;
+          }
+        }
+      }
+      const Param& d = in.dst;
+      const Src none = {-1, -1, -1, -1};
+      Src* to = d.type == TEMP ? &temps.try_emplace(d.num, none).first->second
+                : d.type == TEXCRDOUT || (major_ < 3 && d.type == ATTROUT)
+                    ? &outs.try_emplace(d.type << 16 | d.num, none).first->second
+                    : nullptr;
+      if (!to) continue;
+      for (int l = 0; l < 4; l++)
+        if (d.mask & (1u << l)) (*to)[size_t(l)] = v[l];
+    }
+    std::vector<MovedLane> r;
+    for (const auto& [key, src] : outs) {
+      const uint32_t type = key >> 16, num = key & 0xFFFF;
+      Semantic s;
+      if (major_ >= 3) {
+        auto it = vs3_outputs_.find(num);
+        if (it == vs3_outputs_.end()) continue;
+        s = it->second;
+      } else {
+        s = type == ATTROUT ? Semantic{kColor, num} : Semantic{kTexcoord, num};
+      }
+      if (s.usage != kTexcoord && s.usage != kColor) continue;
+      for (int l = 0; l < 4; l++) {
+        if (src[size_t(l)] < 0) continue;
+        const uint32_t reg = uint32_t(src[size_t(l)]) / 4;
+        auto it = vs_inputs_.find(reg);
+        if (it == vs_inputs_.end()) continue;
+        r.push_back({s, uint8_t(l), uint8_t(std::distance(vs_inputs_.begin(), it)), uint8_t(src[size_t(l)] % 4)});
+      }
+    }
+    return r;
+  }
+
   // ---- declarations: registers used, inputs, outputs, samplers
 
   void Declare() {
@@ -374,6 +1019,9 @@ class Translator {
         if (p.type == CONST || p.type == CONST2 || p.type == CONST3 || p.type == CONST4) {
           if (p.rel) {
             rel_const_ = true;
+            const int base = int(ConstIndex(p));
+            if (!write && base < 256 && (out_->rel_const_base < 0 || base < out_->rel_const_base))
+              out_->rel_const_base = base;
           } else if (!defs_.count(ConstIndex(p))) {
             max_c_ = std::max(max_c_, ConstIndex(p) + 1);
             if (!write && ConstIndex(p) < 256) out_->float_reads.set(ConstIndex(p));
@@ -550,6 +1198,81 @@ class Translator {
     return "r_s" + std::to_string(n);
   }
 
+  // Whether a read of sampler `smp` becomes a call of r_rt_reflect
+  // (TranslateOptions::ray_reflection): ps_3_0, the sampler asked for, the
+  // origin an input declared with a semantic other than POSITION, the
+  // registers in range.
+  bool RayReflectionRead(const Param& smp) const {
+    if (!pixel_ || major_ < 3 || rt_call_.sampler < 0 || smp.type != SAMPLER || smp.num != uint32_t(rt_call_.sampler))
+      return false;
+    auto it = ps3_inputs_.find(rt_call_.origin);
+    if (it == ps3_inputs_.end() || it->second.first.usage == kPosition) return false;
+    for (uint32_t r : rt_call_.registers)
+      if (r >= 224) return false;
+    return true;
+  }
+
+  // The call that reads ray-traced reflections in its place, the read's
+  // coordinate `dir` the ray's direction (`projected`: texldp's, over its
+  // w).
+  std::string RtReflectCall(const Param& dir, bool projected = false) {
+    helpers_.insert("rt_reflect");
+    out_->ray_reflection_sampler = rt_call_.sampler;
+    out_->ray_reflection_location = VaryingLocation(ps3_inputs_.at(rt_call_.origin).first);
+    if (func_ >= 0) out_->ray_reflection_stub_calls++;
+    const std::string d = S(dir);
+    std::string call = "r_rt_reflect(gl_FragCoord, r_v[" + std::to_string(rt_call_.origin) + "], " +
+                       (projected ? "(" + d + " / (" + d + ").w)" : d);
+    for (uint32_t r : rt_call_.registers) {
+      Param c;
+      c.type = CONST;
+      c.num = r;
+      if (!defs_.count(r)) {
+        max_c_ = std::max(max_c_, r + 1);
+        out_->float_reads.set(r);
+      }
+      call += ", " + Reg(c);
+    }
+    return call + ")";
+  }
+
+  // A texldd of the shadow's sampler: the shadow toward a point (hlsl.h,
+  // RayShadowCall): the read's coordinate the point in world space, its
+  // first gradient the vector from it to the light, its second the light's
+  // weight there (x).
+  std::string RtShadowToCall(const Param& point, const Param& to, const Param& weight) {
+    helpers_.insert("rt_shadow_to");
+    out_->ray_shadow_sampler = rt_shadow_.sampler;
+    if (func_ >= 0) out_->ray_shadow_stub_calls++;
+    return "r_rt_shadow_to(gl_FragCoord, " + S(point) + ", " + S(to) + ", " + S(weight) + ")";
+  }
+
+  // Whether a read of sampler `smp` becomes a call of r_rt_shadow
+  // (TranslateOptions::ray_shadow): ps_3_0, the sampler asked for, the
+  // register in range.
+  bool RayShadowRead(const Param& smp) const {
+    return pixel_ && major_ >= 3 && rt_shadow_.sampler >= 0 && smp.type == SAMPLER &&
+           smp.num == uint32_t(rt_shadow_.sampler) && rt_shadow_.light_register < 224;
+  }
+
+  // The call that reads the traced shadow in its place, the read's
+  // coordinate `point` the point in world space (`projected`: texldp's,
+  // over its w).
+  std::string RtShadowCall(const Param& point, bool projected = false) {
+    helpers_.insert("rt_shadow");
+    out_->ray_shadow_sampler = rt_shadow_.sampler;
+    if (func_ >= 0) out_->ray_shadow_stub_calls++;
+    const std::string p = S(point);
+    Param c;
+    c.type = CONST;
+    c.num = rt_shadow_.light_register;
+    if (!defs_.count(c.num)) {
+      max_c_ = std::max(max_c_, c.num + 1);
+      out_->float_reads.set(c.num);
+    }
+    return "r_rt_shadow(gl_FragCoord, " + (projected ? "(" + p + " / (" + p + ").w)" : p) + ", " + Reg(c) + ")";
+  }
+
   // The value of an instruction as a vec4 (before result modifiers).
   std::string Value(const Ins& in) {
     const auto& s = in.src;
@@ -655,6 +1378,8 @@ class Translator {
       }
       case TEX: {  // texld (ps_2+); ps_1_x handled in Instruction
         need(2);
+        if (RayReflectionRead(s[1])) return RtReflectCall(s[0], in.ctl == 1);
+        if (RayShadowRead(s[1])) return RtShadowCall(s[0], in.ctl == 1);
         ParamType ty = sampler_type_.count(s[1].num) ? sampler_type_[s[1].num] : ParamType::Sampler2D;
         std::string smp = SamplerName(s[1].num), c = S(s[0]);
         std::string co = ty == ParamType::Sampler2D ? "(" + c + ").xy" : "(" + c + ").xyz";
@@ -671,6 +1396,8 @@ class Translator {
       }
       case TEXLDL: {
         need(2);
+        if (RayReflectionRead(s[1])) return RtReflectCall(s[0]);
+        if (RayShadowRead(s[1])) return RtShadowCall(s[0]);
         ParamType ty = sampler_type_.count(s[1].num) ? sampler_type_[s[1].num] : ParamType::Sampler2D;
         std::string smp = SamplerName(s[1].num), c = S(s[0]);
         std::string co = ty == ParamType::Sampler2D ? "(" + c + ").xy" : "(" + c + ").xyz";
@@ -678,6 +1405,8 @@ class Translator {
       }
       case TEXLDD: {
         need(4);
+        if (RayReflectionRead(s[1])) return RtReflectCall(s[0]);
+        if (RayShadowRead(s[1])) return RtShadowToCall(s[0], s[2], s[3]);
         ParamType ty = sampler_type_.count(s[1].num) ? sampler_type_[s[1].num] : ParamType::Sampler2D;
         std::string smp = SamplerName(s[1].num);
         const char* sw = ty == ParamType::Sampler2D ? ".xy" : ".xyz";
@@ -1095,6 +1824,29 @@ class Translator {
               "  float a = max(abs(s), 1e-37), e = floor(log2(a));\n"
               "  return vec4(e, a / exp2(e), log2(a), 1.0);\n"
               "}\n";
+    if (helpers_.count("rt_reflect"))
+      help += "// Ray-traced reflections (hlsl::RayReflectionCall): what a ray from\n"
+              "// origin.xyz along dir.xyz hits (rgb, w 1 where it hit). Nothing\n"
+              "// here: a backend that traces rays makes the calls ray queries.\n"
+              "vec4 r_rt_reflect(vec4 pixel, vec4 origin, vec4 dir, vec4 light, vec4 colour, vec4 ambient0,\n"
+              "                  vec4 ambient1) {\n"
+              "  return vec4(0.0);\n"
+              "}\n";
+    if (helpers_.count("rt_shadow"))
+      help += "// Ray-traced shadows (hlsl::RayShadowCall): whether world.xyz (world space)\n"
+              "// sees the light along light.xyz (x: 1 lit, 0 in shadow). Lit here: a\n"
+              "// backend that traces rays makes the calls ray queries.\n"
+              "vec4 r_rt_shadow(vec4 pixel, vec4 world, vec4 light) {\n"
+              "  return vec4(1.0);\n"
+              "}\n";
+    if (helpers_.count("rt_shadow_to"))
+      help += "// Ray-traced shadows toward a point (hlsl::RayShadowCall, a texldd):\n"
+              "// whether world.xyz sees the light at world.xyz + to.xyz (x: 1 lit, 0 in\n"
+              "// shadow), asked only where weight.x is above 0. Lit here: a backend that\n"
+              "// traces rays makes the calls ray queries.\n"
+              "vec4 r_rt_shadow_to(vec4 pixel, vec4 world, vec4 to, vec4 weight) {\n"
+              "  return vec4(1.0);\n"
+              "}\n";
     std::string protos;
     for (uint32_t l : labels_) protos += "void r_l" + std::to_string(l) + "();\n";
     std::string funcs;
@@ -1107,6 +1859,9 @@ class Translator {
   const uint32_t* t_;
   size_t n_;
   Program* out_;
+  bool coverage_ = false;  // TranslateOptions::coverage
+  RayReflectionCall rt_call_;  // TranslateOptions::ray_reflection
+  RayShadowCall rt_shadow_;    // TranslateOptions::ray_shadow
   bool pixel_ = false;
   uint32_t major_ = 0, minor_ = 0;
   std::vector<Ins> ins_;
@@ -1163,9 +1918,14 @@ class Translator {
 }  // namespace
 
 bool TranslateBytecode(const uint32_t* tokens, size_t count, Program* out, std::string* errors) {
+  return TranslateBytecode(tokens, count, out, errors, TranslateOptions{});
+}
+
+bool TranslateBytecode(const uint32_t* tokens, size_t count, Program* out, std::string* errors,
+                       const TranslateOptions& options) {
   *out = Program{};
   try {
-    Translator(tokens, count, out).Run();
+    Translator(tokens, count, out, options).Run();
   } catch (const Error& e) {
     *errors = "bytecode: " + e.msg;
     return false;

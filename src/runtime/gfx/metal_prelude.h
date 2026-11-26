@@ -4,8 +4,10 @@
 // pixel shader helpers. Shared with the offline shader checker
 // (tools/shader_check), so it compiles exactly what the backend does.
 
+#include <cstdint>
 #include <string>
 
+#include "runtime/gfx/reversed_z.h"
 #include "runtime/hlsl/hlsl.h"
 
 namespace recomp::gfx {
@@ -133,6 +135,16 @@ void r_color0(inout vec4 c) {
   return p;
 }
 
+// A vertex shader's capture variant (hlsl/capture_position.h): its
+// buffers' Metal indices (after the prelude's 0-3), and the definitions
+// that go between the prelude and the variant's GLSL.
+constexpr int kMetalCaptureBuffer = 4;       // r_capture: a float4 per vertex
+constexpr int kMetalCaptureRangeBuffer = 5;  // r_capture_range: int4 (first vertex, count, 0, 0)
+inline std::string MetalCaptureDefines() {
+  return "#define R_CAPTURE_BINDING set = 0, binding = " + std::to_string(kMetalCaptureBuffer) +
+         "\n#define R_CAPTURE_RANGE_BINDING set = 0, binding = " + std::to_string(kMetalCaptureRangeBuffer) + "\n";
+}
+
 // The lean variants (a pixel shader without the alpha test): the MSL of a
 // translation (with the prelude) gets the switch as the macro R_ALPHA_TEST
 // in place of the function constant r_alpha_test, so the full variant
@@ -148,6 +160,23 @@ inline bool MetalLeanMacros(std::string* msl, bool vertex) {
   msl->replace(v, value.size(), "R_ALPHA_TEST");
   msl->erase(d, decl.size());
   return true;
+}
+
+// Whether a draw of the scene is jittered for a temporal upscaler or
+// denoiser (r_position's r_pixel.zw): the scene's geometry, not quads over
+// the whole target. A draw that tests depth and writes it, with more than
+// four primitives; and any that tests depth whose position is the vertex
+// times a perspective projection (hlsl::Program::position_matrix: `matrix`
+// those registers' values, null without), whatever it writes and however
+// small: decals, markings and posters drawn over the surface they lie on
+// with depth writes off, or as one quad. Unjittered over a jittered wall,
+// the wall's depth under them moves by its slope times the jitter every
+// frame, and they show and vanish with the camera still.
+inline bool MetalJitteredDraw(bool depth_test, bool depth_write, uint32_t primitives, const float (*matrix)[4]) {
+  if (!depth_test) return false;
+  if (depth_write && primitives > 4) return true;
+  WProjection p;
+  return matrix && PerspectiveOf(matrix, &p);
 }
 
 }  // namespace recomp::gfx

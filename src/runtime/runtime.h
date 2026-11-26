@@ -16,6 +16,17 @@
 
 namespace recomp {
 
+namespace gfx {
+struct RayShadow;             // gfx/device.h
+struct RayReflection;         // gfx/device.h
+struct RayDenoise;            // gfx/device.h
+struct RayForwardReflection;  // gfx/device.h
+struct RayForwardShadow;      // gfx/device.h
+struct RayLightVolume;        // gfx/device.h
+struct RayManyLights;         // gfx/device.h
+struct RayOcclusion;          // gfx/device.h
+}  // namespace gfx
+
 // What the runtime needs to know about the game it runs. Filled in by the
 // game's main() and passed to RunProcess.
 struct GameConfig {
@@ -81,6 +92,89 @@ struct GameConfig {
   // state, on the drawing thread; false if none).
   int wvp_register = -1;
   bool (*depth_planes)(float* near_plane, float* far_plane) = nullptr;
+  // Ray tracing (gfx::Device::SetRayTracing, <ID>_RT): the vertex shader
+  // constants c[n]..c[n + 3] that hold the object-to-world matrix of each
+  // draw (rows, for row vectors); -1: not known, no draw is ray traced.
+  // Optional: a filter called on the drawing thread for each draw that
+  // would be traced, with its vertex shader constants and primitive count;
+  // false leaves it out (geometry that moves with the camera and writes
+  // depth, a sky dome, say). `captured`: a draw whose positions only its
+  // vertex shader makes (skinned, displaced, per instance), whose shader
+  // need not read the world registers (they may be another draw's).
+  // `other_view`: a draw of another pass (ray_other_pass_casters).
+  int world_register = -1;
+  bool (*ray_draw_filter)(const float (*vs_float)[4], uint32_t primitives, bool captured, bool other_view) = nullptr;
+  // Optional: where alpha-tested (or texkill) draws' alpha comes from, by
+  // pixel shader (gfx::Device::RayTracing::alpha_source); null: found from
+  // the shaders.
+  bool (*ray_alpha_source)(uint64_t ps_hash, uint32_t* sampler, uint32_t* texcoord) = nullptr;
+  // Ray-traced shadows (<ID>_RT=shadows or reflections, gfx::
+  // RayTracedShadows): called for each Direct3D 9 pixel shader, after
+  // shader_tokens, while shadows are traced; true for one that reads the
+  // traced shadow mask in place of a shadow lookup of its own (one
+  // shader_tokens made so, say), with where (gfx::RayShadow: the mask's
+  // sampler, the depth's sampler, the light direction's register and which
+  // way it points; or, for a local light's volume drawn one light a draw,
+  // the registers of its position, radius and cone and the lamp's gap).
+  // Null: no shader does.
+  bool (*ray_shadow_consumer)(const std::vector<uint32_t>& tokens, gfx::RayShadow* out) = nullptr;
+  // Ray-traced reflections (<ID>_RT=reflections, gfx::RayTracedReflections):
+  // likewise, true for a pixel shader that reads the traced reflections in
+  // place of an environment map's sample of its own, with where and what
+  // they are traced from (gfx::RayReflection). Null: no shader does.
+  bool (*ray_reflection_consumer)(const std::vector<uint32_t>& tokens, gfx::RayReflection* out) = nullptr;
+  // Ray-traced reflections in forward pixel shaders (gfx::
+  // RayTracedForwardReflections): likewise, true for a pixel shader whose
+  // reads of a sampler should become ray queries of its own, with which
+  // sampler, the input holding the ray's start and what the hits are lit
+  // with (gfx::RayForwardReflection; the read's coordinate is the ray's
+  // direction). The shader is translated so (hlsl::TranslateOptions::
+  // ray_reflection). Null: no shader is.
+  bool (*ray_forward_reflection_consumer)(const std::vector<uint32_t>& tokens,
+                                          gfx::RayForwardReflection* out) = nullptr;
+  // Ray-traced shadows in forward pixel shaders (gfx::RayTracedShadows):
+  // likewise, true for a pixel shader whose reads of a sampler should
+  // become shadow rays of its own toward the far light, with which sampler
+  // and the light's register (gfx::RayForwardShadow; the read's coordinate
+  // is the point, world space). The shader is translated so (hlsl::
+  // TranslateOptions::ray_shadow): lit where the device cannot trace them.
+  // Null: no shader is.
+  bool (*ray_forward_shadow_consumer)(const std::vector<uint32_t>& tokens, gfx::RayForwardShadow* out) = nullptr;
+  // Denoising of the lit scene (gfx::Device::RayTracing::denoise): called
+  // for each Direct3D 9 pixel shader, after shader_tokens, while ray tracing
+  // is on; true for the deferred lighting pass's shaders (the colour target
+  // they draw is the lit scene; where their G-buffer is) and for the
+  // post-process shaders that read the lit scene (which sampler), with
+  // which (gfx::RayDenoise). Null: nothing is denoised.
+  bool (*ray_denoise_consumer)(const std::vector<uint32_t>& tokens, gfx::RayDenoise* out) = nullptr;
+  // The local lights lit by the device itself (gfx::Device::RayTracing::
+  // many_lights, <ID>_RT_MANY_LIGHTS): called for each Direct3D 9 pixel
+  // shader, after shader_tokens, while shadows are traced; true for the
+  // deferred lighting's shaders that name its G-buffer or draw local
+  // lights' volumes (gfx::RayLightVolume). Null: none is lit so.
+  bool (*ray_light_volume_consumer)(const std::vector<uint32_t>& tokens, gfx::RayLightVolume* out) = nullptr;
+  // How those lights light a pixel (the models, pixel classes and lamp gap)
+  // and whether they do by default (its mode; <ID>_RT_MANY_LIGHTS
+  // overrides it), kept by the game for the run. Null: none.
+  const gfx::RayManyLights* ray_many_lights = nullptr;
+  // Ray-traced ambient occlusion (gfx::Device::RayTracing::occlusion_radius,
+  // <ID>_RT_OCCLUSION=0 off): called for each Direct3D 9 pixel shader, after
+  // shader_tokens, while shadows are traced; true for one that reads it
+  // (gfx::RayOcclusion). Null: none; ray_occlusion_radius its rays' length.
+  bool (*ray_occlusion_consumer)(const std::vector<uint32_t>& tokens, gfx::RayOcclusion* out) = nullptr;
+  float ray_occlusion_radius = 0.0f;
+  // The far light bounced once (gfx::Device::RayTracing::bounce_distance):
+  // the consumer's shaders read it where they would the occlusion. 0: none.
+  float ray_bounce_distance = 0.0f;
+  // Optional: where draws' albedo comes from, by pixel shader (gfx::Device::
+  // RayTracing::albedo_source); null: found from the draw.
+  bool (*ray_albedo_source)(uint64_t ps_hash, uint32_t* sampler, uint32_t* texcoord) = nullptr;
+  // Static draws of the game's other passes that write depth and no colour
+  // (its shadow maps' casters) in the ray-traced scene, placed by the world
+  // register (gfx::Device::RayTracing::other_passes); false where those
+  // passes keep something else there. ray_other_color_passes: also passes
+  // that write colour (other_color_passes; ray_draw_filter then picks).
+  bool ray_other_pass_casters = true, ray_other_color_passes = false;
 
   // Physical memory a 32-bit guest is told the machine has
   // (GlobalMemoryStatus[Ex]), in MiB; available is three quarters of it.

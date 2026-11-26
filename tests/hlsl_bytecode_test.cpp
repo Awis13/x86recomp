@@ -1,7 +1,16 @@
 // The bytecode translator (hlsl::TranslateBytecode) on hand-assembled
 // shaders covering shader models 1.1-3.0: each translation is completed
 // with tests/hlsl/prelude.glsl and must compile with glslangValidator
-// (argv[1]); interfaces are checked against what the tokens declare.
+// (argv[1]); interfaces are checked against what the tokens declare. Reads
+// of a sampler made calls of r_rt_reflect (TranslateOptions::
+// ray_reflection: texld, texldl and texldd; the sampler not declared, the
+// origin's input, the read's coordinate and the registers, a def's among
+// them, as its arguments; the registers declared and read; compiling) and
+// not where the origin is not an input or the option is not given. Reads
+// of a sampler made calls of r_rt_shadow likewise (TranslateOptions::
+// ray_shadow: the read's coordinate and the light's register as its
+// arguments, a def's register as such; the stub "lit"; compiling) and not
+// without the option or with the register past c223.
 //
 //   hlsl_bytecode_test <glslangValidator> <prelude.glsl> <out dir>
 
@@ -256,6 +265,208 @@ int DefaultInputChecks() {
   return ok ? 0 : 1;
 }
 
+// glslangValidator's verdict on a pixel shader's translation.
+bool Compiles(const char* glslang, const std::string& prelude, const std::string& dir, const char* name,
+              const Program& p) {
+  const std::string path = dir + "/bytecode_" + name + ".frag";
+  std::ofstream(path) << "#version 450\n#define R_PIXEL_SHADER\n" << prelude << "\n" << p.glsl;
+  const std::string cmd = std::string("\"") + glslang + "\" -V --target-env vulkan1.0 -S frag \"" + path +
+                          "\" -o \"" + path + ".spv\" > \"" + path + ".log\" 2>&1";
+  return std::system(cmd.c_str()) == 0;
+}
+
+// TranslateOptions::ray_reflection.
+int RayReflectionChecks(const char* glslang, const std::string& prelude, const std::string& dir) {
+  int failures = 0;
+  auto check = [&](bool ok, const char* what, const Program& p) {
+    std::printf("%s ray reflection: %s\n", ok ? "ok" : "FAIL", what);
+    if (!ok) {
+      std::printf("%s\n", p.glsl.c_str());
+      failures++;
+    }
+  };
+  // texld (op 0) or texldl / texldd of s3 at r5 (the direction), the
+  // origin TEXCOORD2 at v4.
+  auto shader = [](uint32_t op) {
+    Asm a(true, 3, 0);
+    a.Def(0, 0.25f, 0.5f, 0.75f, 1.0f);
+    a.Dcl(5, 0, Dst(V, 0));
+    a.Dcl(5, 2, Dst(V, 4, 7));
+    a.DclSampler(2, 0);
+    a.DclSampler(2, 3);
+    a.I(TEX, {Dst(R, 0), Src(V, 0), Src(S, 0)});
+    a.I(NRM, {Dst(R, 5, 7), Src(V, 0)});
+    if (op == 93)  // texldd
+      a.I(93, {Dst(R, 2), Src(R, 5), Src(S, 3), Src(V, 0), Src(V, 0)});
+    else
+      a.I(op, {Dst(R, 2), Src(R, 5), Src(S, 3)});
+    a.I(LRP, {Dst(R, 0, 7), Src(R, 2, kW), Src(R, 2), Src(R, 0)});
+    a.I(MOV, {Dst(OC, 0), Src(R, 0)});
+    return a.End();
+  };
+  recomp::hlsl::TranslateOptions o;
+  o.ray_reflection.sampler = 3;
+  o.ray_reflection.origin = 4;
+  o.ray_reflection.registers[0] = 17;
+  o.ray_reflection.registers[1] = 18;
+  o.ray_reflection.registers[2] = 37;
+  o.ray_reflection.registers[3] = 0;  // the def's c0
+  const std::string call = "r_rt_reflect(gl_FragCoord, r_v[4], r_t[5], c[17], c[18], c[37], r_dc0)";
+  const struct {
+    uint32_t op;
+    const char* name;
+  } kReads[] = {{TEX, "texld"}, {TEXLDL, "texldl"}, {93, "texldd"}};
+  for (const auto& r : kReads) {
+    const Tokens t = shader(r.op);
+    Program p;
+    std::string err;
+    if (!recomp::hlsl::TranslateBytecode(t.data(), t.size(), &p, &err, o)) {
+      std::printf("FAIL ray reflection %s: %s\n", r.name, err.c_str());
+      failures++;
+      continue;
+    }
+    bool only_s0 = p.samplers.size() == 1 && p.samplers[0].reg == 0;
+    check(p.ray_reflection_sampler == 3 && p.glsl.find(call) != std::string::npos &&
+              p.glsl.find("r_s3") == std::string::npos && only_s0 && p.float_regs >= 38 &&
+              p.float_reads.test(17) && p.float_reads.test(18) && p.float_reads.test(37) && !p.float_reads.test(0) &&
+              p.glsl.find("vec4 r_rt_reflect(vec4 pixel") != std::string::npos,
+          (std::string(r.name) + " of s3: the call, s3 not declared, the registers read").c_str(), p);
+    check(Compiles(glslang, prelude, dir, (std::string("rt_reflect_") + r.name).c_str(), p) &&
+              p.ray_reflection_location == recomp::hlsl::VaryingLocation({recomp::hlsl::kTexcoord, 2}) &&
+              p.ray_reflection_stub_calls == 0,
+          (std::string(r.name) + ": glslang takes it; the origin's location, no call in a subroutine").c_str(), p);
+    if (r.op != TEX) continue;
+    // A variant for unwritten inputs keeps the calls.
+    const std::string g = recomp::hlsl::GlslWithDefaultInputs(p, recomp::hlsl::VaryingMask(p) & ~1u);
+    check(g.find(call) != std::string::npos, "a variant without TEXCOORD0 keeps the call", p);
+    // Not without the option, nor with an origin that is not an input.
+    Program q;
+    recomp::hlsl::TranslateBytecode(t.data(), t.size(), &q, &err);
+    recomp::hlsl::TranslateOptions bad = o;
+    bad.ray_reflection.origin = 6;
+    Program b;
+    recomp::hlsl::TranslateBytecode(t.data(), t.size(), &b, &err, bad);
+    recomp::hlsl::TranslateOptions far = o;
+    far.ray_reflection.registers[1] = 224;
+    Program fr;
+    recomp::hlsl::TranslateBytecode(t.data(), t.size(), &fr, &err, far);
+    check(q.ray_reflection_sampler == -1 && q.glsl.find("r_rt_reflect") == std::string::npos &&
+              q.glsl.find("uniform sampler2D r_s3") != std::string::npos && b.ray_reflection_sampler == -1 &&
+              b.glsl.find("uniform sampler2D r_s3") != std::string::npos && fr.ray_reflection_sampler == -1,
+          "s3 read as usual without the option, with v6 (not declared) as the origin, a register past c223", q);
+  }
+  // texldp: the coordinate over its w; a read in a subroutine counted.
+  {
+    Asm a(true, 3, 0);
+    a.Dcl(5, 2, Dst(V, 4, 7));
+    a.Dcl(5, 1, Dst(V, 1));
+    a.DclSampler(2, 3);
+    a.I(TEX, {Dst(R, 0), Src(V, 1), Src(S, 3)}, 1);  // texldp r0, v1, s3
+    a.I(CALL, {Src(LBL, 0)});
+    a.I(MOV, {Dst(OC, 0), Src(R, 0)});
+    a.I(RET, {});
+    a.I(LABEL, {Src(LBL, 0)});
+    a.I(TEX, {Dst(R, 1), Src(V, 1), Src(S, 3)});
+    a.I(ADD, {Dst(R, 0), Src(R, 0), Src(R, 1)});
+    a.I(RET, {});
+    const Tokens t = a.End();
+    Program p;
+    std::string err;
+    const bool ok = recomp::hlsl::TranslateBytecode(t.data(), t.size(), &p, &err, o);
+    check(ok && p.glsl.find("r_rt_reflect(gl_FragCoord, r_v[4], (r_v[1] / (r_v[1]).w), c[17]") != std::string::npos &&
+              p.ray_reflection_stub_calls == 1 && Compiles(glslang, prelude, dir, "rt_reflect_texldp", p),
+          "texldp's coordinate over its w; the read in a subroutine counted; glslang takes it", p);
+  }
+  return failures;
+}
+
+// TranslateOptions::ray_shadow.
+int RayShadowChecks(const char* glslang, const std::string& prelude, const std::string& dir) {
+  int failures = 0;
+  auto check = [&](bool ok, const char* what, const Program& p) {
+    std::printf("%s ray shadow: %s\n", ok ? "ok" : "FAIL", what);
+    if (!ok) {
+      std::printf("%s\n", p.glsl.c_str());
+      failures++;
+    }
+  };
+  // texld (op 0) or texldl / texldd of s15 at r5 (the point), the light
+  // in c17; the result's x scales the colour.
+  auto shader = [](uint32_t op) {
+    Asm a(true, 3, 0);
+    a.Def(0, 0.25f, 0.5f, 0.75f, 1.0f);
+    a.Dcl(5, 0, Dst(V, 0));
+    a.Dcl(5, 6, Dst(V, 4, 7));
+    a.DclSampler(2, 0);
+    a.DclSampler(2, 15);
+    a.I(TEX, {Dst(R, 0), Src(V, 0), Src(S, 0)});
+    a.I(MOV, {Dst(R, 5, 7), Src(V, 4)});
+    if (op == 93)  // texldd
+      a.I(93, {Dst(R, 2), Src(R, 5), Src(S, 15), Src(V, 0), Src(V, 0)});
+    else
+      a.I(op, {Dst(R, 2), Src(R, 5), Src(S, 15)});
+    a.I(MUL, {Dst(R, 0, 7), Src(R, 0), Src(R, 2, kX)});
+    a.I(MOV, {Dst(OC, 0), Src(R, 0)});
+    return a.End();
+  };
+  recomp::hlsl::TranslateOptions o;
+  o.ray_shadow.sampler = 15;
+  o.ray_shadow.light_register = 17;
+  const std::string call = "r_rt_shadow(gl_FragCoord, r_t[5], c[17])";
+  const struct {
+    uint32_t op;
+    const char* name;
+  } kReads[] = {{TEX, "texld"}, {TEXLDL, "texldl"}, {93, "texldd"}};
+  for (const auto& r : kReads) {
+    const Tokens t = shader(r.op);
+    Program p;
+    std::string err;
+    if (!recomp::hlsl::TranslateBytecode(t.data(), t.size(), &p, &err, o)) {
+      std::printf("FAIL ray shadow %s: %s\n", r.name, err.c_str());
+      failures++;
+      continue;
+    }
+    const bool only_s0 = p.samplers.size() == 1 && p.samplers[0].reg == 0;
+    if (r.op == 93) {
+      // A texldd is the shadow toward a point: the point, the vector to
+      // the light and its weight (the gradients), no light register read.
+      const size_t at = p.glsl.find("r_rt_shadow_to(gl_FragCoord, r_t[5], ");
+      check(p.ray_shadow_sampler == 15 && p.ray_reflection_sampler == -1 && at != std::string::npos &&
+                p.glsl.find("r_rt_shadow(") == std::string::npos && p.glsl.find("r_s15") == std::string::npos &&
+                only_s0 && !p.float_reads.test(17) &&
+                p.glsl.find("vec4 r_rt_shadow_to(vec4 pixel, vec4 world, vec4 to, vec4 weight) {\n  return vec4(1.0);") !=
+                    std::string::npos &&
+                p.ray_shadow_stub_calls == 0,
+            "texldd of s15: the call toward a point, s15 not declared, c17 not read, the stub lit", p);
+      check(Compiles(glslang, prelude, dir, "rt_shadow_texldd", p), "texldd: glslang takes it", p);
+      continue;
+    }
+    check(p.ray_shadow_sampler == 15 && p.ray_reflection_sampler == -1 && p.glsl.find(call) != std::string::npos &&
+              p.glsl.find("r_s15") == std::string::npos && only_s0 && p.float_reads.test(17) &&
+              p.glsl.find("vec4 r_rt_shadow(vec4 pixel, vec4 world, vec4 light) {\n  return vec4(1.0);") !=
+                  std::string::npos &&
+              p.ray_shadow_stub_calls == 0,
+          (std::string(r.name) + " of s15: the call, s15 not declared, c17 read, the stub lit").c_str(), p);
+    check(Compiles(glslang, prelude, dir, (std::string("rt_shadow_") + r.name).c_str(), p),
+          (std::string(r.name) + ": glslang takes it").c_str(), p);
+    if (r.op != TEX) continue;
+    Program q, fr, d;
+    recomp::hlsl::TranslateBytecode(t.data(), t.size(), &q, &err);
+    recomp::hlsl::TranslateOptions far = o;
+    far.ray_shadow.light_register = 224;
+    recomp::hlsl::TranslateBytecode(t.data(), t.size(), &fr, &err, far);
+    recomp::hlsl::TranslateOptions def = o;
+    def.ray_shadow.light_register = 0;  // the def's c0
+    recomp::hlsl::TranslateBytecode(t.data(), t.size(), &d, &err, def);
+    check(q.ray_shadow_sampler == -1 && q.glsl.find("r_rt_shadow") == std::string::npos &&
+              q.glsl.find("uniform sampler2D r_s15") != std::string::npos && fr.ray_shadow_sampler == -1 &&
+              fr.glsl.find("uniform sampler2D r_s15") != std::string::npos &&
+              d.glsl.find("r_rt_shadow(gl_FragCoord, r_t[5], r_dc0)") != std::string::npos && !d.float_reads.test(0),
+          "s15 read as usual without the option or with a register past c223; a def's register as the def", q);
+  }
+  return failures;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -274,6 +485,16 @@ int main(int argc, char** argv) {
       std::printf("FAIL %s: %s\n", c.name, err.c_str());
       failures++;
       continue;
+    }
+    // The translation the same with the coverage ray tracing asks for.
+    {
+      Program q;
+      recomp::hlsl::TranslateOptions o;
+      o.coverage = true;
+      if (!recomp::hlsl::TranslateBytecode(c.tokens.data(), c.tokens.size(), &q, &err, o) || q.glsl != p.glsl) {
+        std::printf("FAIL %s: another translation with coverage\n", c.name);
+        failures++;
+      }
     }
     bool vs = p.stage == recomp::hlsl::Stage::Vertex;
     if (p.inputs.size() != c.inputs || p.varyings.size() != c.varyings || p.color_outputs != c.colors) {
@@ -294,6 +515,7 @@ int main(int argc, char** argv) {
     }
     std::printf("ok %s\n", c.name);
   }
-  failures += ReadChecks() + DefaultInputChecks();
+  failures += ReadChecks() + DefaultInputChecks() + RayReflectionChecks(argv[1], pre.str(), argv[3]) +
+              RayShadowChecks(argv[1], pre.str(), argv[3]);
   return failures ? 1 : 0;
 }

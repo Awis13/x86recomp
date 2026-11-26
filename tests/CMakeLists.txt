@@ -73,6 +73,64 @@ target_compile_options(mixer_ring_test PRIVATE -O2)
 target_link_libraries(mixer_ring_test PRIVATE Threads::Threads)
 add_test(NAME mixer_ring COMMAND mixer_ring_test)
 
+# surround_test: the 5.1 mix's pure parts (runtime/audio/surround.h):
+# where sources land in it, the LFE fold, the speaker configuration
+# reported, the way a device is rendered for; portable.
+add_executable(surround_test surround_test.cpp)
+target_include_directories(surround_test PRIVATE ${PROJECT_SOURCE_DIR}/src)
+target_compile_features(surround_test PRIVATE cxx_std_20)
+add_test(NAME surround COMMAND surround_test)
+
+# audio_dump_test: RECOMP_AUDIO_DUMP's files written off the audio threads
+# (runtime/audio/dump.h): Write does not wait for a stalled disk, frames
+# arrive in order, a full ring drops and counts; portable.
+add_executable(audio_dump_test audio_dump_test.cpp)
+target_include_directories(audio_dump_test PRIVATE ${PROJECT_SOURCE_DIR}/src)
+target_compile_features(audio_dump_test PRIVATE cxx_std_20)
+target_link_libraries(audio_dump_test PRIVATE Threads::Threads)
+add_test(NAME audio_dump COMMAND audio_dump_test)
+
+if(TARGET recomp_audio)
+  # mixer_bed_test: the mixer's 5.1 mix rendered offline (5.1, 7.1 and
+  # stereo voices, DirectSound's pan) and its stereo mix's frames.
+  add_executable(mixer_bed_test mixer_bed_test.cpp)
+  target_link_libraries(mixer_bed_test PRIVATE recomp_audio)
+  add_test(NAME mixer_bed COMMAND mixer_bed_test)
+endif()
+
+if(APPLE AND NOT RECOMP_IOS)
+  # spatial_chain_test: what the spatial output runs between the mix and
+  # the device (spatial_chain_mac.h), rendered offline without a device, for
+  # each kind of output: where each channel is heard, the LFE fold, the
+  # limiter, head tracking asked for on headphones only, the 5.1 as it is,
+  # the folded stereo, a change of kind as it renders; and the speaker
+  # layouts a device may have. Skipped where the host has no spatial mixer.
+  add_executable(spatial_chain_test spatial_chain_test.cpp
+                 ${PROJECT_SOURCE_DIR}/src/runtime/audio/spatial_chain_mac.cpp)
+  target_include_directories(spatial_chain_test PRIVATE ${PROJECT_SOURCE_DIR}/src)
+  target_compile_features(spatial_chain_test PRIVATE cxx_std_20)
+  target_link_libraries(spatial_chain_test PRIVATE "-framework AudioToolbox" "-framework CoreFoundation")
+  add_test(NAME spatial_chain COMMAND spatial_chain_test)
+  set_tests_properties(spatial_chain PROPERTIES SKIP_RETURN_CODE 77)
+endif()
+# camera_vote_test: the frame's camera from the scene's draws
+# (runtime/gfx/camera_vote.h): taken where two draws with different world
+# matrices agree, a skinned draw's bone matrix rejected; portable.
+add_executable(camera_vote_test camera_vote_test.cpp)
+target_include_directories(camera_vote_test PRIVATE ${PROJECT_SOURCE_DIR}/src)
+target_compile_features(camera_vote_test PRIVATE cxx_std_20)
+add_test(NAME camera_vote COMMAND camera_vote_test)
+
+# rt_light_list_test: the frame's local lights from the recording side to
+# the encoding side (runtime/gfx/rt_light_list.h): each frame in flight its
+# own list, none without a call, the last call winning, the cap and the
+# invalid lights dropped, on one thread and on two; portable.
+add_executable(rt_light_list_test rt_light_list_test.cpp)
+target_include_directories(rt_light_list_test PRIVATE ${PROJECT_SOURCE_DIR}/src)
+target_compile_features(rt_light_list_test PRIVATE cxx_std_20)
+target_link_libraries(rt_light_list_test PRIVATE Threads::Threads)
+add_test(NAME rt_light_list COMMAND rt_light_list_test)
+
 # gl_draw_test: the GL context's vertex arrays and immediate mode against
 # a reference model of GL's conversions, through a recording device;
 # portable.
@@ -167,6 +225,14 @@ set_tests_properties(locale_port_invalid PROPERTIES
 add_executable(file_paths_test file_paths_test.cpp)
 target_link_libraries(file_paths_test PRIVATE recomp_runtime)
 add_test(NAME file_paths COMMAND file_paths_test)
+# buffer_contents_test: versions of Direct3D buffer contents
+# (runtime/hle/buffer_contents.h: locks, unlocks, rewritten buffers);
+# portable.
+add_executable(buffer_contents_test buffer_contents_test.cpp)
+target_include_directories(buffer_contents_test PRIVATE ${PROJECT_SOURCE_DIR}/src)
+target_compile_features(buffer_contents_test PRIVATE cxx_std_20)
+target_link_libraries(buffer_contents_test PRIVATE Threads::Threads)
+add_test(NAME buffer_contents COMMAND buffer_contents_test)
 
 # lazy_mem_test: lazily read-back images (DirectDraw Lock of GPU
 # surfaces) through real page faults; portable.
@@ -267,11 +333,23 @@ add_executable(hlsl_bytecode_test hlsl_bytecode_test.cpp)
 target_link_libraries(hlsl_bytecode_test PRIVATE recomp_hlsl)
 add_test(NAME hlsl_bytecode COMMAND hlsl_bytecode_test ${RECOMP_GLSLANG}
          ${CMAKE_CURRENT_SOURCE_DIR}/hlsl/prelude.glsl ${CMAKE_CURRENT_BINARY_DIR})
+# Translated vertex shaders that also write their positions to memory
+# (captured draws of the ray-traced scene).
+add_executable(hlsl_capture_position_test hlsl_capture_position_test.cpp)
+target_link_libraries(hlsl_capture_position_test PRIVATE recomp_hlsl)
+add_test(NAME hlsl_capture_position COMMAND hlsl_capture_position_test ${RECOMP_GLSLANG}
+         ${CMAKE_CURRENT_SOURCE_DIR}/hlsl/prelude.glsl ${CMAKE_CURRENT_BINARY_DIR})
+# What compiled shaders say about a pixel's coverage (alpha-tested
+# geometry in the ray-traced scene).
+add_executable(hlsl_alpha_source_test hlsl_alpha_source_test.cpp)
+target_link_libraries(hlsl_alpha_source_test PRIVATE recomp_hlsl)
+add_test(NAME hlsl_alpha_source COMMAND hlsl_alpha_source_test)
 
 # metal_depth_test: reversed depth on the Metal backend (gfx/reversed_z.h):
 # translated shaders with the Metal prelude, drawn on the GPU as D3D9
 # stores depth and reversed, must store mirrored values and pass the same
-# depth tests (skipped without a Metal device); macOS.
+# depth tests; decals cover the walls they lie on, jittered with them
+# (skipped without a Metal device); macOS.
 if(APPLE)
   add_executable(metal_depth_test metal_depth_test.mm)
   set_source_files_properties(metal_depth_test.mm PROPERTIES COMPILE_OPTIONS "-fobjc-arc;-std=c++20")
@@ -281,16 +359,133 @@ if(APPLE)
   set_tests_properties(metal_depth PROPERTIES SKIP_RETURN_CODE 77)
 endif()
 
-# metal_rcas_test: sharpening on the Metal backend (gfx/rcas.h), rcas_cs on
-# the GPU against a C++ copy of AMD's FsrRcasF, and what it must and must
-# not sharpen (skipped without a Metal device); macOS.
+# rt_scene_test: the ray-traced scene (gfx/rt_scene.h): meshes gathered on
+# the CPU, then BLASes, TLAS, winding, the cache and the debug view traced
+# on the GPU (skipped without hardware ray tracing); macOS.
 if(APPLE)
-  add_executable(metal_rcas_test metal_rcas_test.mm)
-  set_source_files_properties(metal_rcas_test.mm PROPERTIES COMPILE_OPTIONS "-fobjc-arc;-std=c++20")
-  target_include_directories(metal_rcas_test PRIVATE "${PROJECT_SOURCE_DIR}/src")
-  target_link_libraries(metal_rcas_test PRIVATE "-framework Metal" "-framework Foundation")
-  add_test(NAME metal_rcas COMMAND metal_rcas_test)
-  set_tests_properties(metal_rcas PROPERTIES SKIP_RETURN_CODE 77)
+  add_executable(rt_scene_test rt_scene_test.mm)
+  set_source_files_properties(rt_scene_test.mm PROPERTIES COMPILE_OPTIONS "-fobjc-arc;-std=c++20")
+  target_link_libraries(rt_scene_test PRIVATE recomp_gfx "-framework Metal" "-framework Foundation")
+  add_test(NAME rt_scene COMMAND rt_scene_test)
+  set_tests_properties(rt_scene PROPERTIES SKIP_RETURN_CODE 77)
+endif()
+
+# rt_capture_test: captured draws of the ray-traced scene: translated
+# vertex shaders' capture variants run in a render pass after their draws
+# (with Metal's API validation), their positions to world space, BLASes
+# and rays (skipped without hardware ray tracing); macOS.
+if(APPLE)
+  add_executable(rt_capture_test rt_capture_test.mm)
+  set_source_files_properties(rt_capture_test.mm PROPERTIES COMPILE_OPTIONS "-fobjc-arc;-std=c++20")
+  target_link_libraries(rt_capture_test PRIVATE recomp_gfx recomp_hlsl "-framework Metal" "-framework Foundation")
+  add_test(NAME rt_capture COMMAND rt_capture_test)
+  set_tests_properties(rt_capture PROPERTIES SKIP_RETURN_CODE 77 ENVIRONMENT "MTL_DEBUG_LAYER=1")
+endif()
+
+# rt_shadow_test: ray-traced shadow masks (gfx/rt_shadow.h) from a depth
+# buffer and a light direction, traced against a scene (gfx/rt_scene.h),
+# with Metal's API validation (a depth drawn through the Metal prelude
+# among them); the backend's choices; which draws go into the scene from
+# which passes, deduped (skipped without hardware ray tracing); macOS.
+if(APPLE)
+  add_executable(rt_shadow_test rt_shadow_test.mm)
+  set_source_files_properties(rt_shadow_test.mm PROPERTIES COMPILE_OPTIONS "-fobjc-arc;-std=c++20")
+  target_link_libraries(rt_shadow_test PRIVATE recomp_gfx recomp_hlsl "-framework Metal" "-framework Foundation")
+  add_test(NAME rt_shadow COMMAND rt_shadow_test)
+  set_tests_properties(rt_shadow PROPERTIES SKIP_RETURN_CODE 77 ENVIRONMENT "MTL_DEBUG_LAYER=1")
+endif()
+
+# rt_light_shadow_test: ray-traced shadow masks of local lights (gfx/
+# rt_shadow.h: a point or spot light's position, radius, cone and lamp gap,
+# the mask over the light's bounds on screen) against a scene, with Metal's
+# API validation; the backend's choices over a frame's lights on the CPU
+# (the GPU part skipped without hardware ray tracing); macOS.
+if(APPLE)
+  add_executable(rt_light_shadow_test rt_light_shadow_test.mm)
+  set_source_files_properties(rt_light_shadow_test.mm PROPERTIES COMPILE_OPTIONS "-fobjc-arc;-std=c++20")
+  target_link_libraries(rt_light_shadow_test PRIVATE recomp_gfx "-framework Metal" "-framework Foundation")
+  add_test(NAME rt_light_shadow COMMAND rt_light_shadow_test)
+  set_tests_properties(rt_light_shadow PROPERTIES SKIP_RETURN_CODE 77 ENVIRONMENT "MTL_DEBUG_LAYER=1")
+endif()
+
+# rt_accumulate_test: the accumulation of a sparsely traced term over
+# frames (gfx/rt_accumulate.h) against synthetic scenes whose term is known
+# at every pixel (still, an occluder moved, the camera moving, disocclusion,
+# resets, uniform regions), with Metal's API validation; the sun's mask
+# traced and accumulated against one traced at every pixel, and as before
+# without it, on GPUs with hardware ray tracing; macOS.
+if(APPLE)
+  add_executable(rt_accumulate_test rt_accumulate_test.mm)
+  set_source_files_properties(rt_accumulate_test.mm PROPERTIES COMPILE_OPTIONS "-fobjc-arc;-std=c++20")
+  target_link_libraries(rt_accumulate_test PRIVATE recomp_gfx "-framework Metal" "-framework Foundation")
+  add_test(NAME rt_accumulate COMMAND rt_accumulate_test)
+  set_tests_properties(rt_accumulate PROPERTIES SKIP_RETURN_CODE 77 ENVIRONMENT "MTL_DEBUG_LAYER=1")
+endif()
+
+# rt_many_lights_test: a frame's many local lights lit with ray-traced
+# shadows over a G-buffer (gfx/rt_many_lights.h): the bins on the CPU; on
+# GPUs with hardware ray tracing the light against the model's formula, no
+# light through a wall, pixel classes, no lag behind a moving occluder, many
+# lights' mean over frames, the passes' time at 3440 x 1440; macOS.
+if(APPLE)
+  add_executable(rt_many_lights_test rt_many_lights_test.mm)
+  set_source_files_properties(rt_many_lights_test.mm PROPERTIES COMPILE_OPTIONS "-fobjc-arc;-std=c++20")
+  target_link_libraries(rt_many_lights_test PRIVATE recomp_gfx "-framework Metal" "-framework Foundation")
+  add_test(NAME rt_many_lights COMMAND rt_many_lights_test)
+  set_tests_properties(rt_many_lights PROPERTIES SKIP_RETURN_CODE 77)
+endif()
+
+# rt_reflection_test: ray-traced reflections (gfx/rt_reflection.h) over a
+# synthetic G-buffer, shaded with the scene's hit data and materials
+# (gfx/rt_scene.h: RtHitPrim, RtMaterial version 2), with Metal's API
+# validation; the albedo's source (gfx/rt_alpha.h) on the CPU (skipped
+# without hardware ray tracing); macOS.
+if(APPLE)
+  add_executable(rt_reflection_test rt_reflection_test.mm)
+  set_source_files_properties(rt_reflection_test.mm PROPERTIES COMPILE_OPTIONS "-fobjc-arc;-std=c++20")
+  target_link_libraries(rt_reflection_test PRIVATE recomp_gfx recomp_hlsl "-framework Metal" "-framework Foundation")
+  add_test(NAME rt_reflection COMMAND rt_reflection_test)
+  set_tests_properties(rt_reflection PROPERTIES SKIP_RETURN_CODE 77 ENVIRONMENT "MTL_DEBUG_LAYER=1")
+endif()
+
+# rt_forward_reflection_test: ray-traced reflections traced by forward
+# pixel shaders themselves (gfx/rt_forward_reflection.h): the MSL patch, a
+# draw's parameters and why it traces nothing on the CPU; a translated
+# shader patched, drawn against a scene, with Metal's API validation
+# (skipped without ray tracing from render pipelines); macOS.
+if(APPLE)
+  add_executable(rt_forward_reflection_test rt_forward_reflection_test.mm)
+  set_source_files_properties(rt_forward_reflection_test.mm PROPERTIES COMPILE_OPTIONS "-fobjc-arc;-std=c++20")
+  target_link_libraries(rt_forward_reflection_test PRIVATE recomp_gfx recomp_hlsl "-framework Metal"
+                        "-framework Foundation")
+  add_test(NAME rt_forward_reflection COMMAND rt_forward_reflection_test)
+  set_tests_properties(rt_forward_reflection PROPERTIES SKIP_RETURN_CODE 77 ENVIRONMENT "MTL_DEBUG_LAYER=1")
+endif()
+
+# rt_forward_cost_test: what a forward pixel shader's ray queries cost to
+# compile (a pipeline made in a frame stalls it): a shader with a game's
+# most calls patched, its library and pipeline timed; macOS.
+if(APPLE)
+  add_executable(rt_forward_cost_test rt_forward_cost_test.mm)
+  set_source_files_properties(rt_forward_cost_test.mm PROPERTIES COMPILE_OPTIONS "-fobjc-arc;-std=c++20")
+  target_link_libraries(rt_forward_cost_test PRIVATE recomp_gfx "-framework Metal" "-framework Foundation")
+  add_test(NAME rt_forward_cost COMMAND rt_forward_cost_test)
+  set_tests_properties(rt_forward_cost PROPERTIES SKIP_RETURN_CODE 77)
+endif()
+
+# rt_denoise_test: MetalFX's denoiser of the lit scene (gfx/rt_denoise.h):
+# the camera's split on the CPU; on a GPU and system that have the denoiser
+# (macOS 26, Apple9; else exit 77) the scaler made at 1:1, noise averaged
+# away with the mean kept, a panning pattern followed by its motion without
+# a ghost, a reset dropping the history, the guides and the reactive mask
+# against CPU references, and the soft shadows' cone directions
+# (gfx/rt_shadow.h); with Metal's API validation; macOS.
+if(APPLE)
+  add_executable(rt_denoise_test rt_denoise_test.mm)
+  set_source_files_properties(rt_denoise_test.mm PROPERTIES COMPILE_OPTIONS "-fobjc-arc;-std=c++20")
+  target_link_libraries(rt_denoise_test PRIVATE recomp_gfx "-framework Metal" "-framework Foundation")
+  add_test(NAME rt_denoise COMMAND rt_denoise_test)
+  set_tests_properties(rt_denoise PROPERTIES SKIP_RETURN_CODE 77 ENVIRONMENT "MTL_DEBUG_LAYER=1")
 endif()
 
 # metal_output_curve_test: the curve the Metal backend puts the frame

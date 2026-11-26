@@ -31,6 +31,8 @@
 #include <thread>
 #include <vector>
 
+#include "runtime/gfx/flight_recorder.h"
+#include "runtime/gfx/frame_log.h"
 #include "runtime/display.h"
 #include "runtime/hle/display_modes.h"
 #include "runtime/hle/hle.h"
@@ -481,6 +483,22 @@ void HandleSdlEvent(const SDL_Event& e) {
       break;
     case SDL_EVENT_KEY_DOWN:
     case SDL_EVENT_KEY_UP: {
+      // The flight recorder's mark key (gfx/flight_recorder.h:
+      // RECOMP_RECORD_KEY, default F12): kept from the game.
+      static const SDL_Scancode mark_key = [] {
+        const char* k = std::getenv("RECOMP_RECORD_KEY");
+        return SDL_GetScancodeFromName(k && *k ? k : "F12");
+      }();
+      if (mark_key != SDL_SCANCODE_UNKNOWN && e.key.scancode == mark_key && gfx::FlightRecording()) {
+        if (e.type == SDL_EVENT_KEY_DOWN && !e.key.repeat) std::thread([] { gfx::FlightMark("key"); }).detach();
+        break;
+      }
+      // Without the recorder, the same key marks the frame log (gfx/
+      // frame_log.h): the player's "here", found by its time afterwards.
+      if (mark_key != SDL_SCANCODE_UNKNOWN && e.key.scancode == mark_key && gfx::FrameLogOn()) {
+        if (e.type == SDL_EVENT_KEY_DOWN && !e.key.repeat) gfx::FrameLogLine("e %.4f mark key", gfx::FrameLogSeconds());
+        break;
+      }
       uint32_t h = HwndForSdl(e.key.windowID);
       uint8_t vk = VkFromScancode(e.key.scancode);
       if (!h || !vk) break;

@@ -13,6 +13,7 @@
 #include <vector>
 
 #include "runtime/gfx/device.h"
+#include "runtime/hle/buffer_contents.h"
 #include "runtime/hlsl/hlsl.h"
 #include "runtime/hle/com.h"
 #include "runtime/hle/d3d9_types.h"
@@ -146,8 +147,15 @@ struct Buffer final : com::Tagged<com::TagOf("d3d9.Buffer")> {
   // gfx frame of the last draw that read it.
   bool shared = false;
   uint64_t last_use = 0;
+  // Its contents, tracked while the device asks (Device::buffer_versions).
+  BufferContents contents;
   ~Buffer() override;
 };
+
+// Whether a draw should take `b` as rewritten often (gfx::VertexStream::dynamic).
+inline bool BufferDynamic(const Buffer& b, uint64_t frame) {
+  return (b.usage & D3DUSAGE_DYNAMIC) || b.contents.Rewritten(frame);
+}
 
 // A vertex shader's inputs (its input semantics matched to a vertex
 // declaration's or an FVF's elements), worked out once per shader and
@@ -237,6 +245,8 @@ struct Device final : com::Tagged<com::TagOf("d3d9.Device")> {
   SharedHeapUser heap_user;  // before gfx: see SharedHeapUser
   std::unique_ptr<gfx::Device> gfx;
   bool shared_buffers = false;  // vertex and index buffers in the shared heap
+  // gfx asks for buffer versions (gfx::Device::TracksBufferContents).
+  bool buffer_versions = false;
   std::shared_ptr<Surface> backbuffer, auto_depth;
   uint32_t swapchain = 0;  // IDirect3DSwapChain9 of GetSwapChain(0), made on first use
   // Bound objects (Bind).

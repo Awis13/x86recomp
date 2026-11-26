@@ -1,7 +1,7 @@
 #pragma once
 // Software mixer on an SDL3 audio stream: the host side of Miles' digital
 // driver and of DirectSound (Voice::dsound). Voices are linear-interpolated, gain-ramped and summed into
-// stereo float. Gains follow the mixer of the game's Miles generation
+// stereo float (or a 5.1 mix, below). Gains follow the mixer of the game's Miles generation
 // (Voice::miles), and positional voices get the "Miles Fast 2D Positional
 // Audio" treatment (distance attenuation and stereo panning), or with
 // Voice::ds3d that of DirectSound3D hardware, which Miles' EAX providers
@@ -18,6 +18,13 @@
 // Play cursors and position notifications advance on the mixer thread, in
 // play order, so SDL's real-time thread takes no lock and reads no guest
 // state. RECOMP_AUDIO_MIXTHREAD=0 mixes in the callback again, the old way.
+//
+// 5.1 (Open with 6 channels, where the host has a spatial renderer:
+// spatial_output.h): the mix is surround.h's 5.1, which the host renders
+// for the device (binaural on headphones). Sources of more than two
+// channels go to it channel for channel (Voice of a 5.1 source: volume and
+// pan only, no effect sends); everything else is mixed in stereo as
+// always, effects included, and that stereo goes to the front pair.
 //
 // Locking: Voice fields are shared with the mixer thread and may only be
 // touched with Mixer::mu() held. The mixer never calls into guest code;
@@ -36,11 +43,14 @@
 #include "runtime/audio/reverb.h"
 #include "runtime/audio/ring.h"
 #include "runtime/audio/source.h"
+#include "runtime/audio/surround.h"
 #include "runtime/audio/vec3.h"
 
 struct SDL_AudioStream;
 
 namespace recomp::audio {
+
+class SpatialOutput;
 
 struct Voice {
   enum class State { Idle, Playing, Paused, Done };
@@ -110,7 +120,9 @@ struct Voice {
   double frac_ = 0;   // 0..1 between a_ and b_
   bool primed_ = false;
   bool at_end_ = false;  // b_ is past the end of this pass
-  float a_[2] = {}, b_[2] = {};
+  // Frames either side of the play position: stereo, or a source of more
+  // channels in the 5.1 mix's order.
+  float a_[kBedChannels] = {}, b_[kBedChannels] = {};
   std::vector<float> buf_;  // decoded frames not yet consumed
   size_t buf_head_ = 0;     // in frames
   float cur_l_ = 0, cur_r_ = 0;
@@ -125,12 +137,22 @@ struct Voice {
 
 class Mixer {
  public:
-  // Opens the default playback device at `rate` Hz stereo. False if no
-  // device (the game then runs without sound, as on a soundless PC).
-  bool Open(int rate);
+  // Opens the default playback device at `rate` Hz stereo, or with
+  // `channels` 6 the 5.1 mix through the host's spatial renderer (stereo
+  // where there is none: channels() says which). False if no device (the
+  // game then runs without sound, as on a soundless PC).
+  bool Open(int rate, int channels = 2);
   // No device: the caller pulls the mix with Mix() (offline rendering).
-  void OpenOffline(int rate);
+  void OpenOffline(int rate, int channels = 2);
+  // The 5.1 mix through `out` (Open's way with the host's spatial output;
+  // tests give their own). False, and nothing open, if it would not start.
+  bool OpenSpatial(int rate, std::unique_ptr<SpatialOutput> out);
   void Close();
+  Mixer();
+  ~Mixer();
+
+  // Floats per frame of the mix: 2, or 6 for the 5.1 mix.
+  int channels() const { return channels_; }
 
   std::mutex& mu() { return mu_; }
   // The mix converted to the device's rate (null when the two are the
@@ -156,12 +178,25 @@ class Mixer {
   uint32_t now_ms() const { return rate_ ? uint32_t(mixed_ * 1000 / uint64_t(rate_)) : 0; }
 
   // Called by the mixer thread, or by the device callback with
-  // RECOMP_AUDIO_MIXTHREAD=0: locks mu(), zeroes out and mixes into it.
+  // RECOMP_AUDIO_MIXTHREAD=0: locks mu(), zeroes out and mixes into it
+  // (frames of channels() floats).
   void Mix(float* out, int frames);
   // Called by the device callback when the mixer thread mixes: n frames
   // from the ring into out, silence for the ones it did not have, and how
   // many it had (fewer is an underrun the callback counts).
   int Take(float* out, int n);
+  // The spatial output's real-time thread: n frames of the 5.1 mix at the
+  // device's rate (the ring's, converted).
+  void PullBed(float* out, int n);
+  // The spatial output's device changed: it asks for `device_frames` (at
+  // its rate) at a time, and the ring's fill follows (FillTarget).
+  void SetRequest(int device_frames);
+  // Sizes the ring for device requests of `request` frames (the mixer's)
+  // with room for requests up to `largest` (0: the device does not change):
+  // done as the mixer thread starts; tests call it on an offline mixer.
+  void SizeRing(int request, int largest);
+  int ring_capacity() const { return ring_.Capacity(); }
+  int fill_target() const { return period_target_.load(std::memory_order_relaxed); }
   // <ID>_AUDIO_LOG=1: every 5 s, the audio thread's longest wait for mu()
   // and longest mix, and how many device requests took longer than the
   // audio they returned (heard as a crackle).
@@ -171,6 +206,8 @@ class Mixer {
  private:
   void Init(int rate);
   void MixVoice(Voice& v, float* out, int frames, bool reverb);
+  // A source of more than two channels into the 5.1 mix.
+  void MixBed(Voice& v, float* out, int frames);
   // Channel gains of `v` now, and the volume its digital reverb send
   // scales by.
   void TargetGains(const Voice& v, float* l, float* r, float* send_volume) const;
@@ -189,6 +226,9 @@ class Mixer {
   SDL_AudioStream* stream_ = nullptr;
   SDL_AudioStream* conv_ = nullptr;
   int rate_ = 0, device_rate_ = 0;
+  int channels_ = 2;
+  std::vector<float> stereo_;  // the stereo voices' mix, under a 5.1 mix
+  std::unique_ptr<SpatialOutput> spatial_;
   float master_ = 1.0f;
   // LowPass coefficients (a1, a2) per 10 mB of HF cut, 0 to -10000.
   std::vector<std::array<float, 2>> low_pass_;
@@ -211,8 +251,10 @@ class Mixer {
   std::atomic<bool> stop_{false};
   FrameRing ring_;
   int request_frames_ = 0;  // one device request, in the mixer's frames
+  int largest_request_ = 0;  // the largest a device may make (5.1 mix), or 0
   int period_ = 0;          // frames in a period
-  int period_target_ = 0;   // frames the ring is kept filled to
+  // Frames the ring is kept filled to (a device change moves it).
+  std::atomic<int> period_target_{0};
   std::vector<float> mix_buf_;  // the periods one wake mixes, at most
 };
 

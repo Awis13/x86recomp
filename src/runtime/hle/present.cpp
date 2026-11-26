@@ -268,6 +268,67 @@ std::unique_ptr<gfx::Device> CreateGfxDevice(SDL_Window* w) {
   const char* aniso = Env("ANISO");
   d->SetMinAnisotropy(aniso ? std::atoi(aniso) : Game().anisotropy);
   d->SetDepthFromW(Game().wvp_register, Game().depth_planes);
+  // <ID>_RT=off|on|shadows|reflections (default off): ray tracing, where
+  // the GPU has it (any but off keeps the scene of each frame; what rays
+  // are traced for, the modes say); <ID>_RT_DEBUG=off|normals|instances|
+  // shadowmask|reflections: a view of what the rays hit, or of the traced
+  // shadow mask or reflections, over each frame; <ID>_RT_SHADOW_LOG=1: the
+  // traced shadows' diagnostics every 120 frames; <ID>_RT_LIGHT_MASKS=n:
+  // local lights' shadow masks traced at most per frame (default 8);
+  // <ID>_RT_DENOISE=1: the lit scene denoised (RayTracing::denoise; off by
+  // default); <ID>_RT_MANY_LIGHTS=off|add|only: the local lights lit by the
+  // device with ray-traced shadows, over the game's own default
+  // (GameConfig::ray_many_lights' mode; RayTracing::many_lights: added to the
+  // game's light volumes, or in their place; off unless the game says).
+  using RayTracing = gfx::Device::RayTracing;
+  RayTracing rt;
+  rt.world_register = Game().world_register;
+  rt.filter = Game().ray_draw_filter;
+  rt.alpha_source = Game().ray_alpha_source;
+  rt.albedo_source = Game().ray_albedo_source;
+  rt.other_passes = Game().ray_other_pass_casters;
+  rt.other_color_passes = Game().ray_other_color_passes;
+  if (const char* e = Env("RT")) {
+    if (!std::strcmp(e, "on")) rt.mode = RayTracing::Mode::On;
+    else if (!std::strcmp(e, "shadows")) rt.mode = RayTracing::Mode::Shadows;
+    else if (!std::strcmp(e, "reflections")) rt.mode = RayTracing::Mode::Reflections;
+    else if (std::strcmp(e, "off")) WarnF("gfx: RT=%s: not off, on, shadows or reflections, so off\n", e);
+  }
+  if (const char* e = Env("RT_DEBUG")) {
+    if (!std::strcmp(e, "normals")) rt.debug = RayTracing::Debug::Normals;
+    else if (!std::strcmp(e, "instances")) rt.debug = RayTracing::Debug::Instances;
+    else if (!std::strcmp(e, "shadowmask")) rt.debug = RayTracing::Debug::ShadowMask;
+    else if (!std::strcmp(e, "reflections")) rt.reflection_view = true;
+    else if (std::strcmp(e, "off"))
+      WarnF("gfx: RT_DEBUG=%s: not off, normals, instances, shadowmask or reflections, so off\n", e);
+    if ((rt.debug != RayTracing::Debug::Off || rt.reflection_view) && rt.mode == RayTracing::Mode::Off)
+      WarnF("gfx: RT_DEBUG needs RT\n");
+  }
+  if (const char* e = Env("RT_SHADOW_LOG")) rt.shadow_log = *e && *e != '0';
+  // <ID>_RT_GAME_SHADOWS=lit: the game's own shadow maps, where shaders
+  // still read them, read as lit everywhere (RayShadow::own_map).
+  if (const char* e = Env("RT_GAME_SHADOWS")) rt.own_maps_lit = std::strcmp(e, "lit") == 0;
+  if (const char* e = Env("RT_LIGHT_MASKS"); e && *e) rt.local_light_masks = uint32_t(std::strtoul(e, nullptr, 10));
+  if (const char* e = Env("RT_DENOISE")) rt.denoise = *e == '1';
+  rt.denoise = rt.denoise && Game().ray_denoise_consumer;
+  // (The game's config gives the mode by default; the variable overrides it.)
+  if (Game().ray_many_lights) rt.many_lights = *Game().ray_many_lights;
+  if (const char* e = Env("RT_MANY_LIGHTS")) {
+    rt.many_lights.mode = gfx::RayManyLights::Mode::Off;
+    if (!std::strcmp(e, "add"))
+      rt.many_lights.mode = gfx::RayManyLights::Mode::Add;
+    else if (!std::strcmp(e, "only"))
+      rt.many_lights.mode = gfx::RayManyLights::Mode::Only;
+    else if (std::strcmp(e, "off"))
+      WarnF("gfx: RT_MANY_LIGHTS=%s: not off, add or only, so off\n", e);
+  }
+  if (!Game().ray_light_volume_consumer || !Game().ray_many_lights) rt.many_lights.mode = gfx::RayManyLights::Mode::Off;
+  // <ID>_RT_OCCLUSION=0: no ray-traced ambient occlusion (on where the game
+  // names its shaders and the rays' length).
+  rt.occlusion_radius = Game().ray_occlusion_consumer ? Game().ray_occlusion_radius : 0.0f;
+  if (const char* e = Env("RT_OCCLUSION"); e && *e == '0') rt.occlusion_radius = 0.0f;
+  rt.bounce_distance = Game().ray_occlusion_consumer ? Game().ray_bounce_distance : 0.0f;
+  if (rt.mode != RayTracing::Mode::Off) d->SetRayTracing(rt);
   // <ID>_NO_BC=1: DXT decoded on upload, as on a GPU without BC sampling.
   if (const char* e = Env("NO_BC"); e && *e == '1') d->DecodeDxtOnUpload();
   return d;
