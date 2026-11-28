@@ -1,8 +1,10 @@
 // xlive.dll (Games for Windows - LIVE) for 32-bit guests, answering as a
 // PC with one local, offline profile: user 0 is signed in locally (no
-// LIVE), there is no LIVE matchmaking, no marketplace content and no
-// achievements. Exports are by ordinal only. The behaviour follows
-// xliveless (ThirteenAG's Ultimate-ASI-Loader, MIT), the stand-in the
+// LIVE), there is no LIVE matchmaking and no marketplace content.
+// Achievement writes are discarded and enumerations stay empty unless a
+// port installs a handler (runtime/achievements.h). Exports are by ordinal
+// only. The behaviour follows xliveless (ThirteenAG's Ultimate-ASI-Loader,
+// MIT), the stand-in the
 // community uses for GTA IV and other GFWL games: the same fake XUID, so
 // save folders keyed by it match, and the same notification sequence after
 // a listener is created.
@@ -16,12 +18,14 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstring>
 #include <deque>
 #include <map>
 #include <mutex>
 #include <string>
 #include <vector>
 
+#include "runtime/achievements.h"
 #include "runtime/hle/hle.h"
 #include "runtime/hle/kernel32_state.h"
 #include "runtime/log.h"
@@ -90,6 +94,45 @@ struct Listener {
   std::deque<std::pair<uint32_t, uint32_t>> queue;  // {id, param}
 };
 std::map<uint32_t, Listener> g_listeners;  // by event handle
+
+// XUserCreateAchievementEnumerator handles, so XEnumerate can tell them
+// from the empty friends and stats enumerations. One shot: the second
+// call returns no more items, as XEnumerate does.
+struct AchEnum {
+  uint32_t start = 0;
+  uint32_t count = 0;
+  bool used = false;
+};
+std::map<uint32_t, AchEnum> g_ach_enums;
+
+// UTF-16LE into the guest, one code unit per byte of `text`, including the
+// null. `cap` is characters, not counting the null. Returns the bytes written.
+uint32_t WriteWide(gaddr at, const std::string& text, uint32_t cap) {
+  const uint32_t n = std::min<uint32_t>(uint32_t(text.size()), cap);
+  for (uint32_t i = 0; i < n; i++) Wr16(at + i * 2, uint8_t(text[i]));
+  Wr16(at + n * 2, 0);
+  return (n + 1) * 2;
+}
+
+// FILETIME: 100 ns ticks since 1601-01-01. 11644473600 seconds from then to 1970.
+void UnixToFileTime(int64_t unix_sec, uint32_t* low, uint32_t* high) {
+  if (unix_sec < 0) unix_sec = 0;
+  const uint64_t ticks = (uint64_t(unix_sec) + 11644473600ull) * 10000000ull;
+  *low = uint32_t(ticks);
+  *high = uint32_t(ticks >> 32);
+}
+
+// Installed handler. Off until a port sets one whose enabled() returns true.
+AchievementHandler AchHandler() { return ::recomp::AchievementHandlerSnapshot(); }
+
+bool AchEnabled(const AchievementHandler& h) { return h.enabled && h.enabled(); }
+
+bool AchWrites(const AchievementHandler& h) { return AchEnabled(h) && h.record_unlock; }
+
+bool AchEnums(const AchievementHandler& h) {
+  return AchWrites(h) && h.current_unlocked && h.enum_buffer_bytes && h.enum_label_chars &&
+         h.enum_description_chars;
+}
 
 bool Matches(uint32_t areas, uint32_t id) { return areas & (1u << ((id >> 25) & 0x3F)); }
 
@@ -269,17 +312,70 @@ HLE_NAMED("xlive.dll", "#5251", XCloseHandle, 1) {
   {
     std::lock_guard<std::mutex> l(g_mu);
     g_listeners.erase(h);
+    g_ach_enums.erase(h);
   }
   return CloseHandleValue(h) ? 1 : 0;
 }
 
-// Every enumeration is empty.
+// Every enumeration is empty, except an achievement enumerator while a port
+// has achievements on: that one returns the unlocked rows, strings packed
+// after them in the caller's buffer. A buffer smaller than the size reported
+// at create time is left empty rather than written past.
 HLE_NAMED("xlive.dll", "#5256", XEnumerate, 5) {
+  const uint32_t hnd = uint32_t(Arg(c, 0));
+  const gaddr buf = Arg(c, 1);
+  const uint32_t cb = uint32_t(Arg(c, 2));
   const gaddr pcount = Arg(c, 3), ov = Arg(c, 4);
-  if (ov) return Complete(ov, kErrorNoMoreFiles, 0);
-  if (!pcount) return kErrorInvalidParameter;
-  Wr32(pcount, 0);
-  return kErrorNoMoreFiles;
+  AchEnum en;
+  bool fresh = false;
+  {
+    std::lock_guard<std::mutex> l(g_mu);
+    auto it = g_ach_enums.find(hnd);
+    if (it != g_ach_enums.end()) {
+      en = it->second;
+      fresh = !it->second.used;
+      it->second.used = true;
+    }
+  }
+  auto none = [&] {
+    if (ov) return Complete(ov, kErrorNoMoreFiles, 0);
+    if (!pcount) return kErrorInvalidParameter;
+    Wr32(pcount, 0);
+    return kErrorNoMoreFiles;
+  };
+  const AchievementHandler h = AchHandler();
+  if (!fresh || !AchEnums(h)) return none();
+  const auto items = h.current_unlocked(en.start, en.count);
+  if (items.empty()) return none();
+  const uint32_t bytes = h.enum_buffer_bytes(uint32_t(items.size()));
+  if (!buf || cb < bytes) {
+    WarnF("xlive: achievement enumerate buffer is %u bytes, %u needed; returning none\n", cb, bytes);
+    return none();
+  }
+  std::memset(GPtr(buf), 0, bytes);
+  const uint32_t label_chars = h.enum_label_chars();
+  const uint32_t desc_chars = h.enum_description_chars();
+  gaddr str = buf + 36 * items.size();
+  for (size_t i = 0; i < items.size(); i++) {
+    const gaddr row = buf + 36 * i;
+    Wr32(row + 0, items[i].id);
+    Wr32(row + 4, str);
+    str += WriteWide(str, items[i].label, label_chars);
+    Wr32(row + 8, str);
+    str += WriteWide(str, items[i].description, desc_chars);
+    Wr32(row + 12, str);
+    str += WriteWide(str, items[i].description, desc_chars);
+    Wr32(row + 16, 0);  // image
+    Wr32(row + 20, uint32_t(std::max(0, items[i].points)));
+    uint32_t lo = 0, hi = 0;
+    UnixToFileTime(items[i].unlocked_at, &lo, &hi);
+    Wr32(row + 24, lo);
+    Wr32(row + 28, hi);
+    Wr32(row + 32, 1);  // XACHIEVEMENT_TYPE_COMPLETION; a set FILETIME means unlocked
+  }
+  if (ov) return Complete(ov, kErrorSuccess, uint32_t(items.size()));
+  if (pcount) Wr32(pcount, uint32_t(items.size()));
+  return kErrorSuccess;
 }
 
 // ---- XLive lifetime and rendering hooks --------------------------------------
@@ -449,12 +545,38 @@ HLE_NAMED("xlive.dll", "#5314", XUserMuteListQuery, 4) {  // (user, XUID, PBOOL)
 HLE_NAMED("xlive.dll", "#5276", XUserSetProperty, 4) { return 0; }
 HLE_NAMED("xlive.dll", "#5277", XUserSetContext, 3) { return 0; }
 HLE_NAMED("xlive.dll", "#5292", XUserSetContextEx, 4) { return Finish(Arg(c, 3), kErrorSuccess); }
-HLE_NAMED("xlive.dll", "#5278", XUserWriteAchievements, 3) { return Finish(Arg(c, 2), kErrorSuccess); }
+// XUSER_ACHIEVEMENT is {uint32 user, uint32 id}. With no handler, or the
+// port's option off, this is the old success-and-discard.
+HLE_NAMED("xlive.dll", "#5278", XUserWriteAchievements, 3) {
+  const uint32_t n = uint32_t(Arg(c, 0));
+  const gaddr list = Arg(c, 1);
+  const AchievementHandler h = AchHandler();
+  if (AchWrites(h) && list && n > 0 && n <= 64) {
+    for (uint32_t i = 0; i < n; i++) {
+      const uint32_t id = Rd32(list + i * 8 + 4);
+      if (id) h.record_unlock(id);
+    }
+  } else if (n > 64) {
+    WarnF("xlive: XUserWriteAchievements count %u left unread\n", n);
+  }
+  return Finish(Arg(c, 2), kErrorSuccess);
+}
 
-// (title, user, XUID xuid, flags, start, count, pcbBuffer, phEnum)
+// (title, user, XUID xuid, flags, start, count, pcbBuffer, phEnum).
+// XUID takes two stack slots, so start is argument 5.
 HLE_NAMED("xlive.dll", "#5280", XUserCreateAchievementEnumerator, 9) {
-  if (gaddr p = Arg(c, 7)) Wr32(p, uint32_t(Arg(c, 6)) * 36);  // XACHIEVEMENT_DETAILS
-  if (gaddr p = Arg(c, 8)) Wr32(p, DummyHandle());
+  const uint32_t start = uint32_t(Arg(c, 5));
+  const uint32_t count = uint32_t(Arg(c, 6));
+  // A wild count is left as the old stand-in (the struct size, no rows).
+  const AchievementHandler h = AchHandler();
+  const bool on = AchEnums(h) && count <= 128;
+  if (gaddr p = Arg(c, 7)) Wr32(p, on ? h.enum_buffer_bytes(count) : count * 36);
+  const uint32_t handle = DummyHandle();
+  if (gaddr p = Arg(c, 8)) Wr32(p, handle);
+  if (on && handle) {
+    std::lock_guard<std::mutex> l(g_mu);
+    g_ach_enums[handle] = AchEnum{start, count, false};
+  }
   return kErrorSuccess;
 }
 

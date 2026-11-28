@@ -102,6 +102,7 @@
 #include "runtime/hlsl/capture_position.h"
 #include "runtime/gfx/shader_jobs.h"
 #include "runtime/gfx/target_size.h"
+#include "runtime/achievements.h"
 #include "runtime/log.h"
 
 // RECOMP_DISPLAY_LINK=1 (macOS 14+): the display hands out each drawable
@@ -1471,7 +1472,8 @@ class MetalDevice final : public Device {
     EnsureFrame();
     __unsafe_unretained id<MTLTexture> front = front_;
     const int bw = bb_w_, bh = bb_h_;
-    Rec([=, this] { Show(front, bw, bh); });
+    const bool scene = first_scene_;
+    Rec([=, this] { Show(front, bw, bh, 0, scene); });
     EndFrame();
   }
 
@@ -1634,8 +1636,11 @@ class MetalDevice final : public Device {
       // buffer, D3D9's flip (a discarded back buffer's contents after
       // Present are undefined) instead of a full-size copy.
       __unsafe_unretained id<MTLTexture> shown = smaa ? front : back;
+      // Captured after FirstScene(), for the toast: the encode thread runs
+      // later, when a later frame may already have set first_scene_.
+      const bool scene = first_scene_;
       Rec([=, this] {
-        Show(shown, bw, bh, t_present);
+        Show(shown, bw, bh, t_present, scene);
         if (rec) RecordFrame(rec, shown, bw, bh, rec_mask, rec_frame, t_present);
       });
       // The frame's local lights are over with it (SetRtLights).
@@ -8788,12 +8793,74 @@ void main() {
     [e drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
   }
 
+  // Premultiplied RGBA on top of the frame (the achievement toast).
+  void DrawAlphaQuad(id<MTLRenderCommandEncoder> e, id<MTLTexture> src, float dw, float dh, const Rect& dr) {
+    PipeKey k;
+    std::memset(&k, 0, sizeof k);
+    k.vs = kQuadVs;
+    k.ps = kQuadPs;
+    k.color[0] = uint16_t(MTLPixelFormatBGRA8Unorm);
+    k.blend = 1;
+    k.src = k.src_a = uint8_t(MTLBlendFactorOne);
+    k.dst = k.dst_a = uint8_t(MTLBlendFactorOneMinusSourceAlpha);
+    k.mask[0] = MTLColorWriteMaskAll;
+    [e setRenderPipelineState:Pipeline(k)];
+    const float r[12] = {float(dr.left) / dw * 2 - 1, 1 - float(dr.top) / dh * 2,
+                         float(dr.right) / dw * 2 - 1, 1 - float(dr.bottom) / dh * 2,
+                         0, 0, 1, 1, 0, 0, 0, 0};
+    [e setVertexBytes:r length:sizeof r atIndex:0];
+    [e setFragmentBytes:r length:sizeof r atIndex:0];
+    [e setFragmentTexture:src atIndex:0];
+    [e setFragmentSamplerState:quad_sampler_[1] atIndex:0];
+    [e drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
+  }
+
+  // A bitmap the port supplied (SetPresentOverlay), on top of this present.
+  // `scene` was captured when the frame was presented, after FirstScene().
+  // With no overlay installed this returns without drawing.
+  void DrawAchievementOverlay(id<MTLRenderCommandEncoder> e, int pw, int ph, float scale, bool scene) {
+    const PresentOverlayFn fn = ::recomp::PresentOverlay();
+    if (!fn) return;
+    static bool logged = false;
+    if (!logged) {
+      logged = true;
+      // Same channel as the renderer's other lines: stderr.
+      std::fprintf(stderr, "achievements: overlay active\n");
+      std::fflush(stderr);
+    }
+    PresentOverlayBitmap bm{};
+    if (!fn(pw, ph, scale, scene, &bm) || !bm.rgba || bm.width <= 0 || bm.height <= 0) return;
+    if (bm.y >= ph || bm.x >= pw || bm.y + bm.height <= 0 || bm.x + bm.width <= 0) return;
+    if (!toast_tex_ || toast_w_ != bm.width || toast_h_ != bm.height) {
+      MTLTextureDescriptor* td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+                                                                                     width:NSUInteger(bm.width)
+                                                                                    height:NSUInteger(bm.height)
+                                                                                 mipmapped:NO];
+      td.usage = MTLTextureUsageShaderRead;
+      td.storageMode = MTLStorageModeShared;
+      toast_tex_ = [dev_ newTextureWithDescriptor:td];
+      toast_w_ = bm.width;
+      toast_h_ = bm.height;
+      toast_serial_ = 0;
+    }
+    if (!toast_tex_) return;
+    if (toast_serial_ != bm.serial) {
+      [toast_tex_ replaceRegion:MTLRegionMake2D(0, 0, NSUInteger(bm.width), NSUInteger(bm.height))
+                    mipmapLevel:0
+                      withBytes:bm.rgba
+                    bytesPerRow:NSUInteger(bm.width * 4)];
+      toast_serial_ = bm.serial;
+    }
+    DrawAlphaQuad(e, toast_tex_, float(pw), float(ph), Rect{bm.x, bm.y, bm.x + bm.width, bm.y + bm.height});
+  }
+
   // On the encoding thread: the front buffer (bw x bh) to the window,
   // scaled to fit with its aspect kept, black around it (FitRect). Not
   // while the window cannot be seen.
   // t_present: when the game called Present (CACurrentMediaTime), for the
   // latency from that call to the display (0: not measured).
-  void Show(__unsafe_unretained id<MTLTexture> front, int bw, int bh, double t_present = 0) {
+  void Show(__unsafe_unretained id<MTLTexture> front, int bw, int bh, double t_present = 0,
+            bool scene = false) {
     // (The frame log has an "s" line for every image handed here, shown or
     // not: a frame that got no drawable is written as dropped, 0, so that a
     // reader counting them stays in step with the "p" lines when the window
@@ -8839,6 +8906,10 @@ void main() {
     const bool same = r.right - r.left == bw && r.bottom - r.top == bh;
     DrawQuad(e, MTLPixelFormatBGRA8Unorm, front, 0, float(bw), float(bh), {0, 0, bw, bh},
              float(pw), float(ph), r, !same, output_curve_);
+    int lw = 0, lh = 0;
+    SDL_GetWindowSize(window_, &lw, &lh);
+    const float scale = lw > 0 ? std::max(1.f, float(pw) / float(lw)) : 1.f;
+    DrawAchievementOverlay(e, pw, ph, scale, scene);
     [e endEncoding];
     // When the display really showed it (what Metal's HUD graphs).
     std::mutex* mu = &shown_mu_;
@@ -8960,6 +9031,9 @@ void main() {
   mutable std::recursive_mutex mu_;
   SDL_Window* window_;
   SDL_MetalView view_ = nullptr;
+  id<MTLTexture> toast_tex_ = nil;
+  int toast_w_ = 0, toast_h_ = 0;
+  uint64_t toast_serial_ = 0;
   id<MTLDevice> dev_ = nil;
   id<MTLCommandQueue> queue_ = nil;
   CAMetalLayer* layer_ = nil;

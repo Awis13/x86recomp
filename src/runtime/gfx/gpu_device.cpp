@@ -29,6 +29,7 @@
 #include <cstring>
 #include <deque>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <set>
 #include <tuple>
@@ -1233,15 +1234,43 @@ void r_color0(inout vec4 c) {
     si.num_uniform_buffers = 3;
     sh.sh = SDL_CreateGPUShader(dev_, &si);
     if (!sh.sh) FatalF("gfx: SDL_CreateGPUShader (translated): %s", SDL_GetError());
+    // Kept so a pass with no depth buffer can be given a copy that does not
+    // write gl_FragDepth (PixelShaderWithoutDepth). Apple's Metal, which
+    // SDL_GPU uses here, refuses a pipeline whose shader writes depth when
+    // the depth format is invalid. D3D9 ignores that write.
+    if (!vertex && prog.writes_depth) sh.source = std::make_shared<hlsl::Program>(prog);
     ShaderId id = next_id_++;
-    shaders_[id] = sh;
+    shaders_[id] = std::move(sh);
     return id;
+  }
+
+  // The pixel shader `sid` for a pass without a depth buffer. Same rule as
+  // the Metal renderer (MetalDevice::PixelShaderWithoutDepth).
+  ShaderId PixelShaderWithoutDepth(ShaderId sid) {
+    auto it = shaders_.find(sid);
+    if (it == shaders_.end() || !it->second.source || !it->second.source->writes_depth) return sid;
+    if (it->second.without_depth) return it->second.without_depth;
+    hlsl::Program v = *it->second.source;
+    v.writes_depth = false;
+    std::string glsl;
+    size_t at = 0;
+    while (at < v.glsl.size()) {
+      size_t end = v.glsl.find('\n', at);
+      end = end == std::string::npos ? v.glsl.size() : end + 1;
+      if (v.glsl.find("gl_FragDepth", at) >= end) glsl.append(v.glsl, at, end - at);
+      at = end;
+    }
+    v.glsl = std::move(glsl);
+    const ShaderId vid = CreateShader(v);  // shaders_ is node-based; sid stays
+    shaders_.find(sid)->second.without_depth = vid;
+    return vid;
   }
 
   void DestroyShader(ShaderId id) override {
     std::lock_guard<std::recursive_mutex> l(mu_);
     auto it = shaders_.find(id);
     if (it == shaders_.end()) return;
+    const ShaderId bare = it->second.without_depth;
     // Recorded draws and cached pipelines may use it.
     Flush();
     for (auto p = shader_pipelines_.begin(); p != shader_pipelines_.end();) {
@@ -1254,6 +1283,7 @@ void r_color0(inout vec4 c) {
     }
     SDL_ReleaseGPUShader(dev_, it->second.sh);
     shaders_.erase(it);
+    if (bare) DestroyShader(bare);
   }
 
   void DrawShader(const ShaderDraw& d) override {
@@ -1291,7 +1321,18 @@ void r_color0(inout vec4 c) {
     k.front = SDL_GPU_FRONTFACE_CLOCKWISE;
     for (int i = 1; i < 4; i++) k.mask[i - 1] = i < pass_targets_ ? uint8_t(rs_[189 + i] & 0xF) : 0;
     sc.key.vs = d.vs;
-    sc.key.ps = d.ps;
+    // No depth buffer: a shader that writes depth cannot be paired with an
+    // invalid depth format (AGX: "depthAttachmentPixelFormat is not valid
+    // and shader writes to depth"). D3D9 ignores the write; the depth
+    // test is off too, because there is nothing to test against.
+    if (pass_depth_format_ == SDL_GPU_TEXTUREFORMAT_INVALID) {
+      sc.key.ps = PixelShaderWithoutDepth(d.ps);
+      k.depth_test = 0;
+      k.depth_write = 0;
+      k.stencil = 0;
+    } else {
+      sc.key.ps = d.ps;
+    }
     if (k.blend && rs_[206]) {  // SEPARATEALPHABLENDENABLE
       sc.key.src_a = uint8_t(BlendFactor(rs_[207], pass_alpha_));
       sc.key.dst_a = uint8_t(BlendFactor(rs_[208], pass_alpha_));
@@ -1507,6 +1548,8 @@ void r_color0(inout vec4 c) {
     std::array<hlsl::ParamType, 16> sampler_type{};  // per register; Void if unused
     uint32_t samplers = 0;  // highest register used + 1
     uint32_t float_regs = 0;
+    std::shared_ptr<hlsl::Program> source;  // pixel shaders that write depth
+    ShaderId without_depth = 0;             // that shader with the write removed
   };
   struct BlitTex {
     SDL_GPUTexture* tex;
