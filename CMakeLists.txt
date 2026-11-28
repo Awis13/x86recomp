@@ -238,7 +238,8 @@ add_library(recomp_gfx SHARED
   src/runtime/gfx/gpu_device.cpp
   src/runtime/gfx/shader_compile.cpp
   src/runtime/gfx/target_size.cpp
-  src/runtime/gfx/frame_log.cpp)
+  src/runtime/gfx/frame_log.cpp
+  src/runtime/achievements.cpp)
 target_include_directories(recomp_gfx PUBLIC src)
 target_compile_features(recomp_gfx PUBLIC cxx_std_20)
 # Shaders translated at run time (Direct3D 9) are compiled then: glslang
@@ -408,8 +409,11 @@ add_library(recomp_online SHARED src/runtime/hle/galaxy64.cpp)
 target_link_libraries(recomp_online PUBLIC recomp_runtime)
 
 # Games for Windows - LIVE (xlive.dll), answering as an offline local profile.
+# Achievement forwarding calls into recomp_gfx, where a port installs its
+# handler (runtime/achievements.h). With none installed the calls stay the
+# old success-and-discard.
 add_library(recomp_xlive SHARED src/runtime/hle/xlive.cpp)
-target_link_libraries(recomp_xlive PUBLIC recomp_runtime)
+target_link_libraries(recomp_xlive PUBLIC recomp_runtime PRIVATE recomp_gfx)
 
 # SDL2.dll for x64 guests that link it themselves, on the host's SDL3.
 add_library(recomp_sdl2 SHARED src/runtime/hle/sdl2.cpp src/runtime/hle/sdl2_video.cpp)
